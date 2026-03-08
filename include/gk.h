@@ -75,6 +75,12 @@ struct ssystem {
   double *pos, *chr;        /* charge position and charges for rhs */
   int mesh_flag;            /* mesh format flag */
   int gpuMode;              /* 0=CPU only, >0 request GPU backend */
+  int nLeafCubesFlat;       /* flattened finest-level cube count */
+  int *leafPanelStart;      /* flattened per-leaf panel start index */
+  int *leafPanelCount;      /* flattened per-leaf panel count */
+  int nNearPairsFlat;       /* flattened leaf-neighbor pair count */
+  int *nearPairSrc;         /* flattened nearfield source leaf index */
+  int *nearPairDst;         /* flattened nearfield target leaf index */
   int maxlevCudes;          /* max cubes at finest level */
   int maxlevnPnls;          /* max panels in a cube at finest level */
   panel *pnlLst;            /* linked list of panels (Contiguous wn cubes) */

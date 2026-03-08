@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gpu_backend.h"
@@ -39,6 +40,57 @@ double curvature(double *x, double *h20, double *h11, double *h02);
 double paramEllip( panel *pnl, double x, double y, double *r, double *nrm );
 void dumpStats(ssystem *sys);
 int nrCommonVtx( panel *p, panel *q, int *idxX, int *idxY );
+
+static double wall_seconds_local(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
+}
+
+static int findLeafCubeIndex(cube **leafCubes, int nLeafCubes, cube *target) {
+  int idx;
+  for (idx = 0; idx < nLeafCubes; idx++) {
+    if (leafCubes[idx] == target) {
+      return idx;
+    }
+  }
+  return -1;
+}
+
+static void buildApplyLayout(ssystem *sys) {
+  cube *cb;
+  int depth = sys->depth;
+  int idx;
+  int pairCount = 0;
+  cube **leafCubes;
+
+  for (cb = sys->cubeList[depth]; cb != NULL; cb = cb->next) {
+    pairCount += cb->nNbrs;
+  }
+
+  sys->nNearPairsFlat = pairCount;
+  CALLOC(leafCubes, sys->nLeafCubesFlat, cube *);
+  CALLOC(sys->nearPairSrc, pairCount, int);
+  CALLOC(sys->nearPairDst, pairCount, int);
+
+  for (idx = 0, cb = sys->cubeList[depth]; cb != NULL; cb = cb->next, idx++) {
+    leafCubes[idx] = cb;
+    sys->leafPanelStart[idx] = cb->pnls->idx;
+    sys->leafPanelCount[idx] = cb->nPnls;
+  }
+
+  idx = 0;
+  for (cb = sys->cubeList[depth]; cb != NULL; cb = cb->next) {
+    int srcIdx = findLeafCubeIndex(leafCubes, sys->nLeafCubesFlat, cb);
+    int inbr;
+    for (inbr = 0; inbr < cb->nNbrs; inbr++, idx++) {
+      sys->nearPairSrc[idx] = findLeafCubeIndex(leafCubes, sys->nLeafCubesFlat, cb->nbrs[inbr]);
+      sys->nearPairDst[idx] = srcIdx;
+    }
+  }
+
+  free(leafCubes);
+}
 
 extern double **dG0;     /* workspace for setupDerivs */
 extern double **dGk;     /* workspace for setupDerivs */
@@ -76,6 +128,9 @@ void setupFMM(ssystem *sys) {
   for ( nCubesL=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next ) {
     nCubesL++;
   }
+  sys->nLeafCubesFlat = nCubesL;
+  CALLOC(sys->leafPanelStart, nCubesL, int);
+  CALLOC(sys->leafPanelCount, nCubesL, int);
   CALLOC(Q2M0, nCubesL, double*);
   CALLOC(Q2M1, nCubesL, double*);
   CALLOC(L2P0, nCubesL, double*);
@@ -107,6 +162,9 @@ void setupFMM(ssystem *sys) {
   kernelDS = kernelDS0;
   kernelD  = kernelDG0DGk;
 
+  buildApplyLayout(sys);
+  printf("Flattened apply layout: leaf-cubes=%d near-pairs=%d\n",
+         sys->nLeafCubesFlat, sys->nNearPairsFlat);
 
 } /* setupFMM */
 
@@ -183,7 +241,7 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   int depth=sys->depth, height=sys->height, nPnls=sys->nPnls;
   int nKid, nKid1, iNbr, iPnl, nNbrs, idx, nMom, order;
   int i, k, lev, n, n1, inc = 1;
-  time_t time1, time2;
+  double time1, time2;
 
   /* zero out mom's and lec's */
   for ( lev=depth; lev>=height; lev-- ) {
@@ -201,7 +259,7 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   }
 
   /* Q2M transformations */
-  time1 = time(&time1);
+  time1 = wall_seconds_local();
   nMom = sys->nMom[sys->ordMom[depth]];
   for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
     x = &(sgm[cb->pnls->idx]);
@@ -212,11 +270,11 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
     y = cb->mom_dpdn;
     dgemv_(&nChr, &nMom, &n, &one, Q2M0[idx], &nMom, x, &inc, &one, y, &inc);
   }
-  time2 = time(&time2);
-  fmmQ2MTime += difftime(time2, time1);
+  time2 = wall_seconds_local();
+  fmmQ2MTime += (time2 - time1);
 
   /* upward pass */
-  time1 = time(&time1);
+  time1 = wall_seconds_local();
   for ( lev=depth-1; lev>=height; lev-- ) {
     for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
       for ( nKid=0; nKid<cb->nKids; nKid++ ) {
@@ -224,11 +282,11 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
       }
     }
   }
-  time2 = time(&time2);
-  fmmM2MTime += difftime(time2, time1);
+  time2 = wall_seconds_local();
+  fmmM2MTime += (time2 - time1);
 
   /* Interaction phase */
-  time1 = time(&time1);
+  time1 = wall_seconds_local();
   for ( idx=0, lev=depth; lev>=height; lev-- ) {
     for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
       nNbrs = cb->nNbrs;
@@ -247,11 +305,11 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
       }
     }
   }
-  time2 = time(&time2);
-  fmmM2LTime += difftime(time2, time1);
+  time2 = wall_seconds_local();
+  fmmM2LTime += (time2 - time1);
 
   /* downward pass */
-  time1 = time(&time1);
+  time1 = wall_seconds_local();
   for ( lev=height; lev<depth; lev++ ) {
     for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
       for ( nKid=0; nKid<cb->nKids; nKid++ ) {
@@ -259,11 +317,11 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
       }
     }
   }
-  time2 = time(&time2);
-  fmmL2LTime += difftime(time2, time1);
+  time2 = wall_seconds_local();
+  fmmL2LTime += (time2 - time1);
 
   /* L2P transformations */
-  time1 = time(&time1);
+  time1 = wall_seconds_local();
   nMom = sys->nMom[sys->ordMom[depth]];
   for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
     y = &(pot[cb->pnls->idx]);
@@ -279,12 +337,12 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
     x = cb->lec_k4;
     dgemv_(&hChr, &nMom, &n, alpha, L2P1[idx], &nMom, x, &inc, &one, y, &inc);
   }
-  time2 = time(&time2);
-  fmmL2PTime += difftime(time2, time1);
+  time2 = wall_seconds_local();
+  fmmL2PTime += (time2 - time1);
 
-  time1 = time(&time1);
+  time1 = wall_seconds_local();
   applyNearfield1(sys, alpha, sgm, beta, pot);
-  time2 = time(&time2);
-  fmmNearTime += difftime(time2, time1);
+  time2 = wall_seconds_local();
+  fmmNearTime += (time2 - time1);
 
 } /* applyFMM */

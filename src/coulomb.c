@@ -193,6 +193,7 @@ int main(int nargs, char *argv[]){
   CALLOC(GMRES_work, ldw*(arnoldiSz+4), double);
   CALLOC(GMRES_h, ldh*(arnoldiSz+2), double);
 
+  resetFmmMatvecStats();
   gmres(ldw, pot, sgm, arnoldiSz, GMRES_work, ldw, GMRES_h, ldh,
         &numItr, &tolpar, MtV, PtV, &info);
 
@@ -201,6 +202,7 @@ int main(int nargs, char *argv[]){
   end_t = wall_seconds() - start_t;
   printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
   printf("solvation energy: %f\n", ptl);
+  printFmmMatvecStats();
 
 }
 
@@ -215,16 +217,25 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
   cube *cb;
   panel *pnl;
   double scale1, scale2, inv_beta;
+  double callStart, callEnd, applyStart, applyEnd;
 
   scale1 = (1.0+epsilon)/2.0*(*alpha);
   scale2 = (1.0+1.0/epsilon)/2.0*(*alpha);
 
+  callStart = wall_seconds();
   inv_beta = -(*beta);
+  applyStart = wall_seconds();
   applyFMM(sys, alpha, sgm, &inv_beta, pot);
+  applyEnd = wall_seconds();
   for (  i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {
     pot[i] = (scale1*pnl->area*sgm[i]-pot[i]);
     pot[i+nPnls] = scale2*pnl->area*sgm[i+nPnls]-pot[i+nPnls];
   }
+  callEnd = wall_seconds();
+
+  mtvCalls++;
+  mtvApplyFMMTime += (applyEnd - applyStart);
+  mtvTotalTime += (callEnd - callStart);
 
   return 0;
 } /* MtVmain */

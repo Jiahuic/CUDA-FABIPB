@@ -122,6 +122,8 @@
 extern double setupBasTime, setupMatTime, setupPCTime, solveTimeNoPC, solveTimePC;
 extern double setupQ2PTime, setupQ2MTime, setupM2LTime;
 extern double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
+extern double mtvApplyFMMTime, mtvTotalTime;
+extern long mtvCalls;
 /* counts of memory usage */
 extern long memcount;
 extern long memPVE, memCUBES, memQ2P, memQ2M, memM2L, memSOLVER, memMISC;
@@ -133,3 +135,5 @@ extern double zero, one;
 extern char hChr, nChr;
 extern int oneI;
 
+void resetFmmMatvecStats(void);
+void printFmmMatvecStats(void);
