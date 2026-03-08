@@ -20,7 +20,7 @@
 extern double *fact3, *ifact3, *fact, *ifact;  /* setup by initExpan() */
 extern int ***idx3, *sgn3;
 /* globals in this file */
-double *convVec1, *convVec2, *convVec3; /* workspace for convolutions */
+static double *momConvVec1, *momConvVec2, *momConvVec3; /* workspace for convolutions */
 double *fcnBuf1, *fcnBuf2, *fcnBuf3;
 double *MomWrk, *MomLoc;
 
@@ -37,9 +37,9 @@ void initCalcMoments(ssystem *sys) {
 
   CALLOC(MomWrk, nMomL, double);
   CALLOC(MomLoc, nMomL, double);
-  CALLOC(convVec1, nMomL, double);
-  CALLOC(convVec2, nMomL, double);
-  CALLOC(convVec3, nMomL, double);
+  CALLOC(momConvVec1, nMomL, double);
+  CALLOC(momConvVec2, nMomL, double);
+  CALLOC(momConvVec3, nMomL, double);
   CALLOC(fcnBuf1, order+1, double);
   CALLOC(fcnBuf2, order+1, double);
   CALLOC(fcnBuf3, order+1, double);
@@ -170,19 +170,19 @@ void calcOneMoment0(ssystem *sys, int order, panel *pnl, double *Mom, int job) {
   }
 
   /* setup local moment vector */
-  setupConVect(order1, a1, convVec1);
-  setupConVect(order1, a2, convVec2);
+  setupConVect(order1, a1, momConvVec1);
+  setupConVect(order1, a2, momConvVec2);
 
   for ( i=n=0; n<=order1; n++ ) {
     for ( i1=0; i1<=n; i1++ ) {
       for ( i2=0; i2<=n-i1; i2++, i++ ) {
-        convVec1[i] *= fact[n];
-        convVec2[i] *= fact[n];
+        momConvVec1[i] *= fact[n];
+        momConvVec2[i] *= fact[n];
       }
     }
   }
 
-  convolution(order, convVec1, convVec2, MomBuf);
+  convolution(order, momConvVec1, momConvVec2, MomBuf);
   for ( i=n=0; n<=order; n++ ) {
     for ( i1=0; i1<=n; i1++ ) {
       for ( i2=0; i2<=n-i1; i2++, i++ ) {
@@ -228,8 +228,8 @@ double *calcMoments0(ssystem *sys, int order, cube *cb, int job) {
     calcOneMoment0( sys, order, pnl, MomLoc, job );
     /* translate to center of cube */
     trns[0] = v0[0]-ctr[0]; trns[1] = v0[1]-ctr[1]; trns[2] = v0[2]-ctr[2];
-    setupConVect(order, trns, convVec1);
-    convolution(order, convVec1, MomLoc, &Moments[idx*ldM]);
+    setupConVect(order, trns, momConvVec1);
+    convolution(order, momConvVec1, MomLoc, &Moments[idx*ldM]);
   }
 
   return Moments;
