@@ -81,6 +81,7 @@ struct ssystem {
   int nNearPairsFlat;       /* flattened leaf-neighbor pair count */
   int *nearPairSrc;         /* flattened nearfield source leaf index */
   int *nearPairDst;         /* flattened nearfield target leaf index */
+  panel **panelByIdx;       /* direct panel lookup by contiguous index */
   int maxlevCudes;          /* max cubes at finest level */
   int maxlevnPnls;          /* max panels in a cube at finest level */
   panel *pnlLst;            /* linked list of panels (Contiguous wn cubes) */

@@ -92,6 +92,18 @@ static void buildApplyLayout(ssystem *sys) {
   free(leafCubes);
 }
 
+static void buildPanelIndex(ssystem *sys) {
+  int idx;
+  panel *pnl;
+
+  CALLOC(sys->panelByIdx, sys->nPnls, panel *);
+  for (idx = 0, pnl = sys->pnlLst; pnl != NULL; pnl = pnl->nextC, idx++) {
+    ASSERT(idx < sys->nPnls);
+    sys->panelByIdx[idx] = pnl;
+  }
+  ASSERT(idx == sys->nPnls);
+}
+
 extern double **dG0;     /* workspace for setupDerivs */
 extern double **dGk;     /* workspace for setupDerivs */
 extern int normErr;
@@ -163,6 +175,7 @@ void setupFMM(ssystem *sys) {
   kernelD  = kernelDG0DGk;
 
   buildApplyLayout(sys);
+  buildPanelIndex(sys);
   printf("Flattened apply layout: leaf-cubes=%d near-pairs=%d\n",
          sys->nLeafCubesFlat, sys->nNearPairsFlat);
 
@@ -176,31 +189,37 @@ void setupFMM(ssystem *sys) {
  * Same parameters as applyFMM().
  */
 static void applyNearfield1CPU(ssystem *sys, double *alpha, double *sgm, double *pot) {
-  cube *cb, *cb1;
-  double *x_pot, *y_pot, *x_dpdn, *y_dpdn, *KER;
-  int inbr, nNbrs, idx, nPnls=sys->nPnls;
-  int i, j, n, n1;
-  panel *pnlX, *pnlY;
+  int nPnls = sys->nPnls;
+  int pairIdx;
 
   /* set up kernel */
   kernel = kernelKER4;
 
-  for ( idx=0, cb=sys->cubeList[sys->depth]; cb!=NULL; cb=cb->next ) {
-    y_pot = &(pot[cb->pnls->idx]);
-    y_dpdn = &(pot[cb->pnls->idx+nPnls]);
-    n = cb->nPnls;
-    nNbrs = cb->nNbrs;
-    for ( inbr=0; inbr<nNbrs; inbr++, idx++ ) {
-      cb1 = cb->nbrs[inbr];
-      n1 = cb1->nPnls;
-      x_pot = &(sgm[cb1->pnls->idx]);
-      x_dpdn = &(sgm[cb1->pnls->idx+nPnls]);
-      for ( i=0, pnlX=cb->pnls; i<n; i++, pnlX=pnlX->nextC ) {
-        for ( j=0, pnlY=cb1->pnls; j<n1; j++, pnlY=pnlY->nextC ) {
-          KER = panelIA0(pnlX, pnlY);
-          y_pot[i] += (KER[0]*x_dpdn[j] + KER[1]*x_pot[j])*(*alpha);
-          y_dpdn[i] += (KER[2]*x_dpdn[j] + KER[3]*x_pot[j])*(*alpha);
-        }
+  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+    int srcLeaf = sys->nearPairSrc[pairIdx];
+    int dstLeaf = sys->nearPairDst[pairIdx];
+    int srcStart = sys->leafPanelStart[srcLeaf];
+    int srcCount = sys->leafPanelCount[srcLeaf];
+    int dstStart = sys->leafPanelStart[dstLeaf];
+    int dstCount = sys->leafPanelCount[dstLeaf];
+    int i, j;
+
+    for (i = 0; i < dstCount; i++) {
+      int dstPanelIdx = dstStart + i;
+      panel *pnlX = sys->panelByIdx[dstPanelIdx];
+      double *KER;
+      double *y_pot = &(pot[dstPanelIdx]);
+      double *y_dpdn = &(pot[dstPanelIdx + nPnls]);
+
+      for (j = 0; j < srcCount; j++) {
+        int srcPanelIdx = srcStart + j;
+        panel *pnlY = sys->panelByIdx[srcPanelIdx];
+        double x_pot = sgm[srcPanelIdx];
+        double x_dpdn = sgm[srcPanelIdx + nPnls];
+
+        KER = panelIA0(pnlX, pnlY);
+        y_pot[0] += (KER[0] * x_dpdn + KER[1] * x_pot) * (*alpha);
+        y_dpdn[0] += (KER[2] * x_dpdn + KER[3] * x_pot) * (*alpha);
       }
     }
   }
