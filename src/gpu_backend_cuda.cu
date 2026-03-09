@@ -2,26 +2,275 @@
 #include "gk.h"
 
 #include <cuda_runtime.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
+extern "C" void kernelKER4(double *x, double *y);
+extern "C" void (*kernel)(double *x, double *y);
+
+namespace {
+struct NearfieldGpuCache {
+  const ssystem *sys;
+  int nPnls;
+  long long nInteractions;
+  int *h_src;
+  int *h_dst;
+  double *h_k0;
+  double *h_k1;
+  double *h_k2;
+  double *h_k3;
+  int *d_src;
+  int *d_dst;
+  double *d_k0;
+  double *d_k1;
+  double *d_k2;
+  double *d_k3;
+  double *d_sgm;
+  double *d_pot;
+};
+
+NearfieldGpuCache gNear = {};
+
+void freeNearfieldCache() {
+  free(gNear.h_src);
+  free(gNear.h_dst);
+  free(gNear.h_k0);
+  free(gNear.h_k1);
+  free(gNear.h_k2);
+  free(gNear.h_k3);
+  gNear.h_src = NULL;
+  gNear.h_dst = NULL;
+  gNear.h_k0 = NULL;
+  gNear.h_k1 = NULL;
+  gNear.h_k2 = NULL;
+  gNear.h_k3 = NULL;
+
+  cudaFree(gNear.d_src);
+  cudaFree(gNear.d_dst);
+  cudaFree(gNear.d_k0);
+  cudaFree(gNear.d_k1);
+  cudaFree(gNear.d_k2);
+  cudaFree(gNear.d_k3);
+  cudaFree(gNear.d_sgm);
+  cudaFree(gNear.d_pot);
+  gNear.d_src = NULL;
+  gNear.d_dst = NULL;
+  gNear.d_k0 = NULL;
+  gNear.d_k1 = NULL;
+  gNear.d_k2 = NULL;
+  gNear.d_k3 = NULL;
+  gNear.d_sgm = NULL;
+  gNear.d_pot = NULL;
+
+  gNear.sys = NULL;
+  gNear.nPnls = 0;
+  gNear.nInteractions = 0;
+}
+
+int allocateHostArrays(long long n) {
+  size_t ni = (size_t)n;
+  gNear.h_src = (int *)malloc(ni * sizeof(int));
+  gNear.h_dst = (int *)malloc(ni * sizeof(int));
+  gNear.h_k0 = (double *)malloc(ni * sizeof(double));
+  gNear.h_k1 = (double *)malloc(ni * sizeof(double));
+  gNear.h_k2 = (double *)malloc(ni * sizeof(double));
+  gNear.h_k3 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_src || !gNear.h_dst || !gNear.h_k0 || !gNear.h_k1 || !gNear.h_k2 || !gNear.h_k3) {
+    return 0;
+  }
+  return 1;
+}
+
+int allocateDeviceArrays(int nPnls, long long nInteractions) {
+  size_t ni = (size_t)nInteractions;
+  size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
+  cudaError_t err = cudaSuccess;
+
+  err = cudaMalloc((void **)&gNear.d_src, ni * sizeof(int));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_dst, ni * sizeof(int));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_k0, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_k1, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_k2, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_k3, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_sgm, vecBytes);
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gNear.d_pot, vecBytes);
+  if (err != cudaSuccess) return 0;
+
+  return 1;
+}
+
+int buildNearfieldTables(const ssystem *sys) {
+  int pairIdx;
+  long long totalInteractions = 0;
+  long long k = 0;
+
+  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+    int srcLeaf = sys->nearPairSrc[pairIdx];
+    int dstLeaf = sys->nearPairDst[pairIdx];
+    long long srcCount = (long long)sys->leafPanelCount[srcLeaf];
+    long long dstCount = (long long)sys->leafPanelCount[dstLeaf];
+    totalInteractions += srcCount * dstCount;
+  }
+
+  if (totalInteractions <= 0) {
+    return 0;
+  }
+  if (!allocateHostArrays(totalInteractions)) {
+    return 0;
+  }
+
+  kernel = kernelKER4;
+  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+    int srcLeaf = sys->nearPairSrc[pairIdx];
+    int dstLeaf = sys->nearPairDst[pairIdx];
+    int srcStart = sys->leafPanelStart[srcLeaf];
+    int srcCount = sys->leafPanelCount[srcLeaf];
+    int dstStart = sys->leafPanelStart[dstLeaf];
+    int dstCount = sys->leafPanelCount[dstLeaf];
+    int i, j;
+
+    for (i = 0; i < dstCount; i++) {
+      int dstPanelIdx = dstStart + i;
+      panel *pnlX = sys->panelByIdx[dstPanelIdx];
+      for (j = 0; j < srcCount; j++) {
+        int srcPanelIdx = srcStart + j;
+        panel *pnlY = sys->panelByIdx[srcPanelIdx];
+        double *KER = panelIA0(pnlX, pnlY);
+
+        gNear.h_dst[k] = dstPanelIdx;
+        gNear.h_src[k] = srcPanelIdx;
+        gNear.h_k0[k] = KER[0];
+        gNear.h_k1[k] = KER[1];
+        gNear.h_k2[k] = KER[2];
+        gNear.h_k3[k] = KER[3];
+        k++;
+      }
+    }
+  }
+
+  if (!allocateDeviceArrays(sys->nPnls, totalInteractions)) {
+    return 0;
+  }
+
+  if (cudaMemcpy(gNear.d_src, gNear.h_src, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (cudaMemcpy(gNear.d_dst, gNear.h_dst, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (cudaMemcpy(gNear.d_k0, gNear.h_k0, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (cudaMemcpy(gNear.d_k1, gNear.h_k1, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (cudaMemcpy(gNear.d_k2, gNear.h_k2, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (cudaMemcpy(gNear.d_k3, gNear.h_k3, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+
+  gNear.sys = sys;
+  gNear.nPnls = sys->nPnls;
+  gNear.nInteractions = totalInteractions;
+  printf("GPU nearfield cache: panel-pairs=%lld\n", totalInteractions);
+  return 1;
+}
+
+__global__ void nearfieldApplyKernel(
+    int nPnls,
+    long long nInteractions,
+    const int *src,
+    const int *dst,
+    const double *k0,
+    const double *k1,
+    const double *k2,
+    const double *k3,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nInteractions) {
+    return;
+  }
+
+  int s = src[tid];
+  int d = dst[tid];
+  double x_pot = sgm[s];
+  double x_dpdn = sgm[s + nPnls];
+  double addPot = (k0[tid] * x_dpdn + k1[tid] * x_pot) * alpha;
+  double addDpdn = (k2[tid] * x_dpdn + k3[tid] * x_pot) * alpha;
+
+#if __CUDA_ARCH__ >= 600
+  atomicAdd(&pot[d], addPot);
+  atomicAdd(&pot[d + nPnls], addDpdn);
+#else
+  unsigned long long int *addr1 = (unsigned long long int *)&pot[d];
+  unsigned long long int old1 = *addr1, assumed1;
+  do {
+    assumed1 = old1;
+    old1 = atomicCAS(addr1, assumed1,
+                     __double_as_longlong(addPot + __longlong_as_double(assumed1)));
+  } while (assumed1 != old1);
+
+  unsigned long long int *addr2 = (unsigned long long int *)&pot[d + nPnls];
+  unsigned long long int old2 = *addr2, assumed2;
+  do {
+    assumed2 = old2;
+    old2 = atomicCAS(addr2, assumed2,
+                     __double_as_longlong(addDpdn + __longlong_as_double(assumed2)));
+  } while (assumed2 != old2);
+#endif
+}
+}  // namespace
 
 int gpuBackendAvailable(void) {
+  static int warned = 0;
   int deviceCount = 0;
   cudaError_t err = cudaGetDeviceCount(&deviceCount);
   if (err != cudaSuccess) {
+    if (!warned) {
+      printf("CUDA backend unavailable: %s\n", cudaGetErrorString(err));
+      warned = 1;
+    }
     return 0;
   }
   return (deviceCount > 0) ? 1 : 0;
 }
 
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
-  (void)sys;
-  (void)alpha;
-  (void)sgm;
-  (void)pot;
+  cudaError_t err;
+  size_t vecBytes;
+  int blockSize;
+  int gridSize;
 
-  /*
-   * Stage-1 GPU integration:
-   * runtime backend wiring is in place, but nearfield compute still falls back
-   * to CPU until panel quadrature and neighbor-list kernels are ported.
-   */
-  return 0;
+  if (sys == NULL || sgm == NULL || pot == NULL) {
+    return 0;
+  }
+
+  if (gNear.sys != sys) {
+    freeNearfieldCache();
+    if (!buildNearfieldTables(sys)) {
+      freeNearfieldCache();
+      return 0;
+    }
+  }
+
+  vecBytes = (size_t)(2 * gNear.nPnls) * sizeof(double);
+  err = cudaMemcpy(gNear.d_sgm, sgm, vecBytes, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) return 0;
+  err = cudaMemcpy(gNear.d_pot, pot, vecBytes, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) return 0;
+
+  blockSize = 256;
+  gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
+  nearfieldApplyKernel<<<gridSize, blockSize>>>(
+      gNear.nPnls, gNear.nInteractions,
+      gNear.d_src, gNear.d_dst, gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
+      alpha, gNear.d_sgm, gNear.d_pot);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return 0;
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) return 0;
+
+  err = cudaMemcpy(pot, gNear.d_pot, vecBytes, cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) return 0;
+  return 1;
 }

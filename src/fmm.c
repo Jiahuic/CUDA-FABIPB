@@ -41,6 +41,10 @@ double paramEllip( panel *pnl, double x, double y, double *r, double *nrm );
 void dumpStats(ssystem *sys);
 int nrCommonVtx( panel *p, panel *q, int *idxX, int *idxY );
 
+static cube **m2lSrcPairs, **m2lDstPairs;
+static int *m2lOrderPairs;
+static int nM2LPairs;
+
 static double wall_seconds_local(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -102,6 +106,38 @@ static void buildPanelIndex(ssystem *sys) {
     sys->panelByIdx[idx] = pnl;
   }
   ASSERT(idx == sys->nPnls);
+}
+
+static void buildM2LPairList(ssystem *sys) {
+  cube *cb;
+  int depth = sys->depth;
+  int height = sys->height;
+  int lev;
+  int idx = 0;
+
+  nM2LPairs = 0;
+  for (lev = depth; lev >= height; lev--) {
+    for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next) {
+      nM2LPairs += (cb->n2Nbrs - cb->nNbrs);
+    }
+  }
+
+  CALLOC(m2lSrcPairs, nM2LPairs, cube *);
+  CALLOC(m2lDstPairs, nM2LPairs, cube *);
+  CALLOC(m2lOrderPairs, nM2LPairs, int);
+
+  for (lev = depth; lev >= height; lev--) {
+    int order = sys->ordM2L[lev];
+    int iNbr;
+    for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next) {
+      for (iNbr = cb->n2Nbrs - 1; iNbr >= cb->nNbrs; iNbr--, idx++) {
+        m2lSrcPairs[idx] = cb->nbrs[iNbr];
+        m2lDstPairs[idx] = cb;
+        m2lOrderPairs[idx] = order;
+      }
+    }
+  }
+  ASSERT(idx == nM2LPairs);
 }
 
 extern double **dG0;     /* workspace for setupDerivs */
@@ -176,8 +212,10 @@ void setupFMM(ssystem *sys) {
 
   buildApplyLayout(sys);
   buildPanelIndex(sys);
+  buildM2LPairList(sys);
   printf("Flattened apply layout: leaf-cubes=%d near-pairs=%d\n",
          sys->nLeafCubesFlat, sys->nNearPairsFlat);
+  printf("Flattened interaction layout: m2l-pairs=%d\n", nM2LPairs);
 
 } /* setupFMM */
 
@@ -227,18 +265,20 @@ static void applyNearfield1CPU(ssystem *sys, double *alpha, double *sgm, double 
 
 void applyNearfield1(ssystem *sys, double *alpha, double *sgm, double *beta, double *pot) {
   static int warnedNoGpuBackend = 0;
+  static int warnedGpuApplyFailure = 0;
 
   if (sys->gpuMode > 0) {
     if (gpuNearfieldApply(sys, *alpha, sgm, pot)) {
       return;
     }
-    if (!warnedNoGpuBackend) {
-      if (!gpuBackendAvailable()) {
+    if (!gpuBackendAvailable()) {
+      if (!warnedNoGpuBackend) {
         printf("GPU backend requested but unavailable; using CPU nearfield path.\n");
-      } else {
-        printf("GPU backend selected but nearfield kernel is not ported yet; using CPU fallback.\n");
+        warnedNoGpuBackend = 1;
       }
-      warnedNoGpuBackend = 1;
+    } else if (!warnedGpuApplyFailure) {
+      printf("GPU nearfield path failed at runtime; using CPU fallback.\n");
+      warnedGpuApplyFailure = 1;
     }
   }
 
@@ -258,7 +298,7 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   double *x, *y, *lec;
   double r[3], *self;
   int depth=sys->depth, height=sys->height, nPnls=sys->nPnls;
-  int nKid, nKid1, iNbr, iPnl, nNbrs, idx, nMom, order;
+  int nKid, nKid1, iPnl, idx, nMom, order;
   int i, k, lev, n, n1, inc = 1;
   double time1, time2;
 
@@ -306,23 +346,17 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
 
   /* Interaction phase */
   time1 = wall_seconds_local();
-  for ( idx=0, lev=depth; lev>=height; lev-- ) {
-    for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
-      nNbrs = cb->nNbrs;
-#if !STOREM2L
-      order=sys->ordM2L[lev];
-#endif
-      for ( iNbr=cb->n2Nbrs-1; iNbr>=nNbrs; iNbr--, idx++ ) {
+  for (idx = 0; idx < nM2LPairs; idx++) {
 #if STOREM2L
-        transM2L(sys, Gp0[idx], Gpk[idx], cb->nbrs[iNbr], cb);
+    transM2L(sys, Gp0[idx], Gpk[idx], m2lSrcPairs[idx], m2lDstPairs[idx]);
 #else
-        cb1 = cb->nbrs[iNbr];
-        for ( k=0; k<3; k++ ) r[k] = cb->x[k] - cb1->x[k];
-        setupDerivs(order, r);
-        transM2L(sys, dG0[0], dGk[0], cb1, cb);
+    cb1 = m2lSrcPairs[idx];
+    cb = m2lDstPairs[idx];
+    order = m2lOrderPairs[idx];
+    for (k = 0; k < 3; k++) r[k] = cb->x[k] - cb1->x[k];
+    setupDerivs(order, r);
+    transM2L(sys, dG0[0], dGk[0], cb1, cb);
 #endif
-      }
-    }
   }
   time2 = wall_seconds_local();
   fmmM2LTime += (time2 - time1);
