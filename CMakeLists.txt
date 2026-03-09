@@ -32,10 +32,14 @@ set(FMM_PB_SOURCES
   src/treecode.c
 )
 
-option(FMM_PB_ENABLE_CUDA "Build CUDA GPU backend hooks" OFF)
-if(FMM_PB_ENABLE_CUDA)
+option(FMM_PB_ENABLE_CUDA "Build CUDA GPU backend hooks when a CUDA toolkit is available" ON)
+include(CheckLanguage)
+check_language(CUDA)
+set(FMM_PB_HAS_CUDA OFF)
+if(FMM_PB_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  set(FMM_PB_HAS_CUDA ON)
   list(APPEND FMM_PB_SOURCES src/gpu_backend_cuda.cu)
 else()
   list(APPEND FMM_PB_SOURCES src/gpu_backend_stub.c)
@@ -48,7 +52,7 @@ target_include_directories(coulomb
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-if(FMM_PB_ENABLE_CUDA)
+if(FMM_PB_HAS_CUDA)
   target_compile_definitions(coulomb PRIVATE FMM_PB_HAS_CUDA_BACKEND=1)
 else()
   target_compile_definitions(coulomb PRIVATE FMM_PB_HAS_CUDA_BACKEND=0)
@@ -76,7 +80,7 @@ target_link_libraries(coulomb
     BLAS::BLAS
 )
 
-if(FMM_PB_ENABLE_CUDA)
+if(FMM_PB_HAS_CUDA)
   target_link_libraries(coulomb PRIVATE CUDA::cudart)
 endif()
 
@@ -90,5 +94,6 @@ endif()
 
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 message(STATUS "BLA_VENDOR hint: ${BLA_VENDOR}")
+message(STATUS "CUDA backend enabled: ${FMM_PB_HAS_CUDA}")
 message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
 message(STATUS "LAPACK libraries: ${LAPACK_LIBRARIES}")

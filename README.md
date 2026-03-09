@@ -1,6 +1,6 @@
 # fmm_PB
 
-Finite-memory fast multipole solver for the Poisson-Boltzmann equation using a Galerkin formulation. The current repository contains a CPU build and is being reorganized toward a cleaner `src/` and `include/` layout that can support later GPU work.
+Finite-memory fast multipole solver for the Poisson-Boltzmann equation using a Galerkin formulation. The preferred workflow now uses a single build in `build/`: if a CUDA toolkit is available at configure time, the binary includes the CUDA backend and uses the GPU automatically at runtime when available.
 
 ## Repository layout
 
@@ -26,32 +26,32 @@ Install notes are in [`docs/dependencies.md`](/Users/jiahuic/Garage/electrostati
 
 Recommended build layout:
 
-- `build/`: CPU executable
-- `build-cuda/`: CUDA-enabled executable
-- `build-prof/`: profiling executable
+- `build/`: default executable, with CUDA enabled automatically when available
+- `build-prof/`: optional profiling build
 
-CPU configure:
+Default configure:
 
 ```sh
 cmake -S . -B build
 ```
 
-CPU build:
+Default build:
 
 ```sh
 cmake --build build
 ```
 
-CUDA configure:
+Optional explicit CPU-only configure:
 
 ```sh
-cmake -S . -B build-cuda -DFMM_PB_ENABLE_CUDA=ON
+cmake -S . -B build -DFMM_PB_ENABLE_CUDA=OFF
 ```
 
-CUDA build:
+Optional profiling configure:
 
 ```sh
-cmake --build build-cuda
+cmake -S . -B build-prof -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-prof
 ```
 
 For cross-machine performance comparisons, use a consistent benchmark setup:
@@ -73,30 +73,30 @@ If these are left unset, CPU and GPU comparisons can become misleading because
 the GMRES path uses many BLAS vector operations and the threaded runtime
 overhead can dominate the measured wall time.
 
-For reproducible timings, export:
+The solver now defaults these common runtime variables to `1` if they are not
+already set:
 
 ```sh
-export OMP_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export BLIS_NUM_THREADS=1
+OMP_NUM_THREADS
+OPENBLAS_NUM_THREADS
+MKL_NUM_THREADS
+VECLIB_MAXIMUM_THREADS
+BLIS_NUM_THREADS
 ```
 
-Use the same environment for both CPU and GPU runs.
+This is a runtime concern, not a reliable compile-time setting across BLAS
+vendors. For explicit, reproducible benchmark logs, prefer:
+
+```sh
+./scripts/with_benchmark_env.sh <command> ...
+```
 
 Recommended manual comparison workflow:
 
 ```sh
-export OMP_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export BLIS_NUM_THREADS=1
-
-./build/coulomb test_proteins/1a63
-./build/coulomb -m=0 test_proteins/1a63
-./build-cuda/coulomb -g=1 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/coulomb test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/coulomb -g=0 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/coulomb -g=1 -m=0 test_proteins/1a63
 ```
 
 Notes:
@@ -112,7 +112,7 @@ Notes:
 Optional one-shot debug comparison of CPU vs GPU `applyFMM` on the same input:
 
 ```sh
-./build-cuda/coulomb -g=1 -c=1 -m=0 test_proteins/1a63
+./build/coulomb -g=1 -c=1 -m=0 test_proteins/1a63
 ```
 
 This prints a single `applyFMM debug compare` line with `max_abs` and `rel_l2`
@@ -132,21 +132,45 @@ The configure step checks BLAS and LAPACK up front and stops immediately if eith
 
 If BLAS/LAPACK live in non-default locations, pass the usual CMake search hints, for example through `CMAKE_PREFIX_PATH`.
 
-At runtime, pass `-g=1` to request the GPU near-field backend. If the backend is unavailable or not yet fully implemented, the solver falls back to the CPU path.
+At runtime:
+
+- default startup uses the GPU automatically when the backend is present
+- pass `-g=0` to force CPU
+- pass `-g=1` to require/request GPU explicitly
+
+If the backend is unavailable or not yet fully implemented for a path, the solver falls back to the CPU path.
 
 ## Run
 
-CPU:
+Default run (auto GPU if available):
 
 ```sh
 ./build/coulomb test_proteins/1a7m
 ```
 
-GPU:
+Force CPU:
 
 ```sh
-./build-cuda/coulomb -g=1 test_proteins/1a7m
+./build/coulomb -g=0 test_proteins/1a7m
 ```
+
+Force GPU:
+
+```sh
+./build/coulomb -g=1 test_proteins/1a7m
+```
+
+Direct GPU dense baseline:
+
+```sh
+./build/coulomb -g=1 -r=1 -m=0 test_proteins/1ajj
+```
+
+Notes:
+
+- `-r=1` selects the direct GPU baseline matvec instead of the FMM matvec
+- direct mode is intended for benchmark/reference use and may be limited by GPU memory
+- direct mode prints its estimated host/device memory footprint before allocation
 
 ## Professionalization goals
 

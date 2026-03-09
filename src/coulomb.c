@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /*
  * coulomb.c: main driver
  * This program computes the boundary integral PB equation with fmm method
@@ -12,6 +13,7 @@
 #include <math.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gmres.h"
@@ -43,6 +45,37 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot);
 int PtVfmm(double *pot, double *sgm);
 
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
+
+static void set_benchmark_thread_defaults(void) {
+  const char *vars[] = {
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS"
+  };
+  size_t i;
+
+  for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+    if (getenv(vars[i]) == NULL) {
+      setenv(vars[i], "1", 0);
+    }
+  }
+}
+
+static void buildPanelIndexDirect(ssystem *sys) {
+  int idx = 0;
+  panel *pnl;
+
+  if (sys->panelByIdx != NULL) {
+    return;
+  }
+  CALLOC(sys->panelByIdx, sys->nPnls, panel *);
+  for (pnl = sys->pnlLst; pnl != NULL; pnl = pnl->nextC, idx++) {
+    ASSERT(idx < sys->nPnls);
+    sys->panelByIdx[idx] = pnl;
+  }
+}
 
 static void compareApplyFMMOnce(ssystem *sys, double *sgm) {
   double *potCpu, *potGpu;
@@ -153,14 +186,16 @@ int main(int nargs, char *argv[]){
   double setupPC_t, setupRHS_t, gmres_t, treecode_t;
 
   CALLOC(sys, 1, ssystem);
+  set_benchmark_thread_defaults();
   sys->height = 2;
   sys->maxSepRatio = 0.8;
   sys->maxQuadOrder = 1;
   sys->nKerl = 4;
   sys->depth = 5;
   sys->mesh_flag = 1;
-  sys->gpuMode = 0;
+  sys->gpuMode = -1;
   sys->debugCompareApply = 0;
+  sys->matvecMode = 0;
   sprintf(density,"1");
   double bulk_strength = 0.15;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2);
@@ -198,6 +233,8 @@ int main(int nargs, char *argv[]){
           break;
         case 'c': sys->debugCompareApply = atoi( argv[i]+3 );
           break;
+        case 'r': sys->matvecMode = atoi( argv[i]+3 );
+          break;
       }
     else {
       strcpy(panelfile,argv[i]);
@@ -223,13 +260,22 @@ int main(int nargs, char *argv[]){
     }
   }
   //printf("PDB id: %s, MSMS density: %s\n", panelfile, density);
+  if (sys->gpuMode < 0) {
+    sys->gpuMode = gpuBackendAvailable() ? 1 : 0;
+  }
+
   printf("----------------------------\n");
-  printf("FMM variables: nLev=%d ord=%d SepRat=%lg qOrd=%d\n",
-    sys->depth, order, sys->maxSepRatio, sys->maxQuadOrder );
+  if (sys->matvecMode == 0) {
+    printf("FMM variables: nLev=%d ord=%d SepRat=%lg qOrd=%d\n",
+      sys->depth, order, sys->maxSepRatio, sys->maxQuadOrder );
+  } else {
+    printf("Direct GPU baseline mode enabled (no FMM matvec)\n");
+  }
   printf("GMRES variables: tol=%1.e arnoldiSz=%d maxIt=%d\n",
     tolpar, arnoldiSz, numItr);
   printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
-  printf("GPU mode=%d (0=CPU fallback)\n", sys->gpuMode);
+  printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
+  printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
   //printf("----------------------------\n");
 
 
@@ -250,9 +296,14 @@ int main(int nargs, char *argv[]){
   CALLOC(sgm, 2*nPnls, double);
   CALLOC(pot, 2*nPnls, double);
 
-  stage_t0 = wall_seconds();
-  setupFMM(sys);
-  setupFMM_t_local = wall_seconds() - stage_t0;
+  if (sys->matvecMode == 0 || sys->debugCompareApply > 0) {
+    stage_t0 = wall_seconds();
+    setupFMM(sys);
+    setupFMM_t_local = wall_seconds() - stage_t0;
+  } else {
+    buildPanelIndexDirect(sys);
+    setupFMM_t_local = 0.0;
+  }
   stage_t0 = wall_seconds();
   setupPreconditioning(sys);
   setupPC_t = wall_seconds() - stage_t0;
@@ -288,7 +339,11 @@ int main(int nargs, char *argv[]){
   printf("solvation energy: %f\n", ptl);
   printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
          loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
-  printFmmMatvecStats();
+  if (sys->matvecMode == 0) {
+    printFmmMatvecStats();
+  } else {
+    printf("Direct GPU baseline run: FMM stage stats omitted.\n");
+  }
 
 }
 
@@ -304,6 +359,7 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
   panel *pnl;
   double scale1, scale2, inv_beta;
   double callStart, callEnd, applyStart, applyEnd;
+  static int warnedDirectGpu = 0;
 
   scale1 = (1.0+epsilon)/2.0*(*alpha);
   scale2 = (1.0+1.0/epsilon)/2.0*(*alpha);
@@ -311,7 +367,17 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
   callStart = wall_seconds();
   inv_beta = -(*beta);
   applyStart = wall_seconds();
-  applyFMM(sys, alpha, sgm, &inv_beta, pot);
+  if (sys->matvecMode == 1) {
+    if (!gpuDirectApply(sys, *alpha, inv_beta, sgm, pot)) {
+      if (!warnedDirectGpu) {
+        printf("Direct GPU matvec unavailable; using FMM path.\n");
+        warnedDirectGpu = 1;
+      }
+      applyFMM(sys, alpha, sgm, &inv_beta, pot);
+    }
+  } else {
+    applyFMM(sys, alpha, sgm, &inv_beta, pot);
+  }
   applyEnd = wall_seconds();
   for (  i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {
     pot[i] = (scale1*pnl->area*sgm[i]-pot[i]);

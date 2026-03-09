@@ -2,6 +2,70 @@ Below is a concrete, **paper-driven plan** to turn your existing **FMM-based Poi
 
 ---
 
+## Current Status (March 9, 2026)
+
+Main should stay on the last stable fast baseline at commit `a243a0c`.
+
+The slower experimental work has been preserved separately on branch:
+
+* `nearfield-grouped-experiment`
+* tip commit: `cbd69d0`
+
+Summary of what was learned from that branch:
+
+* flattened M2L caching reduced M2L time, but increased `setupFMM`
+* destination-grouped near-field metadata and grouped kernel did not recover overall speedup on the tested machine
+* the known-good GPU speedup still comes primarily from the original GPU near-field path
+
+Implication for mainline work:
+
+* keep the stable near-field GPU baseline on `main`
+* treat grouped near-field and GPU M2L as experimental branches until they show a clear end-to-end win
+
+Near-field work that is still worth pursuing later:
+
+1. keep `panelIA0()` cache construction as a one-time setup outside GMRES
+2. reduce host-device traffic in repeated near-field applies
+3. test coarser grouping strategies such as destination-leaf grouping before per-panel grouping
+4. only revisit full GPU coefficient generation after the current near-field baseline is fully characterized
+
+How to treat destination-grouped near-field:
+
+* keep it as the innovation path, but not the default production path yet
+* continue developing it on `nearfield-grouped-experiment`, not on `main`
+* use `main` for stable correctness and timing baselines
+* only merge it back when it shows a clear end-to-end improvement over the current atomic-kernel baseline
+
+Grouped near-field research priorities:
+
+1. reduce grouped-metadata setup cost
+2. measure setup time, transfer time, and kernel time separately
+3. test destination-leaf grouping before destination-panel grouping
+4. revisit per-panel grouping only if the grouped apply phase is clearly superior when amortized over GMRES iterations
+
+Required benchmark baseline to add:
+
+* implement a direct GPU matvec baseline with no FMM
+* this baseline should compute the full dense/direct interaction on GPU and use the GPU only as an accelerator for the direct matvec
+* compare three paths in future benchmark tables:
+  1. CPU baseline
+  2. direct GPU matvec baseline without FMM
+  3. GPU-accelerated FMM solver
+
+Benchmark goal:
+
+* show that GPU-FMM integration beats the non-FMM direct GPU baseline at relevant biomolecular problem sizes
+* this comparison is important for the paper because it demonstrates that the FMM integration itself, not just “using a GPU,” is the source of the scalability gain
+
+Direct GPU baseline implementation notes:
+
+* first version should be treated as a benchmark/reference path, not the default solver
+* v1 may precompute dense panel interaction coefficients with `panelIA0()` and upload them once to GPU
+* this makes v1 suitable only for cases that fit GPU memory; large cases should fail clearly rather than silently distort the benchmark
+* after v1 is working, the next step is to separate coefficient-build cost from steady-state dense GPU matvec cost
+
+---
+
 ## 1) Pick a PB formulation that matches your current solver
 
 Most FMM-PB solvers fall into one of these camps:
