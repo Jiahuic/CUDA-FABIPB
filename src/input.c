@@ -200,7 +200,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
    }
   }
 
-  if ( mesh_flag == 1 ) {
+  if ( mesh_flag != 2 ) {
     ierr=fscanf(fp,"%d %d %lf %lf ",&nspt,&natm,&den,&prob_rds);
     //printf("nspt=%d, natm=%d, den=%lf, prob=%lf\n", nspt,natm,den,prob_rds);
   } else if ( mesh_flag == 2 ) {
@@ -236,7 +236,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   }
   for ( i=1; i<=2; i++ ) { while ((c=getc(fp))!='\n'){} }
 
-  if ( mesh_flag == 1 ) {
+  if ( mesh_flag != 2 ) {
     ierr=fscanf(fp,"%d %d %lf %lf ",&nface,&natm,&den,&prob_rds);
   //printf("nface=%d, natm=%d, den=%lf, prob=%lf\n", nface,natm,den,prob_rds);
   } else if ( mesh_flag == 2 ) {
@@ -339,18 +339,8 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   printf("Area=%f \n",s_area);
   //printf("%d ugly faces are deleted\n", nface-*numSing);
 
-  {
-    char rmcmd[512];
-    buildPath(fname, sizeof(fname), fpath, panelfile, ".xyzr");
-    sprintf(rmcmd,"rm %s",fname);
-    ierr=system(rmcmd);
-    buildPath(fname, sizeof(fname), fpath, panelfile, ".vert");
-    sprintf(rmcmd,"rm %s",fname);
-    ierr=system(rmcmd);
-    buildPath(fname, sizeof(fname), fpath, panelfile, ".face");
-    sprintf(rmcmd,"rm %s",fname);
-    ierr=system(rmcmd);
-  }
+  /* Keep generated mesh artifacts on disk so repeated runs can use -m=0
+   * for apples-to-apples CPU/GPU comparisons without remeshing. */
 
   for (i=0;i<3;i++){
     free(sptpos[i]);

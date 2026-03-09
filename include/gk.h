@@ -75,6 +75,7 @@ struct ssystem {
   double *pos, *chr;        /* charge position and charges for rhs */
   int mesh_flag;            /* mesh format flag */
   int gpuMode;              /* 0=CPU only, >0 request GPU backend */
+  int debugCompareApply;    /* 0=off, >0 compare one CPU/GPU applyFMM call */
   int nLeafCubesFlat;       /* flattened finest-level cube count */
   int *leafPanelStart;      /* flattened per-leaf panel start index */
   int *leafPanelCount;      /* flattened per-leaf panel count */

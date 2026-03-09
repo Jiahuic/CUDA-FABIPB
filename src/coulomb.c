@@ -15,6 +15,7 @@
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gmres.h"
+#include "gpu_backend.h"
 
 /* global variables */
 int orderMom=0;
@@ -42,6 +43,67 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot);
 int PtVfmm(double *pot, double *sgm);
 
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
+
+static void compareApplyFMMOnce(ssystem *sys, double *sgm) {
+  double *potCpu, *potGpu;
+  double alpha = 1.0, beta = 0.0;
+  double maxAbs = 0.0, l2Diff = 0.0, l2Ref = 0.0;
+  double savedQ2M, savedM2M, savedM2L, savedL2L, savedL2P, savedNear;
+  int oldGpuMode = sys->gpuMode;
+  int maxIdx = -1;
+  int i, n = 2 * sys->nPnls;
+
+  if (oldGpuMode <= 0) {
+    printf("applyFMM debug compare skipped: run with -g=1 to compare CPU and GPU paths.\n");
+    return;
+  }
+  if (!gpuBackendAvailable()) {
+    printf("applyFMM debug compare skipped: GPU backend unavailable.\n");
+    return;
+  }
+
+  CALLOC(potCpu, n, double);
+  CALLOC(potGpu, n, double);
+
+  savedQ2M = fmmQ2MTime;
+  savedM2M = fmmM2MTime;
+  savedM2L = fmmM2LTime;
+  savedL2L = fmmL2LTime;
+  savedL2P = fmmL2PTime;
+  savedNear = fmmNearTime;
+
+  sys->gpuMode = 0;
+  applyFMM(sys, &alpha, sgm, &beta, potCpu);
+  sys->gpuMode = oldGpuMode;
+  applyFMM(sys, &alpha, sgm, &beta, potGpu);
+
+  fmmQ2MTime = savedQ2M;
+  fmmM2MTime = savedM2M;
+  fmmM2LTime = savedM2L;
+  fmmL2LTime = savedL2L;
+  fmmL2PTime = savedL2P;
+  fmmNearTime = savedNear;
+
+  for (i = 0; i < n; i++) {
+    double diff = fabs(potCpu[i] - potGpu[i]);
+    if (diff > maxAbs) {
+      maxAbs = diff;
+      maxIdx = i;
+    }
+    l2Diff += diff * diff;
+    l2Ref += potCpu[i] * potCpu[i];
+  }
+
+  printf("applyFMM debug compare: max_abs=%e rel_l2=%e max_idx=%d cpu=%e gpu=%e\n",
+         maxAbs,
+         (l2Ref > 0.0) ? sqrt(l2Diff / l2Ref) : 0.0,
+         maxIdx,
+         (maxIdx >= 0) ? potCpu[maxIdx] : 0.0,
+         (maxIdx >= 0) ? potGpu[maxIdx] : 0.0);
+
+  free(potCpu);
+  free(potGpu);
+}
 
 static double wall_seconds(void) {
   struct timeval tv;
@@ -87,6 +149,8 @@ int main(int nargs, char *argv[]){
   static int info;
 
   double start_t, end_t;
+  double stage_t0, loadPanel_t, gkInit_t, setupFMM_t_local;
+  double setupPC_t, setupRHS_t, gmres_t, treecode_t;
 
   CALLOC(sys, 1, ssystem);
   sys->height = 2;
@@ -96,6 +160,7 @@ int main(int nargs, char *argv[]){
   sys->depth = 5;
   sys->mesh_flag = 1;
   sys->gpuMode = 0;
+  sys->debugCompareApply = 0;
   sprintf(density,"1");
   double bulk_strength = 0.15;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2);
@@ -130,6 +195,8 @@ int main(int nargs, char *argv[]){
         case 'm': sys->mesh_flag = atoi( argv[i]+3 );
           break;
         case 'g': sys->gpuMode = atoi( argv[i]+3 );
+          break;
+        case 'c': sys->debugCompareApply = atoi( argv[i]+3 );
           break;
       }
     else {
@@ -171,18 +238,31 @@ int main(int nargs, char *argv[]){
    * or use the panel on sphere test example
    */
   start_t = wall_seconds();
+  stage_t0 = start_t;
   inputLst = loadPanel(panelfile, density, &nPnls, sys);
+  loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
 
+  stage_t0 = wall_seconds();
   gkInit(sys, inputLst, order, orderMom);
+  gkInit_t = wall_seconds() - stage_t0;
 
   CALLOC(sgm, 2*nPnls, double);
   CALLOC(pot, 2*nPnls, double);
 
+  stage_t0 = wall_seconds();
   setupFMM(sys);
+  setupFMM_t_local = wall_seconds() - stage_t0;
+  stage_t0 = wall_seconds();
   setupPreconditioning(sys);
+  setupPC_t = wall_seconds() - stage_t0;
 
+  stage_t0 = wall_seconds();
   setupRHS(sys, sgm);
+  setupRHS_t = wall_seconds() - stage_t0;
+  if (sys->debugCompareApply > 0) {
+    compareApplyFMMOnce(sys, sgm);
+  }
   for ( i=0; i<2*sys->nPnls; i++ ) pot[i] = sgm[i];
 
   MtV = MtVmain;
@@ -194,14 +274,20 @@ int main(int nargs, char *argv[]){
   CALLOC(GMRES_h, ldh*(arnoldiSz+2), double);
 
   resetFmmMatvecStats();
+  stage_t0 = wall_seconds();
   gmres(ldw, pot, sgm, arnoldiSz, GMRES_work, ldw, GMRES_h, ldh,
         &numItr, &tolpar, MtV, PtV, &info);
+  gmres_t = wall_seconds() - stage_t0;
 
+  stage_t0 = wall_seconds();
   applyTreecode( sys, sgm, &ptl );
+  treecode_t = wall_seconds() - stage_t0;
   ptl *= twoPi*para;
   end_t = wall_seconds() - start_t;
   printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
   printf("solvation energy: %f\n", ptl);
+  printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
+         loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
   printFmmMatvecStats();
 
 }

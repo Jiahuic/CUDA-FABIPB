@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-BUILD_DIR="${BUILD_DIR:-build}"
+BUILD_DIR="${BUILD_DIR:-build-cuda}"
 
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 <panel-base-or-pqr-path> [solver options...]" >&2
@@ -27,6 +27,7 @@ mkdir -p "$OUT_DIR"
 
 cpu_log="$OUT_DIR/cpu.log"
 gpu_log="$OUT_DIR/gpu.log"
+prep_log="$OUT_DIR/prep.log"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -34,8 +35,15 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
 export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-1}"
 
-"$BUILD_DIR/coulomb" -g=0 "$panel" "$@" >"$cpu_log" 2>&1
-"$BUILD_DIR/coulomb" -g=1 "$panel" "$@" >"$gpu_log" 2>&1
+mesh_vert="${panel}.vert"
+mesh_face="${panel}.face"
+if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
+  echo "Preparing mesh artifacts for $panel ..."
+  "$BUILD_DIR/coulomb" -g=0 "$panel" "$@" >"$prep_log" 2>&1
+fi
+
+"$BUILD_DIR/coulomb" -g=0 -m=0 "$panel" "$@" >"$cpu_log" 2>&1
+"$BUILD_DIR/coulomb" -g=1 -m=0 "$panel" "$@" >"$gpu_log" 2>&1
 
 extract_metric() {
   log="$1"
@@ -75,6 +83,9 @@ speedup="$(awk -v c="$cpu_ttl" -v g="$gpu_ttl" 'BEGIN{if(g==0){print "inf"}else{
 
 echo "Comparison run"
 echo "  panel: $panel"
+if [ -f "$prep_log" ]; then
+  echo "  prep:  $prep_log"
+fi
 echo "  cpu:   ttl=${cpu_ttl}s its=${cpu_its} energy=${cpu_energy} calls=${cpu_calls} near_ms=${cpu_near_ms}"
 echo "  gpu:   ttl=${gpu_ttl}s its=${gpu_its} energy=${gpu_energy} calls=${gpu_calls} near_ms=${gpu_near_ms}"
 echo "  delta: |energy_cpu-energy_gpu|=${abs_energy_delta} speedup(cpu/gpu)=${speedup}x"
