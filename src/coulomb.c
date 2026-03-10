@@ -196,6 +196,7 @@ int main(int nargs, char *argv[]){
   sys->gpuMode = -1;
   sys->debugCompareApply = 0;
   sys->matvecMode = 0;
+  sys->gpuNearfieldMode = 1;
   sprintf(density,"1");
   double bulk_strength = 0.15;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2);
@@ -234,6 +235,8 @@ int main(int nargs, char *argv[]){
         case 'c': sys->debugCompareApply = atoi( argv[i]+3 );
           break;
         case 'r': sys->matvecMode = atoi( argv[i]+3 );
+          break;
+        case 'G': sys->gpuNearfieldMode = atoi( argv[i]+3 );
           break;
       }
     else {
@@ -276,6 +279,7 @@ int main(int nargs, char *argv[]){
   printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
   printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
   printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
+  printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
   //printf("----------------------------\n");
 
 

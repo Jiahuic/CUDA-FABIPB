@@ -11,6 +11,7 @@ double gkInitTime, setupFMMTime, setupRHSTime, gmresTime;
 double solveTimeNoPC, solveTimePC;
 double setupQ2PTime, setupQ2MTime, setupM2LTime;
 double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
+double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 double mtvApplyFMMTime, mtvTotalTime;
 long mtvCalls;
 
@@ -43,6 +44,10 @@ void resetFmmMatvecStats(void) {
   fmmL2LTime = 0.0;
   fmmL2PTime = 0.0;
   fmmNearTime = 0.0;
+  fmmNearGpuBuildTime = 0.0;
+  fmmNearGpuH2DTime = 0.0;
+  fmmNearGpuKernelTime = 0.0;
+  fmmNearGpuD2HTime = 0.0;
   mtvApplyFMMTime = 0.0;
   mtvTotalTime = 0.0;
   mtvCalls = 0;
@@ -68,4 +73,15 @@ void printFmmMatvecStats(void) {
          1.0e3 * fmmQ2MTime * invCalls, 1.0e3 * fmmM2MTime * invCalls,
          1.0e3 * fmmM2LTime * invCalls, 1.0e3 * fmmL2LTime * invCalls,
          1.0e3 * fmmL2PTime * invCalls, 1.0e3 * fmmNearTime * invCalls);
+  if (fmmNearGpuBuildTime > 0.0 || fmmNearGpuH2DTime > 0.0 ||
+      fmmNearGpuKernelTime > 0.0 || fmmNearGpuD2HTime > 0.0) {
+    printf("GPU nearfield breakdown (s): build=%.6f h2d=%.6f kernel=%.6f d2h=%.6f\n",
+           fmmNearGpuBuildTime, fmmNearGpuH2DTime,
+           fmmNearGpuKernelTime, fmmNearGpuD2HTime);
+    printf("GPU nearfield avg/call (ms): build=%.3f h2d=%.3f kernel=%.3f d2h=%.3f\n",
+           1.0e3 * fmmNearGpuBuildTime * invCalls,
+           1.0e3 * fmmNearGpuH2DTime * invCalls,
+           1.0e3 * fmmNearGpuKernelTime * invCalls,
+           1.0e3 * fmmNearGpuD2HTime * invCalls);
+  }
 }
