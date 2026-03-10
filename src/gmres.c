@@ -1,6 +1,8 @@
 #include <math.h>
+#include <sys/time.h>
 
 #include "gmres.h"
+#include "gkGlobal.h"
 
 /* BLAS prototypes */
 extern int dcopy_(const int *n, const double *dx, const int *incx, double *dy, const int *incy);
@@ -19,6 +21,13 @@ extern int dgemv_(const char *trans, const int *m, const int *n, const double *a
 static void gmres_update(int iter, int n, double *x, double *h, int ldh,
                          double *y, const double *s, double *v, int ldv);
 static void gmres_basis(int iter, int n, double *h_col, double *v, int ldv, double *w);
+
+static double wall_seconds(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
+}
 
 /*  -- Iterative template routine --
 *     Univ. of Tennessee and Oak Ridge National Laboratory
@@ -183,10 +192,16 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
     dcopy_(&n, b, &inc, &work[av_col * ldw], &inc);
     if (dnrm2_(&n, x, &inc) != 0.0) {
         dcopy_(&n, b, &inc, &work[av_col * ldw], &inc);
+        aa = wall_seconds();
         matvec((double *)&neg_one, x, (double *)&one, &work[av_col * ldw]);
+        gmresMatvecTime += wall_seconds() - aa;
+        gmresMatvecCalls++;
     }
 
+    aa = wall_seconds();
     psolve(&work[r_col * ldw], &work[av_col * ldw]);
+    gmresPsolveTime += wall_seconds() - aa;
+    gmresPsolveCalls++;
     bnrm2 = dnrm2_(&n, b, &inc);
     if (bnrm2 == 0.0) {
         bnrm2 = 1.0;
@@ -214,12 +229,20 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
             ++i;
             ++(*iter);
 
+            aa = wall_seconds();
             matvec((double *)&one, &work[(v_col + i - 1) * ldw], (double *)&zero,
                    &work[av_col * ldw]);
+            gmresMatvecTime += wall_seconds() - aa;
+            gmresMatvecCalls++;
+            aa = wall_seconds();
             psolve(&work[w_col * ldw], &work[av_col * ldw]);
+            gmresPsolveTime += wall_seconds() - aa;
+            gmresPsolveCalls++;
 
+            aa = wall_seconds();
             gmres_basis(i, n, &h[(i - 1) * ldh], &work[v_col * ldw], ldw,
                         &work[w_col * ldw]);
+            gmresBasisTime += wall_seconds() - aa;
 
             for (k = 0; k < i - 1; ++k) {
                 drot_(&inc, &h[(i - 1) * ldh + k], &inc, &h[(i - 1) * ldh + k + 1],
@@ -234,11 +257,15 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
 
             drot_(&inc, &work[s_col * ldw + (i - 1)], &inc, &work[s_col * ldw + i],
                   &inc, &h[cs_col * ldh + (i - 1)], &h[sn_col * ldh + (i - 1)]);
+            aa = wall_seconds();
             *resid = fabs(work[s_col * ldw + i]) / bnrm2;
+            gmresResidualTime += wall_seconds() - aa;
 
             if (*resid <= tol) {
+                aa = wall_seconds();
                 gmres_update(i, n, x, h, ldh, &work[y_col * ldw], &work[s_col * ldw],
                              &work[v_col * ldw], ldw);
+                gmresUpdateTime += wall_seconds() - aa;
                 return 0;
             }
             if (*iter == maxit || i >= restrt) {
@@ -246,14 +273,24 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
             }
         }
 
+        aa = wall_seconds();
         gmres_update(restrt, n, x, h, ldh, &work[y_col * ldw], &work[s_col * ldw],
                      &work[v_col * ldw], ldw);
+        gmresUpdateTime += wall_seconds() - aa;
 
         dcopy_(&n, b, &inc, &work[av_col * ldw], &inc);
+        aa = wall_seconds();
         matvec((double *)&neg_one, x, (double *)&one, &work[av_col * ldw]);
+        gmresMatvecTime += wall_seconds() - aa;
+        gmresMatvecCalls++;
+        aa = wall_seconds();
         psolve(&work[r_col * ldw], &work[av_col * ldw]);
+        gmresPsolveTime += wall_seconds() - aa;
+        gmresPsolveCalls++;
+        aa = wall_seconds();
         work[s_col * ldw + i] = dnrm2_(&n, &work[r_col * ldw], &inc);
         *resid = work[s_col * ldw + i] / bnrm2;
+        gmresResidualTime += wall_seconds() - aa;
         if (*resid <= tol) {
             return 0;
         }

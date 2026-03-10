@@ -43,6 +43,8 @@ double *panelRHS(int qOrder, panel *pnlX, double *chrY );
 
 int MtVmain(double *alpha, double *sgm, double *beta, double *pot);
 int PtVfmm(double *pot, double *sgm);
+int PtVfmmCached(double *pot, double *sgm);
+int PtVmain(double *pot, double *sgm);
 
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
 
@@ -138,6 +140,39 @@ static void compareApplyFMMOnce(ssystem *sys, double *sgm) {
   free(potGpu);
 }
 
+static void comparePrecondOnce(ssystem *sys, double *sgm) {
+  double *potOrig, *potCached;
+  double maxAbs = 0.0, l2Diff = 0.0, l2Ref = 0.0;
+  int maxIdx = -1;
+  int i, n = 2 * sys->nPnls;
+
+  CALLOC(potOrig, n, double);
+  CALLOC(potCached, n, double);
+
+  PtVfmm(potOrig, sgm);
+  PtVfmmCached(potCached, sgm);
+
+  for (i = 0; i < n; i++) {
+    double diff = fabs(potOrig[i] - potCached[i]);
+    if (diff > maxAbs) {
+      maxAbs = diff;
+      maxIdx = i;
+    }
+    l2Diff += diff * diff;
+    l2Ref += potOrig[i] * potOrig[i];
+  }
+
+  printf("PtVfmm debug compare: max_abs=%e rel_l2=%e max_idx=%d orig=%e cached=%e\n",
+         maxAbs,
+         (l2Ref > 0.0) ? sqrt(l2Diff / l2Ref) : 0.0,
+         maxIdx,
+         (maxIdx >= 0) ? potOrig[maxIdx] : 0.0,
+         (maxIdx >= 0) ? potCached[maxIdx] : 0.0);
+
+  free(potOrig);
+  free(potCached);
+}
+
 static double wall_seconds(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -195,8 +230,10 @@ int main(int nargs, char *argv[]){
   sys->mesh_flag = 1;
   sys->gpuMode = -1;
   sys->debugCompareApply = 0;
+  sys->debugComparePrecond = 0;
   sys->matvecMode = 0;
   sys->gpuNearfieldMode = 1;
+  sys->precondCacheMode = 0;
   sprintf(density,"1");
   double bulk_strength = 0.15;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2);
@@ -234,9 +271,13 @@ int main(int nargs, char *argv[]){
           break;
         case 'c': sys->debugCompareApply = atoi( argv[i]+3 );
           break;
+        case 'C': sys->debugComparePrecond = atoi( argv[i]+3 );
+          break;
         case 'r': sys->matvecMode = atoi( argv[i]+3 );
           break;
         case 'G': sys->gpuNearfieldMode = atoi( argv[i]+3 );
+          break;
+        case 'P': sys->precondCacheMode = atoi( argv[i]+3 );
           break;
       }
     else {
@@ -280,6 +321,7 @@ int main(int nargs, char *argv[]){
   printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
   printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
   printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
+  printf("Preconditioner mode=%d (0=original, 1=cached-blocks)\n", sys->precondCacheMode);
   //printf("----------------------------\n");
 
 
@@ -318,10 +360,13 @@ int main(int nargs, char *argv[]){
   if (sys->debugCompareApply > 0) {
     compareApplyFMMOnce(sys, sgm);
   }
+  if (sys->debugComparePrecond > 0) {
+    comparePrecondOnce(sys, sgm);
+  }
   for ( i=0; i<2*sys->nPnls; i++ ) pot[i] = sgm[i];
 
   MtV = MtVmain;
-  PtV = PtVfmm;
+  PtV = PtVmain;
   ldw = 2*nPnls;
   ldh = arnoldiSz+1;
 
@@ -329,6 +374,7 @@ int main(int nargs, char *argv[]){
   CALLOC(GMRES_h, ldh*(arnoldiSz+2), double);
 
   resetFmmMatvecStats();
+  resetGmresStats();
   stage_t0 = wall_seconds();
   gmres(ldw, pot, sgm, arnoldiSz, GMRES_work, ldw, GMRES_h, ldh,
         &numItr, &tolpar, MtV, PtV, &info);
@@ -343,6 +389,7 @@ int main(int nargs, char *argv[]){
   printf("solvation energy: %f\n", ptl);
   printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
          loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
+  printGmresStats(gmres_t);
   if (sys->matvecMode == 0) {
     printFmmMatvecStats();
   } else {
@@ -395,3 +442,10 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
 
   return 0;
 } /* MtVmain */
+
+int PtVmain(double *pot, double *sgm) {
+  if (sys->precondCacheMode > 0) {
+    return PtVfmmCached(pot, sgm);
+  }
+  return PtVfmm(pot, sgm);
+}
