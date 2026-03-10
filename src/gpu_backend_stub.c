@@ -21,3 +21,8 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   (void)pot;
   return 0;
 }
+
+int gpuM2LApply(ssystem *sys) {
+  (void)sys;
+  return 0;
+}
