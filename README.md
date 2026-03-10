@@ -135,6 +135,8 @@ If BLAS/LAPACK live in non-default locations, pass the usual CMake search hints,
 At runtime:
 
 - default startup uses the GPU automatically when the backend is present
+- default FMM startup uses the grouped near-field GPU path when GPU is enabled
+- default preconditioner is the cached-LU path (`-P=2`)
 - pass `-g=0` to force CPU
 - pass `-g=1` to require/request GPU explicitly
 
@@ -166,11 +168,18 @@ Direct GPU dense baseline:
 ./build/fabipb -g=1 -r=1 -m=0 test_proteins/1ajj
 ```
 
+Show command-line help:
+
+```sh
+./build/fabipb -h
+```
+
 Notes:
 
 - `-r=1` selects the direct GPU baseline matvec instead of the FMM matvec
 - direct mode is intended for benchmark/reference use and may be limited by GPU memory
 - direct mode prints its estimated host/device memory footprint before allocation
+- `-c=1` and `-C=1` are development-only compare modes and should not be used for timing runs
 
 ## Professionalization goals
 

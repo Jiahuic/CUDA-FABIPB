@@ -185,6 +185,30 @@ static double wall_seconds(void) {
   gettimeofday(&tv, NULL);
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
+
+static void print_usage(const char *prog) {
+  printf("Usage: %s [options] <panel-base-or-pqr-path>\n", prog);
+  printf("Core options:\n");
+  printf("  -g=0|1    CPU only or request GPU (default: auto)\n");
+  printf("  -m=0|1    reuse or regenerate MSMS mesh (default: 1)\n");
+  printf("  -d=<val>  MSMS density used when -m=1 (default: 1)\n");
+  printf("  -r=0|1    FMM matvec or direct GPU baseline (default: 0)\n");
+  printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
+  printf("  -P=0|1|2  original, cached-block, or cached-LU preconditioner (default: 2)\n");
+  printf("  -t=<lev>  tree depth\n");
+  printf("  -q=<ord>  panel quadrature order\n");
+  printf("  -k=<val>  Debye-Huckel kappa\n");
+  printf("  -e1=<val> solvent epsilon 1\n");
+  printf("  -e2=<val> solvent epsilon 2\n");
+  printf("  -S=<val>  FMM separation ratio\n");
+  printf("  -o=<val>  GMRES tolerance\n");
+  printf("  -p=<val>  FMM order\n");
+  printf("  -pm=<val> moment order override\n");
+  printf("Development/debug options:\n");
+  printf("  -c=1      compare one CPU/GPU applyFMM call before GMRES\n");
+  printf("  -C=1      compare one original/cached preconditioner apply before GMRES\n");
+  printf("  -h        show this help\n");
+}
 /*
  *  setup right hand side (exterior Neumann problem)
  */
@@ -240,7 +264,7 @@ int main(int nargs, char *argv[]){
   sys->debugComparePrecond = 0;
   sys->matvecMode = 0;
   sys->gpuNearfieldMode = 1;
-  sys->precondCacheMode = 0;
+  sys->precondCacheMode = 2;
   sprintf(density,"1");
   double bulk_strength = 0.15;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2);
@@ -251,6 +275,9 @@ int main(int nargs, char *argv[]){
   for ( i=1; i<nargs; i++ )
     if ( argv[i][0] == '-' )
       switch ( argv[i][1] ) {
+        case 'h':
+          print_usage(argv[0]);
+          return 0;
         case 'S': sys->maxSepRatio = atof( argv[i]+3 );
           break;
         case 'o': tolpar = atof( argv[i]+3 );
@@ -327,8 +354,14 @@ int main(int nargs, char *argv[]){
   printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
   printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
   printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
-  printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
+  if (sys->matvecMode == 0) {
+    printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
+  }
   printf("Preconditioner mode=%d (0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
+  if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
+    printf("Debug compare flags: apply=%d precond=%d\n",
+           sys->debugCompareApply, sys->debugComparePrecond);
+  }
   //printf("----------------------------\n");
 
 

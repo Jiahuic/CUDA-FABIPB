@@ -26,6 +26,42 @@ Solved near-field milestone:
   * near-field kernel `1.363 s -> 0.020 s`
 * this is strong enough to keep as the default implementation and cite later in the paper as the current near-field acceleration result
 
+Solved preconditioner milestone:
+
+* cached local preconditioner block assembly is now validated as a real speedup path
+* on `1a63`, keeping the same `gmres-its=13` and the same solvation energy:
+  * `ttl` improved `89.68 s -> 53.51 s`
+  * `psolve` improved `68.43 s -> 29.42 s`
+  * preconditioner assembly improved `41.999 s -> 2.841 s`
+* this is strong enough to keep and cite later as the current preconditioner acceleration result
+
+Solved preconditioner LU milestone:
+
+* cached LU reuse for the local preconditioner blocks is now validated on top of cached block assembly
+* on `1a63`, keeping the same `gmres-its=13` and the same solvation energy:
+  * `ttl` improved further `53.51 s -> 30.51 s`
+  * `gmres` improved `44.83 s -> 18.67 s`
+  * `psolve` improved `29.42 s -> 2.05 s`
+  * preconditioner factor time dropped effectively `25.75 s -> 0`
+* this is strong enough to keep and cite later as the current preconditioner LU reuse result
+
+Mainline cleanup milestone before M2L:
+
+* `main` now defaults to the validated fast path instead of the older development settings:
+  * grouped near-field stays default (`-G=1`)
+  * cached-LU preconditioner is the default (`-P=2`)
+* `fabipb -h` now documents the runtime flags directly
+* `-c=1` and `-C=1` remain available only as development compare modes and should not be used in benchmark tables
+* next experimental work should start from this cleaned baseline, not from ad hoc flag combinations
+
+Preconditioner development/debug note:
+
+* `-C=1` is a development-only one-shot compare flag for `PtVfmm`
+* it runs both the original and cached preconditioners once on the same vector and prints their difference
+* it is not a benchmark mode and should be removed after preconditioner development is finished
+* `-P=1` is the cached-block preconditioner mode
+* `-P=2` is the cached-LU preconditioner mode and is now the preferred preconditioner path
+
 See also:
 
 * `docs/nearfield_roadmap.md` for the detailed near-field bottleneck breakdown and experiment order
@@ -41,6 +77,26 @@ Near-field work that is still worth pursuing later:
 2. reduce grouped-metadata setup cost
 3. only revisit host-device transfer reductions if later kernels make copies matter
 4. only revisit full GPU coefficient generation after the current near-field baseline is fully characterized
+
+Preconditioner work that is still worth pursuing later:
+
+1. consider batched CPU or GPU triangular solves only if `dgetrs` becomes worth targeting on the benchmark sizes of interest
+2. remove `-C=1` once preconditioner development is considered complete
+
+Main remaining runtime priorities after the current preconditioner work:
+
+1. near-field cache build (`panelIA0()` setup) is now the largest remaining one-time cost on the large validated case
+2. preconditioner solve (`dgetrs`) is smaller but still measurable
+3. near-field kernel remains important, but no longer dominates the full run the way it did before grouping
+
+Near-field setup update:
+
+* thread-safe `panelIA0()` plus parallel near-field coefficient generation is now merged on `main`
+* on `1a63`, this reduced:
+  * near-field build `13.73 s -> 7.20 s`
+  * coefficient generation `12.92 s -> 6.34 s`
+  * total wall time `29.60 s -> 24.40 s`
+* the next major algorithmic branch should therefore move to destination-grouped GPU `M2L`, not more near-field persistence work
 
 How to treat destination-grouped near-field:
 
@@ -66,6 +122,15 @@ Benchmark goal:
 
 * show that GPU-FMM integration beats the non-FMM direct GPU baseline at relevant biomolecular problem sizes
 * this comparison is important for the paper because it demonstrates that the FMM integration itself, not just “using a GPU,” is the source of the scalability gain
+
+Next research branch after cleanup:
+
+* start a dedicated `M2L` experiment branch from the cleaned `main`
+* target: destination-grouped GPU cluster-cluster interaction (`M2L`)
+* first implementation goal:
+  1. flatten M2L interactions by destination cube
+  2. compare GPU local expansions against CPU `transM2L`
+  3. only then benchmark end-to-end solves
 
 Direct GPU baseline implementation notes:
 

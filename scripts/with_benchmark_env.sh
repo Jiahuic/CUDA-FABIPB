@@ -9,7 +9,7 @@ export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-1}"
 
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 <command> [args...]" >&2
-  echo "Example: $0 ./build/fabipb -m=0 -d=10 test_proteins/1a63" >&2
+  echo "Example: $0 ./build/fabipb -m=1 -d=10 test_proteins/1a63" >&2
   exit 2
 fi
 
