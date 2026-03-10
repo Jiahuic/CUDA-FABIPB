@@ -17,35 +17,41 @@ Summary of what was learned from that branch:
 * destination-grouped near-field metadata and grouped kernel did not recover overall speedup on the tested machine
 * the known-good GPU speedup still comes primarily from the original GPU near-field path
 
+Solved near-field milestone:
+
+* destination-leaf grouped near-field is now the preferred GPU near-field path
+* averaged `1a63` comparison on the GPU machine showed:
+  * wall time `5.794 s -> 4.481 s`
+  * near-field stage `1.941 s -> 0.586 s`
+  * near-field kernel `1.363 s -> 0.020 s`
+* this is strong enough to keep as the default implementation and cite later in the paper as the current near-field acceleration result
+
 See also:
 
 * `docs/nearfield_roadmap.md` for the detailed near-field bottleneck breakdown and experiment order
 
 Implication for mainline work:
 
-* keep the stable near-field GPU baseline on `main`
-* treat grouped near-field and GPU M2L as experimental branches until they show a clear end-to-end win
+* make destination-leaf grouped near-field the default on `main`
+* keep GPU M2L and later grouping variants as experimental branches until they show a clear end-to-end win
 
 Near-field work that is still worth pursuing later:
 
 1. keep `panelIA0()` cache construction as a one-time setup outside GMRES
-2. reduce host-device traffic in repeated near-field applies
-3. test coarser grouping strategies such as destination-leaf grouping before per-panel grouping
+2. reduce grouped-metadata setup cost
+3. only revisit host-device transfer reductions if later kernels make copies matter
 4. only revisit full GPU coefficient generation after the current near-field baseline is fully characterized
 
 How to treat destination-grouped near-field:
 
-* keep it as the innovation path, but not the default production path yet
-* continue developing it on `nearfield-grouped-experiment`, not on `main`
-* use `main` for stable correctness and timing baselines
-* only merge it back when it shows a clear end-to-end improvement over the current atomic-kernel baseline
+* destination-leaf grouping is now the adopted production path
+* finer grouping variants should still stay on experiment branches until they beat the destination-leaf baseline
 
 Grouped near-field research priorities:
 
 1. reduce grouped-metadata setup cost
-2. measure setup time, transfer time, and kernel time separately
-3. test destination-leaf grouping before destination-panel grouping
-4. revisit per-panel grouping only if the grouped apply phase is clearly superior when amortized over GMRES iterations
+2. revisit destination-panel or finer grouping only if they beat destination-leaf grouping end-to-end
+3. use the new near-field comparison script to report averaged comparisons over multiple runs
 
 Required benchmark baseline to add:
 

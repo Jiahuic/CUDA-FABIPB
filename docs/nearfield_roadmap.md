@@ -1,6 +1,6 @@
 ## Near-field Roadmap
 
-Date: March 9, 2026
+Date: March 10, 2026
 Branch: `nearfield-roadmap`
 
 ### Scope
@@ -12,7 +12,26 @@ This document is based on:
 * current code in `src/fmm.c` and `src/gpu_backend_cuda.cu`
 * existing comparison logs on the GPU machine
 
-No new GPU experiments were run from this branch. Any payoff numbers below that are not directly visible in existing logs are marked as estimates.
+This document started from existing logs and was then updated after a destination-leaf grouped near-field implementation was benchmarked on the GPU machine.
+
+Measured result on `test_proteins/1a63` averaged over 10 runs:
+
+* mode 0 (interaction kernel):
+  * `ttl = 5.794227 s`
+  * `Near = 1.940889 s`
+  * `build = 0.574423 s`
+  * `kernel = 1.362885 s`
+* mode 1 (destination-leaf grouped):
+  * `ttl = 4.481293 s`
+  * `Near = 0.585553 s`
+  * `build = 0.561767 s`
+  * `kernel = 0.020167 s`
+
+Conclusion:
+
+* destination-leaf grouped near-field is a solved milestone for the current codebase
+* it should be the default GPU near-field path on `main`
+* later grouping work should be compared against this baseline, not against the old interaction kernel
 
 ### Current implementation
 
@@ -47,14 +66,27 @@ So the current path is:
 
 ### Current bottlenecks
 
-#### Bottleneck 1: repeated near-field accumulation
+#### Bottleneck 1: grouped metadata setup
+
+After destination-leaf grouping, setup/build is now much larger than the remaining near-field kernel.
+
+From the averaged `1a63` grouped result:
+
+* `build = 0.561767 s`
+* `kernel = 0.020167 s`
+
+Implication:
+
+* the next near-field target is setup overhead, not repeated accumulation
+
+#### Bottleneck 2: repeated near-field accumulation
 
 From `build-cuda/compare_logs/20260309_154713` on `test_proteins/1a63`:
 
 * CPU near-field total: `9.376543 s`
 * GPU near-field total: `2.066644 s`
 
-This is already the main source of the GPU speedup, but it is still the largest FMM stage on GPU.
+This was the main source of the GPU speedup in the interaction-kernel baseline, and destination-leaf grouping solved most of it.
 
 Share of `applyFMM`:
 
@@ -66,7 +98,7 @@ Implication:
 * on CPU, near-field dominates almost everything
 * on GPU, near-field is still the largest remaining FMM stage
 
-#### Bottleneck 2: host-device traffic every matvec
+#### Bottleneck 3: host-device traffic every matvec
 
 Current near-field apply still copies:
 
@@ -76,28 +108,31 @@ Current near-field apply still copies:
 
 for every matvec.
 
-This is visible in the code but is not yet timed separately on `main`.
+This is now timed explicitly, and on `1a63` it is small:
+
+* `h2d = 0.001999 s`
+* `d2h = 0.001611 s`
 
 Implication:
 
-* even if the kernel math improves, repeated transfers can cap speedup
-* this becomes more important as the GPU kernel gets faster
+* transfers are not the current dominant problem
+* this should not be the next optimization target
 
-#### Bottleneck 3: atomic contention
+#### Bottleneck 4: atomic contention
 
 Current near-field kernel is interaction-centric:
 
 * one thread per panel-pair interaction
 * uses `atomicAdd` into destination outputs
 
-This is simple and robust, but it means many threads can contend for the same destination panel.
+This was the main issue in the old interaction kernel and is the reason destination-leaf grouping won so clearly.
 
 Implication:
 
 * the current kernel likely leaves performance on the table
 * but not every grouping strategy is worth the metadata/setup overhead
 
-#### Bottleneck 4: coefficient generation is still CPU-side
+#### Bottleneck 5: coefficient generation is still CPU-side
 
 Near-field coefficients are computed with `panelIA0()` on CPU.
 
@@ -161,7 +196,7 @@ Expected payoff:
 * highest diagnostic value
 * required before more kernel restructuring
 
-Priority: highest
+Status: completed
 
 #### Experiment B: keep vectors resident longer across matvecs
 
@@ -181,10 +216,9 @@ Stronger version:
 
 Expected payoff:
 
-* estimate: `5%` to `15%` end-to-end on current GPU path
-* payoff grows if the kernel itself becomes faster
+* now likely limited, because transfer time is very small on the tested case
 
-Priority: high
+Priority: low for the current near-field path
 
 #### Experiment C: destination-leaf grouping
 
@@ -198,31 +232,24 @@ Why leaf grouping first:
 * less metadata overhead
 * more likely to amortize setup cost
 
-Expected payoff:
+Measured payoff on `1a63`:
 
-* estimate: `10%` to `25%` reduction in near-field apply time if grouping is effective
-* end-to-end estimate: `3%` to `10%`
+* near-field: `1.940889 s -> 0.585553 s` (`3.31x`)
+* wall time: `5.794227 s -> 4.481293 s` (`1.29x`)
 
-Priority: high, but only after Experiment A
+Status: completed and adopted
 
-#### Experiment D: revisit grouped kernels only after timing split
+#### Experiment D: reduce grouped-metadata setup cost
 
 Goal:
 
-* test grouped accumulation strategies with setup cost accounted for explicitly
+* reduce the one-time setup cost of the adopted destination-leaf grouped near-field path
 
-Candidate variants:
+Why now:
 
-* destination-leaf grouped kernel
-* coarse destination-panel bins within leaf
-* shared-memory block reductions with fewer final atomics
+* setup is larger than the grouped kernel time on the tested case
 
-Expected payoff:
-
-* unknown
-* only worth continuing if steady-state kernel time drops enough to justify setup cost
-
-Priority: medium
+Priority: highest follow-up
 
 #### Experiment E: GPU coefficient generation for `panelIA0()`
 
@@ -245,11 +272,10 @@ Priority: medium-low
 
 ### Recommended execution order
 
-1. Add timing split for near-field setup, H2D, kernel, D2H.
-2. Run `1ajj` and `1a63` on the GPU machine and record the split.
-3. If transfers are large, do persistent-device-buffer cleanup first.
-4. If kernel dominates, test destination-leaf grouping before any finer grouping.
-5. Only revisit coefficient generation after the above are measured.
+1. Reduce grouped-metadata setup cost.
+2. Re-run averaged comparisons with `scripts/compare_nearfield_modes.sh`.
+3. Only test finer grouping if it beats destination-leaf grouping end-to-end.
+4. Only revisit coefficient generation after setup cost is better understood.
 
 ### Success criteria
 
@@ -266,10 +292,4 @@ A near-field change should be considered good enough to keep only if it satisfie
 
 The best next code task is:
 
-* instrument the current near-field path into four parts:
-  * coefficient build
-  * H2D copies
-  * kernel
-  * D2H copy
-
-This should be done before attempting another grouping kernel on top of `main`.
+* reduce grouped near-field setup/build overhead without regressing the new destination-leaf kernel win
