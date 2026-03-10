@@ -354,6 +354,8 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   int i, k, lev, n, n1, inc = 1;
   double time1, time2;
   static int warnedNoGpuM2L = 0;
+  static int warnedNoGpuQ2M = 0;
+  static int warnedNoGpuL2P = 0;
 
   /* zero out mom's and lec's */
   for ( lev=depth; lev>=height; lev-- ) {
@@ -373,14 +375,20 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   /* Q2M transformations */
   time1 = wall_seconds_local();
   nMom = sys->nMom[sys->ordMom[depth]];
-  for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
-    x = &(sgm[cb->pnls->idx]);
-    n = cb->nPnls;
-    y = cb->mom_pot;
-    dgemv_(&nChr, &nMom, &n, &one, Q2M1[idx], &nMom, x, &inc, &one, y, &inc);
-    x = &(sgm[cb->pnls->idx+nPnls]);
-    y = cb->mom_dpdn;
-    dgemv_(&nChr, &nMom, &n, &one, Q2M0[idx], &nMom, x, &inc, &one, y, &inc);
+  if (!(sys->gpuMode > 0 && gpuQ2MApply(sys, sgm))) {
+    if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedNoGpuQ2M) {
+      printf("GPU Q2M path unavailable; using CPU fallback.\n");
+      warnedNoGpuQ2M = 1;
+    }
+    for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
+      x = &(sgm[cb->pnls->idx]);
+      n = cb->nPnls;
+      y = cb->mom_pot;
+      dgemv_(&nChr, &nMom, &n, &one, Q2M1[idx], &nMom, x, &inc, &one, y, &inc);
+      x = &(sgm[cb->pnls->idx+nPnls]);
+      y = cb->mom_dpdn;
+      dgemv_(&nChr, &nMom, &n, &one, Q2M0[idx], &nMom, x, &inc, &one, y, &inc);
+    }
   }
   time2 = wall_seconds_local();
   fmmQ2MTime += (time2 - time1);
@@ -437,19 +445,25 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   /* L2P transformations */
   time1 = wall_seconds_local();
   nMom = sys->nMom[sys->ordMom[depth]];
-  for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
-    y = &(pot[cb->pnls->idx]);
-    n = cb->nPnls;
-    x = cb->lec_k1;
-    dgemv_(&hChr, &nMom, &n, alpha, L2P0[idx], &nMom, x, &inc, beta, y, &inc);
-    x = cb->lec_k2;
-    dgemv_(&hChr, &nMom, &n, alpha, L2P0[idx], &nMom, x, &inc, &one, y, &inc);
+  if (!(sys->gpuMode > 0 && gpuL2PApply(sys, *alpha, *beta, pot))) {
+    if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedNoGpuL2P) {
+      printf("GPU L2P path unavailable; using CPU fallback.\n");
+      warnedNoGpuL2P = 1;
+    }
+    for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
+      y = &(pot[cb->pnls->idx]);
+      n = cb->nPnls;
+      x = cb->lec_k1;
+      dgemv_(&hChr, &nMom, &n, alpha, L2P0[idx], &nMom, x, &inc, beta, y, &inc);
+      x = cb->lec_k2;
+      dgemv_(&hChr, &nMom, &n, alpha, L2P0[idx], &nMom, x, &inc, &one, y, &inc);
 
-    y = &(pot[cb->pnls->idx+nPnls]);
-    x = cb->lec_k3;
-    dgemv_(&hChr, &nMom, &n, alpha, L2P1[idx], &nMom, x, &inc, beta, y, &inc);
-    x = cb->lec_k4;
-    dgemv_(&hChr, &nMom, &n, alpha, L2P1[idx], &nMom, x, &inc, &one, y, &inc);
+      y = &(pot[cb->pnls->idx+nPnls]);
+      x = cb->lec_k3;
+      dgemv_(&hChr, &nMom, &n, alpha, L2P1[idx], &nMom, x, &inc, beta, y, &inc);
+      x = cb->lec_k4;
+      dgemv_(&hChr, &nMom, &n, alpha, L2P1[idx], &nMom, x, &inc, &one, y, &inc);
+    }
   }
   time2 = wall_seconds_local();
   fmmL2PTime += (time2 - time1);
