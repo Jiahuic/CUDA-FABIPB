@@ -10,6 +10,7 @@ extern "C" {
 int gpuBackendAvailable(void);
 int gpuNearfieldApply(struct ssystem *sys, double alpha, const double *sgm, double *pot);
 int gpuDirectApply(struct ssystem *sys, double alpha, double beta, const double *sgm, double *pot);
+int gpuM2LApply(struct ssystem *sys);
 
 #ifdef __cplusplus
 }

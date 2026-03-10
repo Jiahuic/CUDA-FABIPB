@@ -86,6 +86,15 @@ struct ssystem {
   int nNearPairsFlat;       /* flattened leaf-neighbor pair count */
   int *nearPairSrc;         /* flattened nearfield source leaf index */
   int *nearPairDst;         /* flattened nearfield target leaf index */
+  int nFmmCubesFlat;        /* flattened FMM cube count across active levels */
+  struct cube **fmmCubeByIdx; /* flattened cube lookup by active FMM index */
+  int nM2LPairsFlat;        /* flattened M2L interaction count */
+  int *m2lPairSrc;          /* flattened M2L source cube index */
+  int *m2lPairDst;          /* flattened M2L destination cube index */
+  int *m2lPairOrder;        /* flattened M2L order by interaction */
+  int nM2LDstGroups;        /* number of destination-grouped M2L ranges */
+  int *m2lDstGroupStart;    /* start offset of each destination-grouped M2L range */
+  int *m2lDstGroupCount;    /* interaction count of each destination-grouped M2L range */
   panel **panelByIdx;       /* direct panel lookup by contiguous index */
   int maxlevCudes;          /* max cubes at finest level */
   int maxlevnPnls;          /* max panels in a cube at finest level */
