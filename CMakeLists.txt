@@ -74,10 +74,13 @@ if(NOT LAPACK_FOUND)
   )
 endif()
 
+find_package(Threads REQUIRED)
+
 target_link_libraries(fabipb
   PRIVATE
     LAPACK::LAPACK
     BLAS::BLAS
+    Threads::Threads
 )
 
 if(FMM_PB_HAS_CUDA)
