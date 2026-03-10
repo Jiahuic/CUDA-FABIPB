@@ -17,6 +17,10 @@ Summary of what was learned from that branch:
 * destination-grouped near-field metadata and grouped kernel did not recover overall speedup on the tested machine
 * the known-good GPU speedup still comes primarily from the original GPU near-field path
 
+See also:
+
+* `docs/nearfield_roadmap.md` for the detailed near-field bottleneck breakdown and experiment order
+
 Implication for mainline work:
 
 * keep the stable near-field GPU baseline on `main`
