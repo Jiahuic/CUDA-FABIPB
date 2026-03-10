@@ -3,6 +3,8 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
+#include <unistd.h>
+#include <pthread.h>
 #include "gkGlobal.h"
 #include "gk.h"
 
@@ -31,18 +33,87 @@ extern ssystem *sys;
 
 int nlevel;
 
+typedef struct {
+  ssystem *sys;
+  cube **cubes;
+  int begin;
+  int end;
+  double scale1;
+  double scale2;
+  int buildLU;
+} PrecondSetupTask;
+
 static double wall_seconds_pc(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
 
+static int setupThreadCountPc(int nTasks) {
+  const char *env = getenv("FABIPB_SETUP_THREADS");
+  long hc;
+  int threads;
+
+  if (env != NULL) {
+    threads = atoi(env);
+  } else {
+    hc = sysconf(_SC_NPROCESSORS_ONLN);
+    threads = (hc > 0) ? (int)hc : 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 32) {
+    threads = 32;
+  }
+  return threads;
+}
+
+static void *precondSetupWorker(void *arg) {
+  PrecondSetupTask *task = (PrecondSetupTask *)arg;
+  int idx;
+
+  for (idx = task->begin; idx < task->end; idx++) {
+    cube *cb = task->cubes[idx];
+    int HMsize = cb->nPnls;
+    int Msize = 2 * HMsize;
+    panel *pnlX, *pnlY;
+    int i, j;
+
+    for (i = 0, pnlY = cb->pnls; i < HMsize; i++, pnlY = pnlY->nextC) {
+      for (j = 0, pnlX = cb->pnls; j < HMsize; j++, pnlX = pnlX->nextC) {
+        double *KER = panelIA0(pnlX, pnlY);
+        pcBlocks[idx][i*Msize+j]                 = -KER[1];
+        pcBlocks[idx][i*Msize+j+HMsize]          = -KER[0];
+        pcBlocks[idx][(i+HMsize)*Msize+j]        = -KER[3];
+        pcBlocks[idx][(i+HMsize)*Msize+j+HMsize] = -KER[2];
+      }
+      pcBlocks[idx][i*Msize+i] += task->scale1 * pnlY->area;
+      pcBlocks[idx][(i+HMsize)*Msize+i+HMsize] += task->scale2 * pnlY->area;
+    }
+
+    if (task->buildLU) {
+      int info;
+      memcpy(pcLUBlocks[idx], pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
+      dgetrf_(&Msize, &Msize, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], &info);
+      if (info != 0) {
+        fprintf(stderr, "Error: dgetrf failed in cached LU setup for leaf %d (info=%d)\n",
+                idx, info);
+        exit(1);
+      }
+    }
+  }
+  return NULL;
+}
+
 void setupPreconditioning(ssystem *sys) {
 
-  int i, j, maxnPnls=0, idx, ttlcube=0;
+  int maxnPnls=0, idx, ttlcube=0;
   cube *cb;
-  double scale1, scale2, *KER;
-  panel *pnlX, *pnlY;
+  double scale1, scale2;
 
   nlevel=sys->depth-1;
   //nlevel=sys->depth;
@@ -61,44 +132,61 @@ void setupPreconditioning(ssystem *sys) {
   CALLOC_FULL(ipiv, maxnPnls, int, OFF, ASOLVER);
   CALLOC_FULL(rhs, maxnPnls, double, OFF, ASOLVER);
   if (sys->precondCacheMode > 0 || sys->debugComparePrecond > 0) {
+    cube **precondCubes;
+    int nThreads;
     CALLOC_FULL(pcBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
     CALLOC_FULL(pcBlockSize, nPrecondBlocks, int, OFF, ASOLVER);
     if (sys->precondCacheMode > 1 || sys->debugComparePrecond > 0) {
       CALLOC_FULL(pcLUBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
       CALLOC_FULL(pcIpivBlocks, nPrecondBlocks, int *, OFF, ASOLVER);
     }
+    precondCubes = (cube **)calloc((size_t)nPrecondBlocks, sizeof(cube *));
+    ASSERT(precondCubes != NULL);
     for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
       int HMsize = cb->nPnls;
       int Msize = 2 * HMsize;
-      int info;
 
+      precondCubes[idx] = cb;
       pcBlockSize[idx] = Msize;
       CALLOC_FULL(pcBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
       if (pcLUBlocks != NULL) {
         CALLOC_FULL(pcLUBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
         CALLOC_FULL(pcIpivBlocks[idx], Msize, int, OFF, ASOLVER);
       }
-      for (i = 0, pnlY = cb->pnls; i < HMsize; i++, pnlY = pnlY->nextC) {
-        for (j = 0, pnlX = cb->pnls; j < HMsize; j++, pnlX = pnlX->nextC) {
-          KER = panelIA0(pnlX, pnlY);
-          pcBlocks[idx][i*Msize+j]                 = -KER[1];
-          pcBlocks[idx][i*Msize+j+HMsize]          = -KER[0];
-          pcBlocks[idx][(i+HMsize)*Msize+j]        = -KER[3];
-          pcBlocks[idx][(i+HMsize)*Msize+j+HMsize] = -KER[2];
-        }
-        pcBlocks[idx][i*Msize+i] += scale1*pnlY->area;
-        pcBlocks[idx][(i+HMsize)*Msize+i+HMsize] += scale2*pnlY->area;
-      }
-      if (pcLUBlocks != NULL) {
-        memcpy(pcLUBlocks[idx], pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
-        dgetrf_(&Msize, &Msize, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], &info);
-        if (info != 0) {
-          fprintf(stderr, "Error: dgetrf failed in cached LU setup for leaf %d (info=%d)\n",
-                  idx, info);
-          exit(1);
-        }
-      }
     }
+    nThreads = setupThreadCountPc(nPrecondBlocks);
+    if (nThreads <= 1) {
+      PrecondSetupTask task;
+      task.sys = sys;
+      task.cubes = precondCubes;
+      task.begin = 0;
+      task.end = nPrecondBlocks;
+      task.scale1 = scale1;
+      task.scale2 = scale2;
+      task.buildLU = (pcLUBlocks != NULL);
+      precondSetupWorker(&task);
+    } else {
+      pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+      PrecondSetupTask *tasks = (PrecondSetupTask *)calloc((size_t)nThreads, sizeof(PrecondSetupTask));
+      ASSERT(threads != NULL);
+      ASSERT(tasks != NULL);
+      for (idx = 0; idx < nThreads; idx++) {
+        tasks[idx].sys = sys;
+        tasks[idx].cubes = precondCubes;
+        tasks[idx].begin = (nPrecondBlocks * idx) / nThreads;
+        tasks[idx].end = (nPrecondBlocks * (idx + 1)) / nThreads;
+        tasks[idx].scale1 = scale1;
+        tasks[idx].scale2 = scale2;
+        tasks[idx].buildLU = (pcLUBlocks != NULL);
+        pthread_create(&threads[idx], NULL, precondSetupWorker, &tasks[idx]);
+      }
+      for (idx = 0; idx < nThreads; idx++) {
+        pthread_join(threads[idx], NULL);
+      }
+      free(tasks);
+      free(threads);
+    }
+    free(precondCubes);
   }
   printf("Maximum number of elements in finest cluster: %d\n", maxnPnls);
   printf("----------------------------\n");

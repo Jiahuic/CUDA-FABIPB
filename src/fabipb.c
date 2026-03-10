@@ -231,7 +231,6 @@ void setupRHS(ssystem *sys, double *sgm) {
     sgm[i] *= fac;
     sgm[nPnls+i] *= fac;
   }
-
 } /* setupRHS */
 
 
