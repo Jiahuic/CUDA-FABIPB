@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 /*
- * coulomb.c: main driver
+ * fabipb.c: main driver
  * This program computes the boundary integral PB equation with fmm method
  * usage:
  *   coulomb [options] panelfile [options]

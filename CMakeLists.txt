@@ -18,7 +18,7 @@ if(FMM_PB_BLA_VENDOR)
 endif()
 
 set(FMM_PB_SOURCES
-  src/coulomb.c
+  src/fabipb.c
   src/gkSetup.c
   src/input.c
   src/gkGlobal.c
