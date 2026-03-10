@@ -124,7 +124,10 @@ extern double setupQ2PTime, setupQ2MTime, setupM2LTime;
 extern double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 extern double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 extern double mtvApplyFMMTime, mtvTotalTime;
+extern double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
+extern double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
 extern long mtvCalls;
+extern long gmresMatvecCalls, gmresPsolveCalls;
 /* counts of memory usage */
 extern long memcount;
 extern long memPVE, memCUBES, memQ2P, memQ2M, memM2L, memSOLVER, memMISC;
@@ -138,3 +141,5 @@ extern int oneI;
 
 void resetFmmMatvecStats(void);
 void printFmmMatvecStats(void);
+void resetGmresStats(void);
+void printGmresStats(double gmresWallTime);

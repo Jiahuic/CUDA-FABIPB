@@ -13,7 +13,10 @@ double setupQ2PTime, setupQ2MTime, setupM2LTime;
 double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 double mtvApplyFMMTime, mtvTotalTime;
+double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
+double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
 long mtvCalls;
+long gmresMatvecCalls, gmresPsolveCalls;
 
 /* memory counters */
 long memcount=0;    /* total memory */
@@ -53,6 +56,20 @@ void resetFmmMatvecStats(void) {
   mtvCalls = 0;
 }
 
+void resetGmresStats(void) {
+  gmresMatvecTime = 0.0;
+  gmresPsolveTime = 0.0;
+  gmresBasisTime = 0.0;
+  gmresUpdateTime = 0.0;
+  gmresResidualTime = 0.0;
+  pcAssembleTime = 0.0;
+  pcFactorTime = 0.0;
+  pcSolveTime = 0.0;
+  pcScatterTime = 0.0;
+  gmresMatvecCalls = 0;
+  gmresPsolveCalls = 0;
+}
+
 void printFmmMatvecStats(void) {
   double stageTotal;
   double invCalls;
@@ -83,5 +100,28 @@ void printFmmMatvecStats(void) {
            1.0e3 * fmmNearGpuH2DTime * invCalls,
            1.0e3 * fmmNearGpuKernelTime * invCalls,
            1.0e3 * fmmNearGpuD2HTime * invCalls);
+  }
+}
+
+void printGmresStats(double gmresWallTime) {
+  double accounted;
+  double other;
+
+  accounted = gmresMatvecTime + gmresPsolveTime + gmresBasisTime +
+              gmresUpdateTime + gmresResidualTime;
+  other = gmresWallTime - accounted;
+  if (other < 0.0) {
+    other = 0.0;
+  }
+
+  printf("GMRES breakdown (s): matvec=%.6f psolve=%.6f basis=%.6f update=%.6f residual=%.6f other=%.6f\n",
+         gmresMatvecTime, gmresPsolveTime, gmresBasisTime,
+         gmresUpdateTime, gmresResidualTime, other);
+  printf("GMRES call counts: matvec=%ld psolve=%ld\n",
+         gmresMatvecCalls, gmresPsolveCalls);
+  if (gmresPsolveTime > 0.0) {
+    printf("Preconditioner breakdown (s): assemble=%.6f factor=%.6f solve=%.6f scatter=%.6f other=%.6f\n",
+           pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime,
+           gmresPsolveTime - (pcAssembleTime + pcFactorTime + pcSolveTime + pcScatterTime));
   }
 }
