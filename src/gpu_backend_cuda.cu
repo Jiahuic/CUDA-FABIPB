@@ -5,12 +5,19 @@
 #include <cuda_runtime.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/time.h>
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
 extern "C" void kernelKER4(double *x, double *y);
 extern "C" void (*kernel)(double *x, double *y);
 
 namespace {
+double wall_seconds_cuda_local() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
+}
+
 struct NearfieldGpuCache {
   const ssystem *sys;
   int nPnls;
@@ -436,27 +443,35 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   size_t vecBytes;
   int blockSize;
   int gridSize;
+  double t0, t1;
 
   if (sys == NULL || sgm == NULL || pot == NULL) {
     return 0;
   }
 
   if (gNear.sys != sys) {
+    t0 = wall_seconds_cuda_local();
     freeNearfieldCache();
     if (!buildNearfieldTables(sys)) {
       freeNearfieldCache();
       return 0;
     }
+    t1 = wall_seconds_cuda_local();
+    fmmNearGpuBuildTime += (t1 - t0);
   }
 
   vecBytes = (size_t)(2 * gNear.nPnls) * sizeof(double);
+  t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(gNear.d_sgm, sgm, vecBytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return 0;
   err = cudaMemcpy(gNear.d_pot, pot, vecBytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  fmmNearGpuH2DTime += (t1 - t0);
 
   blockSize = 256;
   gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
+  t0 = wall_seconds_cuda_local();
   nearfieldApplyKernel<<<gridSize, blockSize>>>(
       gNear.nPnls, gNear.nInteractions,
       gNear.d_src, gNear.d_dst, gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
@@ -465,9 +480,14 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   if (err != cudaSuccess) return 0;
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  fmmNearGpuKernelTime += (t1 - t0);
 
+  t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(pot, gNear.d_pot, vecBytes, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  fmmNearGpuD2HTime += (t1 - t0);
   return 1;
 }
 

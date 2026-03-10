@@ -122,6 +122,7 @@
 extern double setupBasTime, setupMatTime, setupPCTime, solveTimeNoPC, solveTimePC;
 extern double setupQ2PTime, setupQ2MTime, setupM2LTime;
 extern double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
+extern double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 extern double mtvApplyFMMTime, mtvTotalTime;
 extern long mtvCalls;
 /* counts of memory usage */
