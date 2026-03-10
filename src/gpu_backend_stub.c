@@ -26,3 +26,17 @@ int gpuM2LApply(ssystem *sys) {
   (void)sys;
   return 0;
 }
+
+int gpuQ2MApply(ssystem *sys, const double *sgm) {
+  (void)sys;
+  (void)sgm;
+  return 0;
+}
+
+int gpuL2PApply(ssystem *sys, double alpha, double beta, double *pot) {
+  (void)sys;
+  (void)alpha;
+  (void)beta;
+  (void)pot;
+  return 0;
+}
