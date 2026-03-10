@@ -78,8 +78,8 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   fp=fopen(fname,"r");
   if (fp == NULL) {
     fprintf(stderr, "Error: cannot open PQR file '%s'\n", fname);
-    fprintf(stderr, "Usage: coulomb <pdb_id>  (e.g. coulomb 1a63)\n");
-    fprintf(stderr, "       or coulomb <path> (e.g. coulomb test_proteins/1a63)\n");
+    fprintf(stderr, "Usage: fabipb <pdb_id>  (e.g. fabipb 1a63)\n");
+    fprintf(stderr, "       or fabipb <path> (e.g. fabipb test_proteins/1a63)\n");
     exit(1);
   }
   buildPath(fname, sizeof(fname), fpath, panelfile, ".xyzr");

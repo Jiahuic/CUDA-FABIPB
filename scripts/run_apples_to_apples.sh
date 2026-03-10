@@ -21,4 +21,4 @@ case "$panel" in
   *.pqr) panel="${panel%.pqr}" ;;
 esac
 
-exec ./scripts/with_benchmark_env.sh "$BUILD_DIR/coulomb" "$panel" "$@"
+exec ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" "$panel" "$@"

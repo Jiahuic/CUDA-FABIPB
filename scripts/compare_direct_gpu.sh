@@ -15,8 +15,8 @@ case "$panel" in
   *.pqr) panel="${panel%.pqr}" ;;
 esac
 
-if [ ! -x "$BUILD_DIR/coulomb" ]; then
-  echo "Error: $BUILD_DIR/coulomb not found. Build first:" >&2
+if [ ! -x "$BUILD_DIR/fabipb" ]; then
+  echo "Error: $BUILD_DIR/fabipb not found. Build first:" >&2
   echo "  cmake -S . -B $BUILD_DIR && cmake --build $BUILD_DIR" >&2
   exit 2
 fi
@@ -34,12 +34,12 @@ mesh_vert="${panel}.vert"
 mesh_face="${panel}.face"
 if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
   echo "Preparing mesh artifacts for $panel ..."
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/coulomb" -g=0 "$panel" "$@" >"$prep_log" 2>&1
+  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=0 "$panel" "$@" >"$prep_log" 2>&1
 fi
 
-./scripts/with_benchmark_env.sh "$BUILD_DIR/coulomb" -g=0 -m=0 "$panel" "$@" >"$cpu_log" 2>&1
-./scripts/with_benchmark_env.sh "$BUILD_DIR/coulomb" -g=1 -r=1 -m=0 "$panel" "$@" >"$direct_log" 2>&1
-./scripts/with_benchmark_env.sh "$BUILD_DIR/coulomb" -g=1 -m=0 "$panel" "$@" >"$fmm_gpu_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=0 -m=0 "$panel" "$@" >"$cpu_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=1 -r=1 -m=0 "$panel" "$@" >"$direct_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=1 -m=0 "$panel" "$@" >"$fmm_gpu_log" 2>&1
 
 extract_metric() {
   log="$1"

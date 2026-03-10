@@ -45,17 +45,17 @@ else()
   list(APPEND FMM_PB_SOURCES src/gpu_backend_stub.c)
 endif()
 
-add_executable(coulomb ${FMM_PB_SOURCES})
+add_executable(fabipb ${FMM_PB_SOURCES})
 
-target_include_directories(coulomb
+target_include_directories(fabipb
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 if(FMM_PB_HAS_CUDA)
-  target_compile_definitions(coulomb PRIVATE FMM_PB_HAS_CUDA_BACKEND=1)
+  target_compile_definitions(fabipb PRIVATE FMM_PB_HAS_CUDA_BACKEND=1)
 else()
-  target_compile_definitions(coulomb PRIVATE FMM_PB_HAS_CUDA_BACKEND=0)
+  target_compile_definitions(fabipb PRIVATE FMM_PB_HAS_CUDA_BACKEND=0)
 endif()
 
 find_package(BLAS QUIET)
@@ -74,22 +74,22 @@ if(NOT LAPACK_FOUND)
   )
 endif()
 
-target_link_libraries(coulomb
+target_link_libraries(fabipb
   PRIVATE
     LAPACK::LAPACK
     BLAS::BLAS
 )
 
 if(FMM_PB_HAS_CUDA)
-  target_link_libraries(coulomb PRIVATE CUDA::cudart)
+  target_link_libraries(fabipb PRIVATE CUDA::cudart)
 endif()
 
 if(UNIX AND NOT APPLE)
-  target_link_libraries(coulomb PRIVATE m)
+  target_link_libraries(fabipb PRIVATE m)
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-  target_compile_options(coulomb PRIVATE -g)
+  target_compile_options(fabipb PRIVATE -g)
 endif()
 
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")

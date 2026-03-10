@@ -15,8 +15,8 @@ cmake --build build-prof
 
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
 rm -f gmon.out
-./build-prof/coulomb -g=0 test_proteins/1a7m > build-prof/cpu_profile_run.log 2>&1
-gprof ./build-prof/coulomb gmon.out > build-prof/gprof.txt
+./build-prof/fabipb -g=0 test_proteins/1a7m > build-prof/cpu_profile_run.log 2>&1
+gprof ./build-prof/fabipb gmon.out > build-prof/gprof.txt
 ```
 
 ## Overall runtime context

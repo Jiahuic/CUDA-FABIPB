@@ -3,7 +3,7 @@
  * fabipb.c: main driver
  * This program computes the boundary integral PB equation with fmm method
  * usage:
- *   coulomb [options] panelfile [options]
+ *   fabipb [options] panelfile [options]
  *
  * Copyright: Jiahui Chen, Weihua Geng, Johannes Tausch
  *

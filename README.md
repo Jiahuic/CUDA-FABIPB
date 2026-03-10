@@ -94,9 +94,9 @@ vendors. For explicit, reproducible benchmark logs, prefer:
 Recommended manual comparison workflow:
 
 ```sh
-./scripts/with_benchmark_env.sh ./build/coulomb test_proteins/1a63
-./scripts/with_benchmark_env.sh ./build/coulomb -g=0 -m=0 test_proteins/1a63
-./scripts/with_benchmark_env.sh ./build/coulomb -g=1 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=0 test_proteins/1a63
 ```
 
 Notes:
@@ -112,7 +112,7 @@ Notes:
 Optional one-shot debug comparison of CPU vs GPU `applyFMM` on the same input:
 
 ```sh
-./build/coulomb -g=1 -c=1 -m=0 test_proteins/1a63
+./build/fabipb -g=1 -c=1 -m=0 test_proteins/1a63
 ```
 
 This prints a single `applyFMM debug compare` line with `max_abs` and `rel_l2`
@@ -145,25 +145,25 @@ If the backend is unavailable or not yet fully implemented for a path, the solve
 Default run (auto GPU if available):
 
 ```sh
-./build/coulomb test_proteins/1a7m
+./build/fabipb test_proteins/1a7m
 ```
 
 Force CPU:
 
 ```sh
-./build/coulomb -g=0 test_proteins/1a7m
+./build/fabipb -g=0 test_proteins/1a7m
 ```
 
 Force GPU:
 
 ```sh
-./build/coulomb -g=1 test_proteins/1a7m
+./build/fabipb -g=1 test_proteins/1a7m
 ```
 
 Direct GPU dense baseline:
 
 ```sh
-./build/coulomb -g=1 -r=1 -m=0 test_proteins/1ajj
+./build/fabipb -g=1 -r=1 -m=0 test_proteins/1ajj
 ```
 
 Notes:

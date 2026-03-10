@@ -93,10 +93,10 @@ cmake --build build-a2a
 
 ```sh
 # Linux
-ldd build-a2a/coulomb | rg -i "openblas|blas|lapack"
+ldd build-a2a/fabipb | rg -i "openblas|blas|lapack"
 
 # macOS
-otool -L build-a2a/coulomb | rg -i "openblas|blas|lapack|accelerate|veclib"
+otool -L build-a2a/fabipb | rg -i "openblas|blas|lapack|accelerate|veclib"
 ```
 
 3. Confirm thread pinning environment:
