@@ -21,6 +21,8 @@ void dgesdd_(char* C, int* N, int* M, double* A, int* LDA, double* s, double* u,
 double *matrixA, *rhs;
 int *ipiv;
 double **pcBlocks;
+double **pcLUBlocks;
+int **pcIpivBlocks;
 int *pcBlockSize;
 int nPrecondBlocks;
 
@@ -61,12 +63,21 @@ void setupPreconditioning(ssystem *sys) {
   if (sys->precondCacheMode > 0 || sys->debugComparePrecond > 0) {
     CALLOC_FULL(pcBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
     CALLOC_FULL(pcBlockSize, nPrecondBlocks, int, OFF, ASOLVER);
+    if (sys->precondCacheMode > 1 || sys->debugComparePrecond > 0) {
+      CALLOC_FULL(pcLUBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
+      CALLOC_FULL(pcIpivBlocks, nPrecondBlocks, int *, OFF, ASOLVER);
+    }
     for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
       int HMsize = cb->nPnls;
       int Msize = 2 * HMsize;
+      int info;
 
       pcBlockSize[idx] = Msize;
       CALLOC_FULL(pcBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
+      if (pcLUBlocks != NULL) {
+        CALLOC_FULL(pcLUBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
+        CALLOC_FULL(pcIpivBlocks[idx], Msize, int, OFF, ASOLVER);
+      }
       for (i = 0, pnlY = cb->pnls; i < HMsize; i++, pnlY = pnlY->nextC) {
         for (j = 0, pnlX = cb->pnls; j < HMsize; j++, pnlX = pnlX->nextC) {
           KER = panelIA0(pnlX, pnlY);
@@ -77,6 +88,15 @@ void setupPreconditioning(ssystem *sys) {
         }
         pcBlocks[idx][i*Msize+i] += scale1*pnlY->area;
         pcBlocks[idx][(i+HMsize)*Msize+i+HMsize] += scale2*pnlY->area;
+      }
+      if (pcLUBlocks != NULL) {
+        memcpy(pcLUBlocks[idx], pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
+        dgetrf_(&Msize, &Msize, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], &info);
+        if (info != 0) {
+          fprintf(stderr, "Error: dgetrf failed in cached LU setup for leaf %d (info=%d)\n",
+                  idx, info);
+          exit(1);
+        }
       }
     }
   }
@@ -176,6 +196,50 @@ int PtVfmmCached(double *pot, double *sgm) {
     pcFactorTime += wall_seconds_pc() - t0;
     t0 = wall_seconds_pc();
     dgetrs_(&nChr, &Msize, &oneI, matrixA, &Msize, ipiv, rhs, &Msize, &inc);
+    pcSolveTime += wall_seconds_pc() - t0;
+
+    t0 = wall_seconds_pc();
+    for (i = 0; i < HMsize; i++) {
+      pot[cb->pnls->idx+i] = rhs[i];
+      pot[nPnls+cb->pnls->idx+i] = rhs[i+HMsize];
+    }
+    for (i = 0; i < Msize; i++) {
+      rhs[i] = 0.0;
+    }
+    pcScatterTime += wall_seconds_pc() - t0;
+  }
+
+  return 0;
+}
+
+int PtVfmmCachedLU(double *pot, double *sgm) {
+  int i, idx, Msize, HMsize, info;
+  int nPnls = sys->nPnls;
+  cube *cb;
+  double t0;
+
+  ASSERT(pcLUBlocks != NULL);
+  ASSERT(pcIpivBlocks != NULL);
+  ASSERT(pcBlockSize != NULL);
+
+  for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
+    Msize = pcBlockSize[idx];
+    HMsize = cb->nPnls;
+
+    t0 = wall_seconds_pc();
+    for (i = 0; i < HMsize; i++) {
+      rhs[i] = sgm[cb->pnls->idx+i];
+      rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
+    }
+    pcAssembleTime += wall_seconds_pc() - t0;
+
+    t0 = wall_seconds_pc();
+    dgetrs_(&nChr, &Msize, &oneI, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], rhs, &Msize, &info);
+    if (info != 0) {
+      fprintf(stderr, "Error: dgetrs failed in cached LU apply for leaf %d (info=%d)\n",
+              idx, info);
+      exit(1);
+    }
     pcSolveTime += wall_seconds_pc() - t0;
 
     t0 = wall_seconds_pc();

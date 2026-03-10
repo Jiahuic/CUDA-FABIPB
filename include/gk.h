@@ -79,7 +79,7 @@ struct ssystem {
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
   int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
-  int precondCacheMode;     /* 0=original PtVfmm, 1=cached local blocks */
+  int precondCacheMode;     /* 0=original, 1=cached local blocks, 2=cached LU */
   int nLeafCubesFlat;       /* flattened finest-level cube count */
   int *leafPanelStart;      /* flattened per-leaf panel start index */
   int *leafPanelCount;      /* flattened per-leaf panel count */

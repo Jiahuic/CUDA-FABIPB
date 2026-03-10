@@ -44,6 +44,7 @@ double *panelRHS(int qOrder, panel *pnlX, double *chrY );
 int MtVmain(double *alpha, double *sgm, double *beta, double *pot);
 int PtVfmm(double *pot, double *sgm);
 int PtVfmmCached(double *pot, double *sgm);
+int PtVfmmCachedLU(double *pot, double *sgm);
 int PtVmain(double *pot, double *sgm);
 
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
@@ -143,6 +144,7 @@ static void compareApplyFMMOnce(ssystem *sys, double *sgm) {
 static void comparePrecondOnce(ssystem *sys, double *sgm) {
   double *potOrig, *potCached;
   double maxAbs = 0.0, l2Diff = 0.0, l2Ref = 0.0;
+  const char *modeLabel = (sys->precondCacheMode > 1) ? "cached-lu" : "cached-blocks";
   int maxIdx = -1;
   int i, n = 2 * sys->nPnls;
 
@@ -150,7 +152,11 @@ static void comparePrecondOnce(ssystem *sys, double *sgm) {
   CALLOC(potCached, n, double);
 
   PtVfmm(potOrig, sgm);
-  PtVfmmCached(potCached, sgm);
+  if (sys->precondCacheMode > 1) {
+    PtVfmmCachedLU(potCached, sgm);
+  } else {
+    PtVfmmCached(potCached, sgm);
+  }
 
   for (i = 0; i < n; i++) {
     double diff = fabs(potOrig[i] - potCached[i]);
@@ -162,7 +168,8 @@ static void comparePrecondOnce(ssystem *sys, double *sgm) {
     l2Ref += potOrig[i] * potOrig[i];
   }
 
-  printf("PtVfmm debug compare: max_abs=%e rel_l2=%e max_idx=%d orig=%e cached=%e\n",
+  printf("PtVfmm debug compare (%s): max_abs=%e rel_l2=%e max_idx=%d orig=%e test=%e\n",
+         modeLabel,
          maxAbs,
          (l2Ref > 0.0) ? sqrt(l2Diff / l2Ref) : 0.0,
          maxIdx,
@@ -321,7 +328,7 @@ int main(int nargs, char *argv[]){
   printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
   printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
   printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
-  printf("Preconditioner mode=%d (0=original, 1=cached-blocks)\n", sys->precondCacheMode);
+  printf("Preconditioner mode=%d (0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
   //printf("----------------------------\n");
 
 
@@ -444,6 +451,9 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
 } /* MtVmain */
 
 int PtVmain(double *pot, double *sgm) {
+  if (sys->precondCacheMode > 1) {
+    return PtVfmmCachedLU(pot, sgm);
+  }
   if (sys->precondCacheMode > 0) {
     return PtVfmmCached(pot, sgm);
   }
