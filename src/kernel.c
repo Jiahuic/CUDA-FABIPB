@@ -8,8 +8,14 @@
 #include "gkGlobal.h"
 #include "gk.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define FABIPB_THREAD_LOCAL __thread
+#else
+#define FABIPB_THREAD_LOCAL
+#endif
+
 extern double kappa;
-extern double *nrmX, *nrmY;
+extern FABIPB_THREAD_LOCAL double *nrmX, *nrmY;
 extern double epsilon;
 extern int nKerl;
 

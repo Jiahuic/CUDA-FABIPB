@@ -123,6 +123,7 @@ extern double setupBasTime, setupMatTime, setupPCTime, solveTimeNoPC, solveTimeP
 extern double setupQ2PTime, setupQ2MTime, setupM2LTime;
 extern double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 extern double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
+extern double fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime;
 extern double mtvApplyFMMTime, mtvTotalTime;
 extern double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 extern double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
