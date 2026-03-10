@@ -12,19 +12,62 @@
 #include "gkGlobal.h"
 #include "gk.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define FABIPB_THREAD_LOCAL __thread
+#else
+#define FABIPB_THREAD_LOCAL
+#endif
+
 /* function prototypes */
 void Jacobi(int, double, double, double*, double*);  /* Gauss quad rule */
 
 /* global variables */
-double *nrmX, *nrmY;
+FABIPB_THREAD_LOCAL double *nrmX, *nrmY;
 double **tLegA, **wLegA;
 //double intgrY[9];
 int maxQuadOrder, nKerl;
-double *intgrP, *intgr, *intgrY, intgrRHS[2], intgrPtl[2];
-double *fcn1, *fcn2, *fcn3, *fcn4, *fcn5, *fcn6;
+static FABIPB_THREAD_LOCAL double *intgrP, *intgr, *intgrY;
+static FABIPB_THREAD_LOCAL double intgrRHS[2], intgrPtl[2];
+static FABIPB_THREAD_LOCAL double *fcn1, *fcn2, *fcn3, *fcn4, *fcn5, *fcn6;
+static FABIPB_THREAD_LOCAL int quadWorkspaceSize;
 
 void kernelRHS( double *x, double *y);
 void kernelPtl( double *x, double *y);
+
+static void ensureQuadThreadWorkspace(void) {
+  if (quadWorkspaceSize == nKerl &&
+      intgrP != NULL && intgr != NULL && intgrY != NULL &&
+      fcn1 != NULL && fcn2 != NULL && fcn3 != NULL &&
+      fcn4 != NULL && fcn5 != NULL && fcn6 != NULL) {
+    return;
+  }
+
+  free(intgrP);
+  free(intgr);
+  free(intgrY);
+  free(fcn1);
+  free(fcn2);
+  free(fcn3);
+  free(fcn4);
+  free(fcn5);
+  free(fcn6);
+
+  intgrP = (double *)calloc((size_t)nKerl, sizeof(double));
+  intgr = (double *)calloc((size_t)nKerl, sizeof(double));
+  intgrY = (double *)calloc((size_t)nKerl, sizeof(double));
+  fcn1 = (double *)calloc((size_t)nKerl, sizeof(double));
+  fcn2 = (double *)calloc((size_t)nKerl, sizeof(double));
+  fcn3 = (double *)calloc((size_t)nKerl, sizeof(double));
+  fcn4 = (double *)calloc((size_t)nKerl, sizeof(double));
+  fcn5 = (double *)calloc((size_t)nKerl, sizeof(double));
+  fcn6 = (double *)calloc((size_t)nKerl, sizeof(double));
+  if (!intgrP || !intgr || !intgrY || !fcn1 || !fcn2 || !fcn3 ||
+      !fcn4 || !fcn5 || !fcn6) {
+    fprintf(stderr, "Error: failed to allocate thread-local quadrature workspace\n");
+    exit(1);
+  }
+  quadWorkspaceSize = nKerl;
+}
 
 /*
  *  current kernel must be turned on before using quadrature
@@ -60,16 +103,6 @@ void initQuad(ssystem *sys) {
 
   maxQuadOrder = sys->maxQuadOrder;
   nKerl = sys->nKerl;
-
-  CALLOC(intgrP, nKerl, double);
-  CALLOC(intgr, nKerl, double);
-  CALLOC(intgrY, nKerl, double);
-  CALLOC(fcn1, nKerl, double);
-  CALLOC(fcn2, nKerl, double);
-  CALLOC(fcn3, nKerl, double);
-  CALLOC(fcn4, nKerl, double);
-  CALLOC(fcn5, nKerl, double);
-  CALLOC(fcn6, nKerl, double);
 
   CALLOC(tLegA, 11, double*);
   CALLOC(wLegA, 11, double*);
@@ -226,6 +259,7 @@ double potentialP0(panel *pnlY, double *xC) {
   double tmp, intgr;
 
   qOrder = maxQuadOrder-1;
+  ensureQuadThreadWorkspace();
   tLeg = tLegA[qOrder];
   wLeg = wLegA[qOrder];
 
@@ -493,6 +527,7 @@ double *panelIA0(panel *pnlX, panel *pnlY ) {
   double dist2, diam2;
   double *intgr;
   /* normals are only used for double, adjoint and hypersing */
+  ensureQuadThreadWorkspace();
   nrmX = pnlX->normal;
   nrmY = pnlY->normal;
   //printf("%f %f %f\n",nrmY[0],nrmY[1],nrmY[2]);
@@ -566,6 +601,7 @@ double *panelIA1(panel *pnlX, panel *pnlY ) {
   double dist2, diam2;
   double *intgr;
   /* normals are only used for double, adjoint and hypersing */
+  ensureQuadThreadWorkspace();
   nrmX = pnlX->normal;
   nrmY = pnlY->normal;
   //printf("%f %f %f\n",nrmY[0],nrmY[1],nrmY[2]);
@@ -623,7 +659,7 @@ double *panelIA1(panel *pnlX, panel *pnlY ) {
   }
 
   return intgrP;
-} /* panelIA0 */
+} /* panelIA1 */
 
 
 
@@ -642,6 +678,7 @@ double *panelRHS( int qOrder, panel *pnlX, double *chrY ) {
 
   tLeg = tLegA[qOrder];
   wLeg = wLegA[qOrder];
+  ensureQuadThreadWorkspace();
 
   ax2 = pnlX->a[2];
   ax0 = pnlX->a[0];
@@ -676,6 +713,7 @@ double *panelPotential( int qOrder, double *chrX, panel *pnlY ) {
 
   tLeg = tLegA[qOrder];
   wLeg = wLegA[qOrder];
+  ensureQuadThreadWorkspace();
 
   ax2 = pnlY->a[2];
   ax0 = pnlY->a[0];

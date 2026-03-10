@@ -3,9 +3,12 @@
 #include "gkGlobal.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <thread>
+#include <vector>
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
 extern "C" void kernelKER4(double *x, double *y);
@@ -240,10 +243,35 @@ int allocateDirectArrays(int nPnls, long long nInteractions) {
   return 1;
 }
 
+int nearfieldBuildThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_NEARFIELD_BUILD_THREADS");
+  unsigned int hc = std::thread::hardware_concurrency();
+  int threads;
+
+  if (env != NULL) {
+    threads = atoi(env);
+  } else if (hc > 0U) {
+    threads = (int)hc;
+  } else {
+    threads = 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 32) {
+    threads = 32;
+  }
+  return threads;
+}
+
 int buildNearfieldTables(const ssystem *sys) {
   int pairIdx;
   long long totalInteractions = 0;
   long long k = 0;
+  double t0, t1;
 
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
     int srcLeaf = sys->nearPairSrc[pairIdx];
@@ -258,6 +286,7 @@ int buildNearfieldTables(const ssystem *sys) {
   }
   gNear.sys = sys;
   gNear.nearfieldMode = sys->gpuNearfieldMode;
+  t0 = wall_seconds_cuda_local();
   if (!allocateHostArrays(totalInteractions)) {
     return 0;
   }
@@ -265,45 +294,102 @@ int buildNearfieldTables(const ssystem *sys) {
   memcpy(gNear.h_leafPanelStart, sys->leafPanelStart, (size_t)sys->nLeafCubesFlat * sizeof(int));
   memcpy(gNear.h_leafPanelCount, sys->leafPanelCount, (size_t)sys->nLeafCubesFlat * sizeof(int));
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+    int srcLeaf = sys->nearPairSrc[pairIdx];
     int dstLeaf = sys->nearPairDst[pairIdx];
+    int srcCount = sys->leafPanelCount[srcLeaf];
     gNear.h_leafPairOffset[dstLeaf + 1] += 1;
+    gNear.h_pairSrcCount[pairIdx] = srcCount;
+    gNear.h_pairInteractionOffset[pairIdx] = k;
+    k += (long long)srcCount * (long long)sys->leafPanelCount[dstLeaf];
   }
   for (pairIdx = 0; pairIdx < sys->nLeafCubesFlat; pairIdx++) {
     gNear.h_leafPairOffset[pairIdx + 1] += gNear.h_leafPairOffset[pairIdx];
   }
+  t1 = wall_seconds_cuda_local();
+  fmmNearGpuMetaTime += (t1 - t0);
 
   kernel = kernelKER4;
-  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
-    int srcLeaf = sys->nearPairSrc[pairIdx];
-    int dstLeaf = sys->nearPairDst[pairIdx];
-    int srcStart = sys->leafPanelStart[srcLeaf];
-    int srcCount = sys->leafPanelCount[srcLeaf];
-    int dstStart = sys->leafPanelStart[dstLeaf];
-    int dstCount = sys->leafPanelCount[dstLeaf];
-    int i, j;
+  t0 = wall_seconds_cuda_local();
+  {
+    int nThreads = nearfieldBuildThreadCount(sys->nNearPairsFlat);
+    if (nThreads <= 1) {
+      for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+        int srcLeaf = sys->nearPairSrc[pairIdx];
+        int dstLeaf = sys->nearPairDst[pairIdx];
+        int srcStart = sys->leafPanelStart[srcLeaf];
+        int srcCount = sys->leafPanelCount[srcLeaf];
+        int dstStart = sys->leafPanelStart[dstLeaf];
+        int dstCount = sys->leafPanelCount[dstLeaf];
+        long long base = gNear.h_pairInteractionOffset[pairIdx];
+        int i, j;
 
-    gNear.h_pairSrcCount[pairIdx] = srcCount;
-    gNear.h_pairInteractionOffset[pairIdx] = k;
+        for (i = 0; i < dstCount; i++) {
+          int dstPanelIdx = dstStart + i;
+          panel *pnlX = sys->panelByIdx[dstPanelIdx];
+          for (j = 0; j < srcCount; j++) {
+            long long idx = base + (long long)i * (long long)srcCount + (long long)j;
+            int srcPanelIdx = srcStart + j;
+            panel *pnlY = sys->panelByIdx[srcPanelIdx];
+            double *KER = panelIA0(pnlX, pnlY);
 
-    for (i = 0; i < dstCount; i++) {
-      int dstPanelIdx = dstStart + i;
-      panel *pnlX = sys->panelByIdx[dstPanelIdx];
-      for (j = 0; j < srcCount; j++) {
-        int srcPanelIdx = srcStart + j;
-        panel *pnlY = sys->panelByIdx[srcPanelIdx];
-        double *KER = panelIA0(pnlX, pnlY);
+            gNear.h_dst[idx] = dstPanelIdx;
+            gNear.h_src[idx] = srcPanelIdx;
+            gNear.h_k0[idx] = KER[0];
+            gNear.h_k1[idx] = KER[1];
+            gNear.h_k2[idx] = KER[2];
+            gNear.h_k3[idx] = KER[3];
+          }
+        }
+      }
+    } else {
+      std::vector<std::thread> workers;
+      int t;
 
-        gNear.h_dst[k] = dstPanelIdx;
-        gNear.h_src[k] = srcPanelIdx;
-        gNear.h_k0[k] = KER[0];
-        gNear.h_k1[k] = KER[1];
-        gNear.h_k2[k] = KER[2];
-        gNear.h_k3[k] = KER[3];
-        k++;
+      workers.reserve((size_t)nThreads);
+      for (t = 0; t < nThreads; t++) {
+        int begin = (sys->nNearPairsFlat * t) / nThreads;
+        int end = (sys->nNearPairsFlat * (t + 1)) / nThreads;
+        workers.emplace_back([=]() {
+          int localPairIdx;
+          for (localPairIdx = begin; localPairIdx < end; localPairIdx++) {
+            int srcLeaf = sys->nearPairSrc[localPairIdx];
+            int dstLeaf = sys->nearPairDst[localPairIdx];
+            int srcStart = sys->leafPanelStart[srcLeaf];
+            int srcCount = sys->leafPanelCount[srcLeaf];
+            int dstStart = sys->leafPanelStart[dstLeaf];
+            int dstCount = sys->leafPanelCount[dstLeaf];
+            long long base = gNear.h_pairInteractionOffset[localPairIdx];
+            int i, j;
+
+            for (i = 0; i < dstCount; i++) {
+              int dstPanelIdx = dstStart + i;
+              panel *pnlX = sys->panelByIdx[dstPanelIdx];
+              for (j = 0; j < srcCount; j++) {
+                long long idx = base + (long long)i * (long long)srcCount + (long long)j;
+                int srcPanelIdx = srcStart + j;
+                panel *pnlY = sys->panelByIdx[srcPanelIdx];
+                double *KER = panelIA0(pnlX, pnlY);
+
+                gNear.h_dst[idx] = dstPanelIdx;
+                gNear.h_src[idx] = srcPanelIdx;
+                gNear.h_k0[idx] = KER[0];
+                gNear.h_k1[idx] = KER[1];
+                gNear.h_k2[idx] = KER[2];
+                gNear.h_k3[idx] = KER[3];
+              }
+            }
+          }
+        });
+      }
+      for (t = 0; t < nThreads; t++) {
+        workers[(size_t)t].join();
       }
     }
   }
+  t1 = wall_seconds_cuda_local();
+  fmmNearGpuCoeffTime += (t1 - t0);
 
+  t0 = wall_seconds_cuda_local();
   if (!allocateDeviceArrays(sys->nPnls, totalInteractions)) {
     return 0;
   }
@@ -319,6 +405,8 @@ int buildNearfieldTables(const ssystem *sys) {
   if (cudaMemcpy(gNear.d_k1, gNear.h_k1, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_k2, gNear.h_k2, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_k3, gNear.h_k3, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  fmmNearGpuUploadTime += (t1 - t0);
 
   gNear.nPnls = sys->nPnls;
   gNear.nInteractions = totalInteractions;

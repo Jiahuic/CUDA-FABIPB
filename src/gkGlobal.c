@@ -12,6 +12,7 @@ double solveTimeNoPC, solveTimePC;
 double setupQ2PTime, setupQ2MTime, setupM2LTime;
 double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
+double fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime;
 double mtvApplyFMMTime, mtvTotalTime;
 double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
@@ -51,6 +52,9 @@ void resetFmmMatvecStats(void) {
   fmmNearGpuH2DTime = 0.0;
   fmmNearGpuKernelTime = 0.0;
   fmmNearGpuD2HTime = 0.0;
+  fmmNearGpuMetaTime = 0.0;
+  fmmNearGpuCoeffTime = 0.0;
+  fmmNearGpuUploadTime = 0.0;
   mtvApplyFMMTime = 0.0;
   mtvTotalTime = 0.0;
   mtvCalls = 0;
@@ -100,6 +104,9 @@ void printFmmMatvecStats(void) {
            1.0e3 * fmmNearGpuH2DTime * invCalls,
            1.0e3 * fmmNearGpuKernelTime * invCalls,
            1.0e3 * fmmNearGpuD2HTime * invCalls);
+    printf("GPU nearfield build breakdown (s): meta=%.6f coeff=%.6f upload=%.6f other=%.6f\n",
+           fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime,
+           fmmNearGpuBuildTime - (fmmNearGpuMetaTime + fmmNearGpuCoeffTime + fmmNearGpuUploadTime));
   }
 }
 
