@@ -47,59 +47,35 @@ static double wall_seconds_local(void) {
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
 
-static int findLeafCubeIndex(cube **leafCubes, int nLeafCubes, cube *target) {
-  int idx;
-  for (idx = 0; idx < nLeafCubes; idx++) {
-    if (leafCubes[idx] == target) {
-      return idx;
-    }
-  }
-  return -1;
-}
-
-static int findFmmCubeIndex(cube **cubeByIdx, int nCubes, cube *target) {
-  int idx;
-  for (idx = 0; idx < nCubes; idx++) {
-    if (cubeByIdx[idx] == target) {
-      return idx;
-    }
-  }
-  return -1;
-}
-
 static void buildApplyLayout(ssystem *sys) {
   cube *cb;
   int depth = sys->depth;
   int idx;
   int pairCount = 0;
-  cube **leafCubes;
 
   for (cb = sys->cubeList[depth]; cb != NULL; cb = cb->next) {
     pairCount += cb->nNbrs;
   }
 
   sys->nNearPairsFlat = pairCount;
-  CALLOC(leafCubes, sys->nLeafCubesFlat, cube *);
   CALLOC(sys->nearPairSrc, pairCount, int);
   CALLOC(sys->nearPairDst, pairCount, int);
 
   for (idx = 0, cb = sys->cubeList[depth]; cb != NULL; cb = cb->next, idx++) {
-    leafCubes[idx] = cb;
+    cb->leafFlatIdx = idx;
     sys->leafPanelStart[idx] = cb->pnls->idx;
     sys->leafPanelCount[idx] = cb->nPnls;
   }
 
   idx = 0;
   for (cb = sys->cubeList[depth]; cb != NULL; cb = cb->next) {
-    int srcIdx = findLeafCubeIndex(leafCubes, sys->nLeafCubesFlat, cb);
+    int srcIdx = cb->leafFlatIdx;
     int inbr;
     for (inbr = 0; inbr < cb->nNbrs; inbr++, idx++) {
-      sys->nearPairSrc[idx] = findLeafCubeIndex(leafCubes, sys->nLeafCubesFlat, cb->nbrs[inbr]);
+      sys->nearPairSrc[idx] = cb->nbrs[inbr]->leafFlatIdx;
       sys->nearPairDst[idx] = srcIdx;
     }
   }
-
-  free(leafCubes);
 }
 
 static void buildPanelIndex(ssystem *sys) {
@@ -130,6 +106,7 @@ static void buildFmmCubeLayout(ssystem *sys) {
   CALLOC(sys->fmmCubeByIdx, sys->nFmmCubesFlat, cube *);
   for (lev = depth; lev >= height; lev--) {
     for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next, idx++) {
+      cb->flatIdx = idx;
       sys->fmmCubeByIdx[idx] = cb;
     }
   }
@@ -142,50 +119,65 @@ static void buildM2LPairList(ssystem *sys) {
   int height = sys->height;
   int lev;
   int idx = 0;
-  int currentDst = -1;
-  int groupIdx = -1;
 
   sys->nM2LPairsFlat = 0;
-  sys->nM2LDstGroups = 0;
   for (lev = depth; lev >= height; lev--) {
     for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next) {
       int count = cb->n2Nbrs - cb->nNbrs;
       sys->nM2LPairsFlat += count;
-      if (count > 0) {
-        sys->nM2LDstGroups++;
-      }
     }
   }
 
   CALLOC(sys->m2lPairSrc, sys->nM2LPairsFlat, int);
   CALLOC(sys->m2lPairDst, sys->nM2LPairsFlat, int);
   CALLOC(sys->m2lPairOrder, sys->nM2LPairsFlat, int);
-  CALLOC(sys->m2lDstGroupStart, sys->nM2LDstGroups, int);
-  CALLOC(sys->m2lDstGroupCount, sys->nM2LDstGroups, int);
 
   for (lev = depth; lev >= height; lev--) {
     int order = sys->ordM2L[lev];
     int iNbr;
     for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next) {
-      int dstIdx = findFmmCubeIndex(sys->fmmCubeByIdx, sys->nFmmCubesFlat, cb);
+      int dstIdx = cb->flatIdx;
       for (iNbr = cb->n2Nbrs - 1; iNbr >= cb->nNbrs; iNbr--, idx++) {
-        int srcIdx = findFmmCubeIndex(sys->fmmCubeByIdx, sys->nFmmCubesFlat, cb->nbrs[iNbr]);
+        int srcIdx = cb->nbrs[iNbr]->flatIdx;
         ASSERT(srcIdx >= 0);
         ASSERT(dstIdx >= 0);
         sys->m2lPairSrc[idx] = srcIdx;
         sys->m2lPairDst[idx] = dstIdx;
         sys->m2lPairOrder[idx] = order;
-        if (dstIdx != currentDst) {
-          groupIdx++;
-          currentDst = dstIdx;
-          sys->m2lDstGroupStart[groupIdx] = idx;
-          sys->m2lDstGroupCount[groupIdx] = 0;
-        }
-        sys->m2lDstGroupCount[groupIdx]++;
       }
     }
   }
   ASSERT(idx == sys->nM2LPairsFlat);
+}
+
+static void buildM2LDstGroups(ssystem *sys) {
+  int idx;
+  int currentDst = -1;
+  int groupIdx = -1;
+
+  sys->nM2LDstGroups = 0;
+  for (idx = 0; idx < sys->nM2LPairsFlat; idx++) {
+    if (sys->m2lPairDst[idx] != currentDst) {
+      currentDst = sys->m2lPairDst[idx];
+      sys->nM2LDstGroups++;
+    }
+  }
+
+  CALLOC(sys->m2lDstGroupStart, sys->nM2LDstGroups, int);
+  CALLOC(sys->m2lDstGroupCount, sys->nM2LDstGroups, int);
+
+  currentDst = -1;
+  for (idx = 0; idx < sys->nM2LPairsFlat; idx++) {
+    int dstIdx = sys->m2lPairDst[idx];
+    if (dstIdx != currentDst) {
+      groupIdx++;
+      currentDst = dstIdx;
+      sys->m2lDstGroupStart[groupIdx] = idx;
+      sys->m2lDstGroupCount[groupIdx] = 0;
+    }
+    sys->m2lDstGroupCount[groupIdx]++;
+  }
+
   ASSERT(groupIdx + 1 == sys->nM2LDstGroups || sys->nM2LDstGroups == 0);
 }
 
@@ -220,6 +212,8 @@ void setupFMM(ssystem *sys) {
   int inbr, nNbrs;
   int order, nMoments, nCubesL;
   double r[3];
+  double t0, t1;
+  double tApplyLayout, tPanelIndex, tCubeLayout, tM2LPair, tM2LGroup;
 
 
   for ( nCubesL=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next ) {
@@ -236,12 +230,16 @@ void setupFMM(ssystem *sys) {
   order=sys->ordMom[depth];
 
   /* moments depend on which layer operator we have */
+  t0 = wall_seconds_local();
   for ( idx=0, cb=sys->cubeList[depth]; cb!=NULL; cb=cb->next, idx++ ) {
     L2P0[idx] = Q2M0[idx] = calcMoments0(sys, order, cb, 0);
     L2P1[idx] = Q2M1[idx] = calcMoments0(sys, order, cb, 1);
   }
+  t1 = wall_seconds_local();
+  setupFmmLeafTime += (t1 - t0);
 
 
+  t0 = wall_seconds_local();
   for ( lev=sys->depth; lev>=sys->height; lev-- ) {
     order = sys->ordMom[lev];
     nMoments  = sys->nMom[order];
@@ -254,15 +252,45 @@ void setupFMM(ssystem *sys) {
       CALLOC(cb->lec_k4, nMoments, double);
     }
   }
+  t1 = wall_seconds_local();
+  setupFmmCubeAllocTime += (t1 - t0);
 
   kernelDC = kernelDC0;
   kernelDS = kernelDS0;
   kernelD  = kernelDG0DGk;
 
+  tApplyLayout = tPanelIndex = tCubeLayout = tM2LPair = tM2LGroup = 0.0;
+
+  t0 = wall_seconds_local();
   buildApplyLayout(sys);
+  t1 = wall_seconds_local();
+  tApplyLayout = (t1 - t0);
+  setupFmmApplyLayoutTime += tApplyLayout;
+
+  t0 = wall_seconds_local();
   buildPanelIndex(sys);
+  t1 = wall_seconds_local();
+  tPanelIndex = (t1 - t0);
+  setupFmmPanelIndexTime += tPanelIndex;
+
+  t0 = wall_seconds_local();
   buildFmmCubeLayout(sys);
+  t1 = wall_seconds_local();
+  tCubeLayout = (t1 - t0);
+  setupFmmCubeLayoutTime += tCubeLayout;
+
+  t0 = wall_seconds_local();
   buildM2LPairList(sys);
+  t1 = wall_seconds_local();
+  tM2LPair = (t1 - t0);
+  setupFmmM2LPairTime += tM2LPair;
+
+  t0 = wall_seconds_local();
+  buildM2LDstGroups(sys);
+  t1 = wall_seconds_local();
+  tM2LGroup = (t1 - t0);
+  setupFmmM2LGroupTime += tM2LGroup;
+  setupFmmLayoutTime += tApplyLayout + tPanelIndex + tCubeLayout + tM2LPair + tM2LGroup;
   printf("Flattened apply layout: leaf-cubes=%d near-pairs=%d\n",
          sys->nLeafCubesFlat, sys->nNearPairsFlat);
   printf("Flattened interaction layout: m2l-pairs=%d dst-groups=%d\n",
@@ -375,8 +403,8 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   /* Q2M transformations */
   time1 = wall_seconds_local();
   nMom = sys->nMom[sys->ordMom[depth]];
-  if (!(sys->gpuMode > 0 && gpuQ2MApply(sys, sgm))) {
-    if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedNoGpuQ2M) {
+  if (!(sys->gpuMode > 0 && sys->gpuQ2MMode > 0 && gpuQ2MApply(sys, sgm))) {
+    if (sys->gpuMode > 0 && sys->gpuQ2MMode > 0 && gpuBackendAvailable() && !warnedNoGpuQ2M) {
       printf("GPU Q2M path unavailable; using CPU fallback.\n");
       warnedNoGpuQ2M = 1;
     }

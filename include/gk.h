@@ -30,6 +30,8 @@ typedef struct edge edge;
 struct cube {               /* cube, actually a cluster of panels */
   int level;                /* 0 => root */
   int i, j, k;              /* cube is cubes[level][j][k][l] */
+  int flatIdx;              /* flattened active-FMM cube index */
+  int leafFlatIdx;          /* flattened finest-level cube index */
   double x[3];              /* Chebychev center */
   int nPnls;                /* number of panels in cube */
   panel *pnls;              /* linked list of panels with center in cube */
@@ -78,6 +80,7 @@ struct ssystem {
   int debugCompareApply;    /* 0=off, >0 compare one CPU/GPU applyFMM call */
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
+  int gpuQ2MMode;           /* 0=CPU default, 1=enable GPU Q2M path for debugging */
   int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
   int precondCacheMode;     /* 0=original, 1=cached local blocks, 2=cached LU (preferred) */
   int nLeafCubesFlat;       /* flattened finest-level cube count */
