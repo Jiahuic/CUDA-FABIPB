@@ -40,3 +40,11 @@ int gpuL2PApply(ssystem *sys, double alpha, double beta, double *pot) {
   (void)pot;
   return 0;
 }
+
+int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
+  (void)sys;
+  (void)qOrder;
+  (void)fac;
+  (void)sgm;
+  return 0;
+}

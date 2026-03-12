@@ -218,8 +218,17 @@ void setupRHS(ssystem *sys, double *sgm) {
   int nPnls = sys->nPnls, nChar = sys->nChar, qOrder=sys->maxQuadOrder;
   double *intgr, fac;
   panel *pnl;
+  static int warnedGpuRHS = 0;
 
   fac = fourPiI/epsilon1;
+
+  if (sys->gpuMode > 0 && gpuSetupRHS(sys, qOrder, fac, sgm)) {
+    return;
+  }
+  if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedGpuRHS) {
+    printf("GPU RHS path unavailable; using CPU setupRHS.\n");
+    warnedGpuRHS = 1;
+  }
 
   /* triangles order for Direct */
   for ( i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {

@@ -13,6 +13,7 @@ int gpuDirectApply(struct ssystem *sys, double alpha, double beta, const double 
 int gpuM2LApply(struct ssystem *sys);
 int gpuQ2MApply(struct ssystem *sys, const double *sgm);
 int gpuL2PApply(struct ssystem *sys, double alpha, double beta, double *pot);
+int gpuSetupRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
 
 #ifdef __cplusplus
 }
