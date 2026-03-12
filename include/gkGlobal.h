@@ -121,6 +121,9 @@
 /* timers */
 extern double setupBasTime, setupMatTime, setupPCTime, solveTimeNoPC, solveTimePC;
 extern double setupQ2PTime, setupQ2MTime, setupM2LTime;
+extern double setupFmmLeafTime, setupFmmCubeAllocTime, setupFmmLayoutTime;
+extern double setupFmmApplyLayoutTime, setupFmmPanelIndexTime, setupFmmCubeLayoutTime;
+extern double setupFmmM2LPairTime, setupFmmM2LGroupTime;
 extern double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 extern double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 extern double fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime;
@@ -142,5 +145,6 @@ extern int oneI;
 
 void resetFmmMatvecStats(void);
 void printFmmMatvecStats(void);
+void printSetupFmmStats(void);
 void resetGmresStats(void);
 void printGmresStats(double gmresWallTime);

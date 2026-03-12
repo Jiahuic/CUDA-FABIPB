@@ -10,6 +10,9 @@
 double gkInitTime, setupFMMTime, setupRHSTime, gmresTime;
 double solveTimeNoPC, solveTimePC;
 double setupQ2PTime, setupQ2MTime, setupM2LTime;
+double setupFmmLeafTime, setupFmmCubeAllocTime, setupFmmLayoutTime;
+double setupFmmApplyLayoutTime, setupFmmPanelIndexTime, setupFmmCubeLayoutTime;
+double setupFmmM2LPairTime, setupFmmM2LGroupTime;
 double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 double fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime;
@@ -58,6 +61,25 @@ void resetFmmMatvecStats(void) {
   mtvApplyFMMTime = 0.0;
   mtvTotalTime = 0.0;
   mtvCalls = 0;
+}
+
+void printSetupFmmStats(void) {
+  double total = setupFmmLeafTime + setupFmmCubeAllocTime + setupFmmLayoutTime;
+  double layoutTracked = setupFmmApplyLayoutTime + setupFmmPanelIndexTime +
+                         setupFmmCubeLayoutTime + setupFmmM2LPairTime +
+                         setupFmmM2LGroupTime;
+
+  if (total <= 0.0) {
+    return;
+  }
+
+  printf("setupFMM breakdown (s): leaf-transforms=%.6f cube-alloc=%.6f layouts=%.6f tracked=%.6f\n",
+         setupFmmLeafTime, setupFmmCubeAllocTime, setupFmmLayoutTime, total);
+  if (setupFmmLayoutTime > 0.0) {
+    printf("setupFMM layout breakdown (s): apply=%.6f panel-index=%.6f cubes=%.6f m2l-pairs=%.6f m2l-groups=%.6f tracked=%.6f\n",
+           setupFmmApplyLayoutTime, setupFmmPanelIndexTime, setupFmmCubeLayoutTime,
+           setupFmmM2LPairTime, setupFmmM2LGroupTime, layoutTracked);
+  }
 }
 
 void resetGmresStats(void) {

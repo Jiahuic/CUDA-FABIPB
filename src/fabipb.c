@@ -193,6 +193,7 @@ static void print_usage(const char *prog) {
   printf("  -m=0|1    reuse or regenerate MSMS mesh (default: 1)\n");
   printf("  -d=<val>  MSMS density used when -m=1 (default: 1)\n");
   printf("  -r=0|1    FMM matvec or direct GPU baseline (default: 0)\n");
+  printf("  -Q=0|1    CPU-default or GPU-debug Q2M path (default: 0)\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
   printf("  -P=0|1|2  original, cached-block, or cached-LU preconditioner (default: 2)\n");
   printf("  -t=<lev>  tree depth\n");
@@ -262,6 +263,7 @@ int main(int nargs, char *argv[]){
   sys->debugCompareApply = 0;
   sys->debugComparePrecond = 0;
   sys->matvecMode = 0;
+  sys->gpuQ2MMode = 0;
   sys->gpuNearfieldMode = 1;
   sys->precondCacheMode = 2;
   sprintf(density,"1");
@@ -307,6 +309,8 @@ int main(int nargs, char *argv[]){
         case 'C': sys->debugComparePrecond = atoi( argv[i]+3 );
           break;
         case 'r': sys->matvecMode = atoi( argv[i]+3 );
+          break;
+        case 'Q': sys->gpuQ2MMode = atoi( argv[i]+3 );
           break;
         case 'G': sys->gpuNearfieldMode = atoi( argv[i]+3 );
           break;
@@ -354,6 +358,7 @@ int main(int nargs, char *argv[]){
   printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
   printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
   if (sys->matvecMode == 0) {
+    printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
     printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
   }
   printf("Preconditioner mode=%d (0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
@@ -381,13 +386,12 @@ int main(int nargs, char *argv[]){
   CALLOC(sgm, 2*nPnls, double);
   CALLOC(pot, 2*nPnls, double);
 
-  if (sys->matvecMode == 0 || sys->debugCompareApply > 0) {
-    stage_t0 = wall_seconds();
-    setupFMM(sys);
-    setupFMM_t_local = wall_seconds() - stage_t0;
-  } else {
+  stage_t0 = wall_seconds();
+  setupFMM(sys);
+  setupFMM_t_local = wall_seconds() - stage_t0;
+  if (sys->matvecMode == 1) {
+    /* Direct-GPU matvec still uses treecode/FMM-side data for postprocessing. */
     buildPanelIndexDirect(sys);
-    setupFMM_t_local = 0.0;
   }
   stage_t0 = wall_seconds();
   setupPreconditioning(sys);
@@ -428,6 +432,7 @@ int main(int nargs, char *argv[]){
   printf("solvation energy: %f\n", ptl);
   printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
          loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
+  printSetupFmmStats();
   printGmresStats(gmres_t);
   if (sys->matvecMode == 0) {
     printFmmMatvecStats();

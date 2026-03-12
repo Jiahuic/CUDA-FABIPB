@@ -89,6 +89,17 @@ Main remaining runtime priorities after the current preconditioner work:
 2. preconditioner solve (`dgetrs`) is smaller but still measurable
 3. near-field kernel remains important, but no longer dominates the full run the way it did before grouping
 
+Leaf-transform policy update:
+
+* GPU `Q2M` was validated numerically and should remain available in the codebase
+* current results show that `Q2M` is regime-dependent:
+  * on moderate cases, CPU `Q2M` can still win because the current GPU path is dominated by copy and launch overhead
+  * on deeper trees with very large leaf counts, GPU `Q2M` can become faster because the leaf-transform work is large enough to amortize the overhead
+* the current runtime policy may stay conservative, but the final presentation goal should be an adaptive hybrid strategy rather than a fixed CPU-only or GPU-only rule
+* final hybrid-mode goal:
+  * choose CPU or GPU per stage based on problem size, depth, and leaf workload
+  * in particular, allow `Q2M` to switch automatically when the leaf-transform workload crosses the GPU-beneficial threshold
+
 Near-field setup update:
 
 * thread-safe `panelIA0()` plus parallel near-field coefficient generation is now merged on `main`
