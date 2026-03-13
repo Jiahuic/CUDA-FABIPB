@@ -879,8 +879,9 @@ int buildM2LTables(const ssystem *sys) {
                  (size_t)gM2L.totalPairCoeff * sizeof(double),
                  cudaMemcpyHostToDevice) != cudaSuccess) return 0;
 
-  printf("GPU M2L cache: cubes=%d pairs=%d coeff=%lld\n",
-         gM2L.nCubes, gM2L.nPairs, gM2L.totalPairCoeff);
+  if (sys->benchmarkMode > 0)
+    printf("GPU M2L cache: cubes=%d pairs=%d coeff=%lld\n",
+           gM2L.nCubes, gM2L.nPairs, gM2L.totalPairCoeff);
   return 1;
 }
 
@@ -942,8 +943,9 @@ int buildLeafTables(const ssystem *sys) {
                  (size_t)totalEntries * sizeof(double),
                  cudaMemcpyHostToDevice) != cudaSuccess) return 0;
 
-  printf("GPU leaf cache: leaves=%d coeff=%d matrix-entries=%lld\n",
-         gLeaf.nLeaves, gLeaf.nLeaves * nMom, totalEntries);
+  if (sys->benchmarkMode > 0)
+    printf("GPU leaf cache: leaves=%d coeff=%d matrix-entries=%lld\n",
+           gLeaf.nLeaves, gLeaf.nLeaves * nMom, totalEntries);
   return 1;
 }
 
@@ -1090,7 +1092,8 @@ int buildNearfieldTables(const ssystem *sys) {
 
   gNear.nPnls = sys->nPnls;
   gNear.nInteractions = totalInteractions;
-  printf("GPU nearfield cache: panel-pairs=%lld mode=%d\n", totalInteractions, sys->gpuNearfieldMode);
+  if (sys->benchmarkMode > 0)
+    printf("GPU nearfield cache: panel-pairs=%lld mode=%d\n", totalInteractions, sys->gpuNearfieldMode);
   return 1;
 }
 
@@ -1114,15 +1117,17 @@ int buildDirectTables(const ssystem *sys) {
   hostCoeffBytes = 4 * coeffBytes;
   totalBytes = 4 * coeffBytes + 2 * vecBytes;
   combinedBytes = hostCoeffBytes + totalBytes;
-  printf("Direct GPU memory estimate: solver-host=%.3f GB host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
-         (double)memcount / (1024.0 * 1024.0 * 1024.0),
-         (double)hostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
-         (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
-         (double)combinedBytes / (1024.0 * 1024.0 * 1024.0));
+  if (sys->benchmarkMode > 0)
+    printf("Direct GPU memory estimate: solver-host=%.3f GB host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
+           (double)memcount / (1024.0 * 1024.0 * 1024.0),
+           (double)hostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)combinedBytes / (1024.0 * 1024.0 * 1024.0));
   if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
-    printf("Direct GPU device memory: free=%.3f GB total=%.3f GB\n",
-           (double)freeBytes / (1024.0 * 1024.0 * 1024.0),
-           (double)totalGpuBytes / (1024.0 * 1024.0 * 1024.0));
+    if (sys->benchmarkMode > 0)
+      printf("Direct GPU device memory: free=%.3f GB total=%.3f GB\n",
+             (double)freeBytes / (1024.0 * 1024.0 * 1024.0),
+             (double)totalGpuBytes / (1024.0 * 1024.0 * 1024.0));
     if (totalBytes > freeBytes * 7 / 10) {
       printf("Direct GPU cache unavailable: need %.3f GB, free %.3f GB\n",
              (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
@@ -1159,7 +1164,8 @@ int buildDirectTables(const ssystem *sys) {
   gDirect.sys = sys;
   gDirect.nPnls = sys->nPnls;
   gDirect.nInteractions = nInteractions;
-  printf("GPU direct cache: panel-pairs=%lld\n", nInteractions);
+  if (sys->benchmarkMode > 0)
+    printf("GPU direct cache: panel-pairs=%lld\n", nInteractions);
   return 1;
 }
 
@@ -1215,7 +1221,8 @@ int buildRhsTables(const ssystem *sys, int qOrder) {
   gRhs.nPnls = sys->nPnls;
   gRhs.nChar = sys->nChar;
   gRhs.qOrder = qOrder;
-  printf("GPU RHS cache: panels=%d charges=%d qOrder=%d\n", gRhs.nPnls, gRhs.nChar, gRhs.qOrder);
+  if (sys->benchmarkMode > 0)
+    printf("GPU RHS cache: panels=%d charges=%d qOrder=%d\n", gRhs.nPnls, gRhs.nChar, gRhs.qOrder);
   return 1;
 }
 
@@ -1628,7 +1635,7 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   fmmNearGpuH2DTime += (t1 - t0);
 
   blockSize = 256;
-  if (printedMode != sys->gpuNearfieldMode) {
+  if (sys->benchmarkMode > 0 && printedMode != sys->gpuNearfieldMode) {
     printf("GPU nearfield apply mode=%d (%s)\n",
            sys->gpuNearfieldMode,
            (sys->gpuNearfieldMode == 0) ? "interaction" : "destination-leaf");

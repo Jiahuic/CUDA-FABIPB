@@ -291,11 +291,13 @@ void setupFMM(ssystem *sys) {
   tM2LGroup = (t1 - t0);
   setupFmmM2LGroupTime += tM2LGroup;
   setupFmmLayoutTime += tApplyLayout + tPanelIndex + tCubeLayout + tM2LPair + tM2LGroup;
-  printf("Flattened apply layout: leaf-cubes=%d near-pairs=%d\n",
-         sys->nLeafCubesFlat, sys->nNearPairsFlat);
-  printf("Flattened interaction layout: m2l-pairs=%d dst-groups=%d\n",
-         sys->nM2LPairsFlat, sys->nM2LDstGroups);
-  printf("Flattened FMM cube layout: cubes=%d\n", sys->nFmmCubesFlat);
+  if (sys->benchmarkMode > 0) {
+    printf("Flattened apply layout: leaf-cubes=%d near-pairs=%d\n",
+           sys->nLeafCubesFlat, sys->nNearPairsFlat);
+    printf("Flattened interaction layout: m2l-pairs=%d dst-groups=%d\n",
+           sys->nM2LPairsFlat, sys->nM2LDstGroups);
+    printf("Flattened FMM cube layout: cubes=%d\n", sys->nFmmCubesFlat);
+  }
 
 } /* setupFMM */
 

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "gkGlobal.h"
+#include "gk.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -43,6 +44,7 @@ int oneI = 1;
 
 char hChr='T';             /* transpose */
 char nChr='N';             /* normal */
+extern ssystem *sys;
 
 void resetFmmMatvecStats(void) {
   fmmQ2MTime = 0.0;
@@ -69,6 +71,9 @@ void printSetupFmmStats(void) {
                          setupFmmCubeLayoutTime + setupFmmM2LPairTime +
                          setupFmmM2LGroupTime;
 
+  if (sys == NULL || sys->benchmarkMode == 0) {
+    return;
+  }
   if (total <= 0.0) {
     return;
   }
@@ -100,6 +105,9 @@ void printFmmMatvecStats(void) {
   double stageTotal;
   double invCalls;
 
+  if (sys == NULL || sys->benchmarkMode == 0) {
+    return;
+  }
   if (mtvCalls <= 0) {
     printf("FMM matvec stats: no calls recorded.\n");
     return;
@@ -136,6 +144,9 @@ void printGmresStats(double gmresWallTime) {
   double accounted;
   double other;
 
+  if (sys == NULL || sys->benchmarkMode == 0) {
+    return;
+  }
   accounted = gmresMatvecTime + gmresPsolveTime + gmresBasisTime +
               gmresUpdateTime + gmresResidualTime;
   other = gmresWallTime - accounted;

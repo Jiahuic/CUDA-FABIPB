@@ -96,8 +96,10 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
       sys->nChar++;
     }
   }
-  printf("PDB ID = %s\n",panelfile);
-  printf("#Atoms = %d\n",sys->nChar);
+  if (sys->benchmarkMode > 0) {
+    printf("PDB ID = %s\n",panelfile);
+    printf("#Atoms = %d\n",sys->nChar);
+  }
   fclose(fp);
   fclose(wfp);
 
@@ -256,7 +258,9 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
 
   /* we delete ill performence triangles */
   s_area = 0.0;
-  printf("#ele=%d, ",nface);
+  if (sys->benchmarkMode > 0) {
+    printf("#ele=%d, ",nface);
+  }
   //printf("Number of vertices = %d\n",nspt);
 
   pnlList = NULL;
@@ -336,7 +340,9 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     }
   }
 
-  printf("Area=%f \n",s_area);
+  if (sys->benchmarkMode > 0) {
+    printf("Area=%f \n",s_area);
+  }
   //printf("%d ugly faces are deleted\n", nface-*numSing);
 
   /* Keep generated mesh artifacts on disk so repeated runs can use -m=0

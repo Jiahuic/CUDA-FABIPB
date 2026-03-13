@@ -191,6 +191,7 @@ static void print_usage(const char *prog) {
   printf("Core options:\n");
   printf("  -g=0|1    CPU only or request GPU (default: auto)\n");
   printf("  -m=0|1    reuse or regenerate MSMS mesh (default: 1)\n");
+  printf("  -B=0|1    quiet default or benchmark/profiling output (default: 0)\n");
   printf("  -d=<val>  MSMS density used when -m=1 (default: 1)\n");
   printf("  -r=0|1    FMM matvec or direct GPU baseline (default: 0)\n");
   printf("  -Q=0|1    CPU-default or GPU-debug Q2M path (default: 0)\n");
@@ -268,6 +269,7 @@ int main(int nargs, char *argv[]){
   sys->nKerl = 4;
   sys->depth = 5;
   sys->mesh_flag = 1;
+  sys->benchmarkMode = 0;
   sys->gpuMode = -1;
   sys->debugCompareApply = 0;
   sys->debugComparePrecond = 0;
@@ -310,6 +312,8 @@ int main(int nargs, char *argv[]){
         case 'k': kappa = atof( argv[i]+3 );
           break;
         case 'm': sys->mesh_flag = atoi( argv[i]+3 );
+          break;
+        case 'B': sys->benchmarkMode = atoi( argv[i]+3 );
           break;
         case 'g': sys->gpuMode = atoi( argv[i]+3 );
           break;
@@ -354,26 +358,28 @@ int main(int nargs, char *argv[]){
     sys->gpuMode = gpuBackendAvailable() ? 1 : 0;
   }
 
-  printf("----------------------------\n");
-  if (sys->matvecMode == 0) {
-    printf("FMM variables: nLev=%d ord=%d SepRat=%lg qOrd=%d\n",
-      sys->depth, order, sys->maxSepRatio, sys->maxQuadOrder );
-  } else {
-    printf("Direct GPU baseline mode enabled (no FMM matvec)\n");
-  }
-  printf("GMRES variables: tol=%1.e arnoldiSz=%d maxIt=%d\n",
-    tolpar, arnoldiSz, numItr);
-  printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
-  printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
-  printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
-  if (sys->matvecMode == 0) {
-    printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
-    printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
-  }
-  printf("Preconditioner mode=%d (0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
-  if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
-    printf("Debug compare flags: apply=%d precond=%d\n",
-           sys->debugCompareApply, sys->debugComparePrecond);
+  if (sys->benchmarkMode > 0) {
+    printf("----------------------------\n");
+    if (sys->matvecMode == 0) {
+      printf("FMM variables: nLev=%d ord=%d SepRat=%lg qOrd=%d\n",
+        sys->depth, order, sys->maxSepRatio, sys->maxQuadOrder );
+    } else {
+      printf("Direct GPU baseline mode enabled (no FMM matvec)\n");
+    }
+    printf("GMRES variables: tol=%1.e arnoldiSz=%d maxIt=%d\n",
+      tolpar, arnoldiSz, numItr);
+    printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
+    printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
+    printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
+    if (sys->matvecMode == 0) {
+      printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
+      printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
+    }
+    printf("Preconditioner mode=%d (0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
+    if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
+      printf("Debug compare flags: apply=%d precond=%d\n",
+             sys->debugCompareApply, sys->debugComparePrecond);
+    }
   }
   //printf("----------------------------\n");
 
@@ -439,13 +445,15 @@ int main(int nargs, char *argv[]){
   end_t = wall_seconds() - start_t;
   printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
   printf("solvation energy: %f\n", ptl);
-  printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
-         loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
+  if (sys->benchmarkMode > 0) {
+    printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
+           loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
+  }
   printSetupFmmStats();
   printGmresStats(gmres_t);
-  if (sys->matvecMode == 0) {
+  if (sys->benchmarkMode > 0 && sys->matvecMode == 0) {
     printFmmMatvecStats();
-  } else {
+  } else if (sys->benchmarkMode > 0) {
     printf("Direct GPU baseline run: FMM stage stats omitted.\n");
   }
 

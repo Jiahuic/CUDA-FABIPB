@@ -188,8 +188,10 @@ void setupPreconditioning(ssystem *sys) {
     }
     free(precondCubes);
   }
-  printf("Maximum number of elements in finest cluster: %d\n", maxnPnls);
-  printf("----------------------------\n");
+  if (sys->benchmarkMode > 0) {
+    printf("Maximum number of elements in finest cluster: %d\n", maxnPnls);
+    printf("----------------------------\n");
+  }
 }
 
 

@@ -34,7 +34,7 @@ mesh_face="${panel}.face"
 if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
   echo "Preparing mesh artifacts for $panel ..."
   FABIPB_SETUP_THREADS="$SETUP_THREADS" \
-    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=0 "$panel" >"$prep_log" 2>&1
+    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" >"$prep_log" 2>&1
 fi
 
 run_case() {
@@ -44,10 +44,10 @@ run_case() {
   if [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$SETUP_THREADS" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g="$mode" -m=0 -t="$depth" "$panel" $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$mode" -m=0 -t="$depth" "$panel" $solver_args >"$log" 2>&1
   else
     FABIPB_SETUP_THREADS="$SETUP_THREADS" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g="$mode" -m=0 -t="$depth" "$panel" >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$mode" -m=0 -t="$depth" "$panel" >"$log" 2>&1
   fi
   echo "$log"
 }

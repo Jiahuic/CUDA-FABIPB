@@ -32,7 +32,7 @@ mesh_vert="${panel}.vert"
 mesh_face="${panel}.face"
 if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
   echo "Preparing mesh artifacts for $panel ..."
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=0 "$panel" "$@" >"$prep_log" 2>&1
+  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" "$@" >"$prep_log" 2>&1
 fi
 
 run_mode() {
@@ -41,9 +41,9 @@ run_mode() {
   log="$OUT_DIR/mode${mode}_run$(printf "%02d" "$idx").log"
   if [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
-    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=1 -G="$mode" -m=0 "$panel" $solver_args >"$log" 2>&1
+    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -G="$mode" -m=0 "$panel" $solver_args >"$log" 2>&1
   else
-    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -g=1 -G="$mode" -m=0 "$panel" >"$log" 2>&1
+    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -G="$mode" -m=0 "$panel" >"$log" 2>&1
   fi
   echo "$log"
 }

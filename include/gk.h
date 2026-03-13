@@ -76,6 +76,7 @@ struct ssystem {
   double maxSepRatio;       /* maximal separation ratio for cubes to be neighbors */
   double *pos, *chr;        /* charge position and charges for rhs */
   int mesh_flag;            /* mesh format flag */
+  int benchmarkMode;        /* 0=quiet default, 1=print profiling/benchmark details */
   int gpuMode;              /* 0=CPU only, >0 request GPU backend */
   int debugCompareApply;    /* 0=off, >0 compare one CPU/GPU applyFMM call */
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */

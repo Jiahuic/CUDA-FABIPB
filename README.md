@@ -150,6 +150,12 @@ Default run (auto GPU if available):
 ./build/fabipb test_proteins/1a7m
 ```
 
+Benchmark/profiling run:
+
+```sh
+./build/fabipb -B=1 -g=1 -m=0 test_proteins/1a63
+```
+
 Force CPU:
 
 ```sh
@@ -176,6 +182,8 @@ Show command-line help:
 
 Notes:
 
+- default output is intentionally quiet: final wall time and solvation energy
+- pass `-B=1` to print setup, GMRES, FMM, and GPU cache/profiling details
 - `-r=1` selects the direct GPU baseline matvec instead of the FMM matvec
 - direct mode is intended for benchmark/reference use and may be limited by GPU memory
 - direct mode prints its estimated host/device memory footprint before allocation
