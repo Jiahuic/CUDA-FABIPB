@@ -4,6 +4,8 @@ set -eu
 BUILD_DIR="${BUILD_DIR:-build}"
 DEPTHS="${DEPTHS:-5 6 7 8}"
 HYBRID_SETUP_THREADS="${HYBRID_SETUP_THREADS:-8}"
+REPEATS="${REPEATS:-10}"
+MESH_DENSITY="${MESH_DENSITY:-10}"
 
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 <panel-base-or-pqr-path> [solver options...]" >&2
@@ -30,15 +32,16 @@ mkdir -p "$OUT_DIR"
 
 raw_csv="$OUT_DIR/results.csv"
 summary_csv="$OUT_DIR/summary.csv"
+raw_repeats_csv="$OUT_DIR/results_raw.csv"
 prep_log="$OUT_DIR/prep.log"
 
-mesh_vert="${panel}.vert"
-mesh_face="${panel}.face"
-if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
-  echo "Preparing mesh artifacts for $panel ..."
-  FABIPB_SETUP_THREADS=1 \
-    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" >"$prep_log" 2>&1
-fi
+echo "Preparing mesh artifacts for $panel at density $MESH_DENSITY ..."
+FABIPB_SETUP_THREADS=1 \
+  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -m=1 -d="$MESH_DENSITY" "$panel" >"$prep_log" 2>&1
+
+cat >"$raw_repeats_csv" <<'EOF'
+case_name,depth,config,repeat,gpu_mode,gpu_q2m_mode,setup_threads,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,setupFMM_leaf,setupFMM_cube_alloc,setupFMM_layout,setupFMM_apply,setupFMM_panel_index,setupFMM_cubes,setupFMM_m2l_pairs,setupFMM_m2l_groups,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other,applyFMM,Q2M,M2M,M2L,L2L,L2P,Near,near_build,near_h2d,near_kernel,near_d2h,near_meta,near_coeff,near_upload,near_other
+EOF
 
 cat >"$raw_csv" <<'EOF'
 case_name,depth,config,gpu_mode,gpu_q2m_mode,setup_threads,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,setupFMM_leaf,setupFMM_cube_alloc,setupFMM_layout,setupFMM_apply,setupFMM_panel_index,setupFMM_cubes,setupFMM_m2l_pairs,setupFMM_m2l_groups,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other,applyFMM,Q2M,M2M,M2L,L2L,L2P,Near,near_build,near_h2d,near_kernel,near_d2h,near_meta,near_coeff,near_upload,near_other
@@ -152,7 +155,8 @@ extract_metric() {
 run_case() {
   config="$1"
   depth="$2"
-  log="$OUT_DIR/${config}_t${depth}.log"
+  repeat="$3"
+  log="$OUT_DIR/${config}_t${depth}_r$(printf "%02d" "$repeat").log"
 
   case "$config" in
     cpu_serial)
@@ -188,10 +192,14 @@ run_case() {
   echo "$log"
 }
 
-append_row() {
+append_raw_row() {
   config="$1"
   depth="$2"
+  repeat="$3"
   log="$3"
+  if [ "$#" -ge 4 ]; then
+    log="$4"
+  fi
   case "$config" in
     cpu_serial) gpu_mode=0; q2m_mode=0; setup_threads=1 ;;
     gpu_full) gpu_mode=1; q2m_mode=1; setup_threads=1 ;;
@@ -215,13 +223,65 @@ applyFMM Q2M M2M M2L L2L L2P Near near_build near_h2d near_kernel near_d2h near_
   done
 
   printf "%s,%s,%s,%s,%s,%s,%s\n" \
-    "$panel" "$depth" "$config" "$gpu_mode" "$q2m_mode" "$setup_threads" "$values" >>"$raw_csv"
+    "$panel" "$depth" "$config" "$repeat" "$gpu_mode" "$q2m_mode" "$setup_threads" "$values" >>"$raw_repeats_csv"
 }
 
 ratio() {
   num="$1"
   den="$2"
   awk -v a="$num" -v b="$den" 'BEGIN{if(a==""||b==""||b==0){print ""}else{printf "%.6f", a/b}}'
+}
+
+average_metric() {
+  config="$1"
+  depth="$2"
+  key="$3"
+  sum="0"
+  count=0
+  rep=1
+  while [ "$rep" -le "$REPEATS" ]; do
+    log="$OUT_DIR/${config}_t${depth}_r$(printf "%02d" "$rep").log"
+    value="$(extract_metric "$log" "$key")"
+    if [ -n "$value" ]; then
+      sum="$(awk -v a="$sum" -v b="$value" 'BEGIN{printf "%.12f", a+b}')"
+      count=$((count + 1))
+    fi
+    rep=$((rep + 1))
+  done
+  if [ "$count" -eq 0 ]; then
+    echo ""
+  else
+    awk -v s="$sum" -v c="$count" 'BEGIN{printf "%.6f", s/c}'
+  fi
+}
+
+append_avg_row() {
+  config="$1"
+  depth="$2"
+  case "$config" in
+    cpu_serial) gpu_mode=0; q2m_mode=0; setup_threads=1 ;;
+    gpu_full) gpu_mode=1; q2m_mode=1; setup_threads=1 ;;
+    hybrid_best) gpu_mode=1; q2m_mode=0; setup_threads="$HYBRID_SETUP_THREADS" ;;
+  esac
+
+  metrics="ttl its energy loadPanel gkInit setupFMM setupPC setupRHS gmres treecode \
+setupFMM_leaf setupFMM_cube_alloc setupFMM_layout setupFMM_apply setupFMM_panel_index \
+setupFMM_cubes setupFMM_m2l_pairs setupFMM_m2l_groups gmres_matvec gmres_psolve gmres_basis \
+gmres_update gmres_residual gmres_other pc_assemble pc_factor pc_solve pc_scatter pc_other \
+applyFMM Q2M M2M M2L L2L L2P Near near_build near_h2d near_kernel near_d2h near_meta near_coeff near_upload near_other"
+
+  values=""
+  for key in $metrics; do
+    value="$(average_metric "$config" "$depth" "$key")"
+    if [ -n "$values" ]; then
+      values="$values,$value"
+    else
+      values="$value"
+    fi
+  done
+
+  printf "%s,%s,%s,%s,%s,%s,%s\n" \
+    "$panel" "$depth" "$config" "$gpu_mode" "$q2m_mode" "$setup_threads" "$values" >>"$raw_csv"
 }
 
 cat >"$summary_csv" <<'EOF'
@@ -231,6 +291,8 @@ EOF
 echo "Benchmark matrix"
 echo "  panel: $panel"
 echo "  depths: $DEPTHS"
+echo "  repeats: $REPEATS"
+echo "  mesh density: $MESH_DENSITY"
 echo "  hybrid setup threads: $HYBRID_SETUP_THREADS"
 if [ -f "$prep_log" ]; then
   echo "  prep: $prep_log"
@@ -238,33 +300,41 @@ fi
 echo
 
 for depth in $DEPTHS; do
-  echo "  running depth $depth cpu_serial"
-  cpu_log="$(run_case cpu_serial "$depth")"
-  append_row cpu_serial "$depth" "$cpu_log"
+  rep=1
+  while [ "$rep" -le "$REPEATS" ]; do
+    echo "  running depth $depth repeat $rep/$REPEATS cpu_serial"
+    cpu_log="$(run_case cpu_serial "$depth" "$rep")"
+    append_raw_row cpu_serial "$depth" "$rep" "$cpu_log"
 
-  echo "  running depth $depth gpu_full"
-  gpu_full_log="$(run_case gpu_full "$depth")"
-  append_row gpu_full "$depth" "$gpu_full_log"
+    echo "  running depth $depth repeat $rep/$REPEATS gpu_full"
+    gpu_full_log="$(run_case gpu_full "$depth" "$rep")"
+    append_raw_row gpu_full "$depth" "$rep" "$gpu_full_log"
 
-  echo "  running depth $depth hybrid_best"
-  hybrid_log="$(run_case hybrid_best "$depth")"
-  append_row hybrid_best "$depth" "$hybrid_log"
+    echo "  running depth $depth repeat $rep/$REPEATS hybrid_best"
+    hybrid_log="$(run_case hybrid_best "$depth" "$rep")"
+    append_raw_row hybrid_best "$depth" "$rep" "$hybrid_log"
+    rep=$((rep + 1))
+  done
 
-  cpu_ttl="$(extract_metric "$cpu_log" ttl)"
-  gpu_full_ttl="$(extract_metric "$gpu_full_log" ttl)"
-  hybrid_ttl="$(extract_metric "$hybrid_log" ttl)"
-  cpu_apply="$(extract_metric "$cpu_log" applyFMM)"
-  gpu_full_apply="$(extract_metric "$gpu_full_log" applyFMM)"
-  hybrid_apply="$(extract_metric "$hybrid_log" applyFMM)"
-  cpu_m2l="$(extract_metric "$cpu_log" M2L)"
-  gpu_full_m2l="$(extract_metric "$gpu_full_log" M2L)"
-  hybrid_m2l="$(extract_metric "$hybrid_log" M2L)"
-  cpu_near="$(extract_metric "$cpu_log" Near)"
-  gpu_full_near="$(extract_metric "$gpu_full_log" Near)"
-  hybrid_near="$(extract_metric "$hybrid_log" Near)"
-  cpu_its="$(extract_metric "$cpu_log" its)"
-  gpu_full_its="$(extract_metric "$gpu_full_log" its)"
-  hybrid_its="$(extract_metric "$hybrid_log" its)"
+  append_avg_row cpu_serial "$depth"
+  append_avg_row gpu_full "$depth"
+  append_avg_row hybrid_best "$depth"
+
+  cpu_ttl="$(average_metric cpu_serial "$depth" ttl)"
+  gpu_full_ttl="$(average_metric gpu_full "$depth" ttl)"
+  hybrid_ttl="$(average_metric hybrid_best "$depth" ttl)"
+  cpu_apply="$(average_metric cpu_serial "$depth" applyFMM)"
+  gpu_full_apply="$(average_metric gpu_full "$depth" applyFMM)"
+  hybrid_apply="$(average_metric hybrid_best "$depth" applyFMM)"
+  cpu_m2l="$(average_metric cpu_serial "$depth" M2L)"
+  gpu_full_m2l="$(average_metric gpu_full "$depth" M2L)"
+  hybrid_m2l="$(average_metric hybrid_best "$depth" M2L)"
+  cpu_near="$(average_metric cpu_serial "$depth" Near)"
+  gpu_full_near="$(average_metric gpu_full "$depth" Near)"
+  hybrid_near="$(average_metric hybrid_best "$depth" Near)"
+  cpu_its="$(average_metric cpu_serial "$depth" its)"
+  gpu_full_its="$(average_metric gpu_full "$depth" its)"
+  hybrid_its="$(average_metric hybrid_best "$depth" its)"
 
   printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$panel" "$depth" "$cpu_ttl" "$gpu_full_ttl" "$hybrid_ttl" \
@@ -279,6 +349,7 @@ for depth in $DEPTHS; do
 done
 
 echo
+echo "Raw repeat CSV: $raw_repeats_csv"
 echo "Raw CSV: $raw_csv"
 echo "Summary CSV: $summary_csv"
 echo "Logs: $OUT_DIR"

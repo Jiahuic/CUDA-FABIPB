@@ -228,8 +228,16 @@ Optional:
 
 The benchmark driver should write:
 
+- raw repeat CSV: one row per `(case, depth, config, repeat)`
 - raw CSV: one row per `(case, depth, config)`
 - summary CSV: speedups relative to CPU serial at each depth
+
+Current default policy in the benchmark runner:
+
+- `REPEATS=10`
+- `results_raw.csv` stores every repeat
+- `results.csv` stores the averaged row for each `(case, depth, config)`
+- `summary.csv` stores averaged speedups derived from those averaged rows
 
 This keeps the data easy to analyze in Python/R/Excel and easy to reuse for
 paper tables and figures.
