@@ -29,6 +29,91 @@ From the current benchmark matrix on `1a63` at density `10`:
 So the old serial-only `nLev` rule is no longer sufficient. The new rule needs
 to account for different CPU/GPU speedups for different FMM stages.
 
+## Full FMM parameter set
+
+The adaptive-depth study should be based on the actual FMM control parameters in
+this code, not just on `nLev`.
+
+### Structural parameters
+
+- `depth` (`-t=<lev>`)
+  - finest tree depth
+  - the main `nLev` parameter
+- `height` (currently fixed internally at `2`)
+  - coarsest active FMM level
+  - not yet exposed on the command line
+- `maxSepRatio` (`-S=<val>`)
+  - separation/admissibility threshold
+  - changes the balance between near-field and far-field work
+
+### Expansion parameters
+
+- `order` (`-p=<val>`)
+  - controls the FMM order policy
+  - if positive: fixed order on all active levels
+  - if negative: variable order with `-order` used at the finest level
+- `orderMom` (`-pm=<val>`)
+  - override for moment/local orders relative to `M2L`
+  - only meaningful when variable-order mode is used
+
+### Derived FMM parameters
+
+These are computed in `gkInit()` from the structural and expansion parameters:
+
+- `ordM2L[lev]`
+  - `M2L` order used at each level
+- `ordMom[lev]`
+  - moment/local order used for `Q2M`, `M2M`, `L2L`, and `L2P`
+- `maxOrder`
+  - largest order used anywhere
+- `nMom[p]`
+  - number of coefficients for order `p`
+
+### Quadrature/interface parameter
+
+- `maxQuadOrder` (`-q=<ord>`)
+  - panel quadrature order
+  - affects near-field, RHS, and related panel-integral work
+
+### Execution-policy parameters
+
+These do not change the mathematical FMM hierarchy directly, but they do change
+which `nLev` is optimal once GPU is involved:
+
+- `gpuMode` (`-g=0|1`)
+- `gpuQ2MMode` (`-Q=0|1`)
+- `gpuNearfieldMode` (`-G=0|1`)
+- `precondCacheMode` (`-P=0|1|2`)
+
+For the adaptive strategy, these should be treated as part of the runtime model,
+not ignored as "implementation details."
+
+## Initial study scope
+
+The first adaptive-depth study should stay narrow.
+
+### Vary first
+
+- `depth`
+- execution mode:
+  - CPU serial
+  - GPU full
+  - hybrid best
+
+### Hold fixed initially
+
+- `height = 2`
+- `maxSepRatio = 0.8`
+- `qOrder = 1`
+- chosen `order` / `orderMom` policy
+
+This gives a manageable first model. If depth-only adaptation is not stable
+enough, then the next parameters to widen are:
+
+1. `maxSepRatio`
+2. `order`
+3. `height`
+
 ## Workstream A: direct-sum PB comparison
 
 ### Objective
@@ -111,6 +196,10 @@ where `a`, `b`, and `c` depend on the execution mode:
 - CPU serial
 - GPU full
 - hybrid
+
+In the first pass, this is a depth-only model with all other FMM parameters held
+fixed. Only after that should the model be widened to include additional FMM
+knobs such as `maxSepRatio` or order policy.
 
 ### Phase 2: runtime policy
 
