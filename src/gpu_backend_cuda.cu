@@ -158,6 +158,8 @@ struct DirectGpuCache {
   const ssystem *sys;
   int nPnls;
   long long nInteractions;
+  int mode;
+  int blockDstCount;
   double *h_k0;
   double *h_k1;
   double *h_k2;
@@ -436,6 +438,8 @@ void freeDirectCache() {
   gDirect.sys = NULL;
   gDirect.nPnls = 0;
   gDirect.nInteractions = 0;
+  gDirect.mode = 0;
+  gDirect.blockDstCount = 0;
 }
 
 void freeRhsCache() {
@@ -520,6 +524,35 @@ int allocateDeviceArrays(int nPnls, long long nInteractions) {
 
 int allocateDirectArrays(int nPnls, long long nInteractions) {
   size_t ni = (size_t)nInteractions;
+  size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
+  cudaError_t err = cudaSuccess;
+
+  gDirect.h_k0 = (double *)malloc(ni * sizeof(double));
+  gDirect.h_k1 = (double *)malloc(ni * sizeof(double));
+  gDirect.h_k2 = (double *)malloc(ni * sizeof(double));
+  gDirect.h_k3 = (double *)malloc(ni * sizeof(double));
+  if (!gDirect.h_k0 || !gDirect.h_k1 || !gDirect.h_k2 || !gDirect.h_k3) {
+    return 0;
+  }
+
+  err = cudaMalloc((void **)&gDirect.d_k0, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_k1, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_k2, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_k3, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_sgm, vecBytes);
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_pot, vecBytes);
+  if (err != cudaSuccess) return 0;
+
+  return 1;
+}
+
+int allocateBlockedDirectArrays(int nPnls, int dstBlockCount) {
+  size_t ni = (size_t)nPnls * (size_t)dstBlockCount;
   size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
   cudaError_t err = cudaSuccess;
 
@@ -1100,11 +1133,16 @@ int buildNearfieldTables(const ssystem *sys) {
 int buildDirectTables(const ssystem *sys) {
   long long nInteractions;
   size_t coeffBytes;
+  size_t blockCoeffBytes;
   size_t vecBytes;
   size_t totalBytes;
   size_t hostCoeffBytes;
   size_t combinedBytes;
+  size_t blockHostCoeffBytes;
+  size_t blockTotalBytes;
+  size_t blockCombinedBytes;
   size_t freeBytes = 0, totalGpuBytes = 0;
+  int dstBlockCount;
   int i, j;
 
   nInteractions = (long long)sys->nPnls * (long long)sys->nPnls;
@@ -1117,55 +1155,85 @@ int buildDirectTables(const ssystem *sys) {
   hostCoeffBytes = 4 * coeffBytes;
   totalBytes = 4 * coeffBytes + 2 * vecBytes;
   combinedBytes = hostCoeffBytes + totalBytes;
-  if (sys->benchmarkMode > 0)
+  dstBlockCount = MIN(256, sys->nPnls);
+  blockCoeffBytes = (size_t)dstBlockCount * (size_t)sys->nPnls * sizeof(double);
+  blockHostCoeffBytes = 4 * blockCoeffBytes;
+  blockTotalBytes = 4 * blockCoeffBytes + 2 * vecBytes;
+  blockCombinedBytes = blockHostCoeffBytes + blockTotalBytes;
+  if (sys->benchmarkMode > 0) {
     printf("Direct GPU memory estimate: solver-host=%.3f GB host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
            (double)memcount / (1024.0 * 1024.0 * 1024.0),
            (double)hostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
            (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
            (double)combinedBytes / (1024.0 * 1024.0 * 1024.0));
+    printf("Blocked direct GPU estimate: dst-block=%d host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
+           dstBlockCount,
+           (double)blockHostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)blockCombinedBytes / (1024.0 * 1024.0 * 1024.0));
+  }
   if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
     if (sys->benchmarkMode > 0)
       printf("Direct GPU device memory: free=%.3f GB total=%.3f GB\n",
              (double)freeBytes / (1024.0 * 1024.0 * 1024.0),
              (double)totalGpuBytes / (1024.0 * 1024.0 * 1024.0));
-    if (totalBytes > freeBytes * 7 / 10) {
-      printf("Direct GPU cache unavailable: need %.3f GB, free %.3f GB\n",
-             (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
-             (double)freeBytes / (1024.0 * 1024.0 * 1024.0));
-      return 0;
-    }
   }
 
-  if (!allocateDirectArrays(sys->nPnls, nInteractions)) {
+  if (freeBytes > 0 && totalBytes <= freeBytes * 7 / 10) {
+    if (!allocateDirectArrays(sys->nPnls, nInteractions)) {
+      return 0;
+    }
+
+    kernel = kernelKER4;
+    for (i = 0; i < sys->nPnls; i++) {
+      panel *pnlX = sys->panelByIdx[i];
+      long long base = (long long)i * (long long)sys->nPnls;
+      for (j = 0; j < sys->nPnls; j++) {
+        panel *pnlY = sys->panelByIdx[j];
+        double *KER = panelIA0(pnlX, pnlY);
+        long long idx = base + (long long)j;
+
+        gDirect.h_k0[idx] = KER[0];
+        gDirect.h_k1[idx] = KER[1];
+        gDirect.h_k2[idx] = KER[2];
+        gDirect.h_k3[idx] = KER[3];
+      }
+    }
+
+    if (cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+
+    gDirect.sys = sys;
+    gDirect.nPnls = sys->nPnls;
+    gDirect.nInteractions = nInteractions;
+    gDirect.mode = 1;
+    gDirect.blockDstCount = sys->nPnls;
+    if (sys->benchmarkMode > 0)
+      printf("GPU direct cache: panel-pairs=%lld mode=dense\n", nInteractions);
+    return 1;
+  }
+
+  if (freeBytes > 0 && blockTotalBytes > freeBytes * 7 / 10) {
+    printf("Direct GPU cache unavailable: dense need %.3f GB, blocked need %.3f GB, free %.3f GB\n",
+           (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)freeBytes / (1024.0 * 1024.0 * 1024.0));
     return 0;
   }
 
-  kernel = kernelKER4;
-  for (i = 0; i < sys->nPnls; i++) {
-    panel *pnlX = sys->panelByIdx[i];
-    long long base = (long long)i * (long long)sys->nPnls;
-    for (j = 0; j < sys->nPnls; j++) {
-      panel *pnlY = sys->panelByIdx[j];
-      double *KER = panelIA0(pnlX, pnlY);
-      long long idx = base + (long long)j;
-
-      gDirect.h_k0[idx] = KER[0];
-      gDirect.h_k1[idx] = KER[1];
-      gDirect.h_k2[idx] = KER[2];
-      gDirect.h_k3[idx] = KER[3];
-    }
+  if (!allocateBlockedDirectArrays(sys->nPnls, dstBlockCount)) {
+    return 0;
   }
-
-  if (cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
 
   gDirect.sys = sys;
   gDirect.nPnls = sys->nPnls;
   gDirect.nInteractions = nInteractions;
+  gDirect.mode = 2;
+  gDirect.blockDstCount = dstBlockCount;
   if (sys->benchmarkMode > 0)
-    printf("GPU direct cache: panel-pairs=%lld\n", nInteractions);
+    printf("GPU direct cache: panel-pairs=%lld mode=blocked dst-block=%d\n", nInteractions, dstBlockCount);
   return 1;
 }
 
@@ -1397,6 +1465,60 @@ __global__ void directApplyKernel(
   }
 
   base = (long long)d * (long long)nPnls;
+  for (s = tid; s < nPnls; s += blockDim.x) {
+    long long idx = base + (long long)s;
+    double x_pot = sgm[s];
+    double x_dpdn = sgm[s + nPnls];
+    sumPot += k0[idx] * x_dpdn + k1[idx] * x_pot;
+    sumDpdn += k2[idx] * x_dpdn + k3[idx] * x_pot;
+  }
+
+  shPot[tid] = sumPot;
+  shDpdn[tid] = sumDpdn;
+  __syncthreads();
+
+  for (stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shPot[tid] += shPot[tid + stride];
+      shDpdn[tid] += shDpdn[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    pot[d] = beta * pot[d] + alpha * shPot[0];
+    pot[d + nPnls] = beta * pot[d + nPnls] + alpha * shDpdn[0];
+  }
+}
+
+__global__ void directApplyBlockKernel(
+    int nPnls,
+    int dstStart,
+    int dstCount,
+    const double *k0,
+    const double *k1,
+    const double *k2,
+    const double *k3,
+    double alpha,
+    double beta,
+    const double *sgm,
+    double *pot) {
+  __shared__ double shPot[256];
+  __shared__ double shDpdn[256];
+  int localD = blockIdx.x;
+  int d = dstStart + localD;
+  int tid = threadIdx.x;
+  int s;
+  long long base;
+  double sumPot = 0.0;
+  double sumDpdn = 0.0;
+  int stride;
+
+  if (localD >= dstCount || d >= nPnls) {
+    return;
+  }
+
+  base = (long long)localD * (long long)nPnls;
   for (s = tid; s < nPnls; s += blockDim.x) {
     long long idx = base + (long long)s;
     double x_pot = sgm[s];
@@ -1677,6 +1799,7 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   size_t vecBytes;
   int blockSize;
   int gridSize;
+  int dstStart;
 
   if (sys == NULL || sgm == NULL || pot == NULL) {
     return 0;
@@ -1697,14 +1820,60 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   if (err != cudaSuccess) return 0;
 
   blockSize = 256;
-  gridSize = gDirect.nPnls;
-  directApplyKernel<<<gridSize, blockSize>>>(
-      gDirect.nPnls, gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
-      alpha, beta, gDirect.d_sgm, gDirect.d_pot);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return 0;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 0;
+  if (gDirect.mode == 1) {
+    gridSize = gDirect.nPnls;
+    directApplyKernel<<<gridSize, blockSize>>>(
+        gDirect.nPnls, gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
+        alpha, beta, gDirect.d_sgm, gDirect.d_pot);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return 0;
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return 0;
+  } else if (gDirect.mode == 2) {
+    kernel = kernelKER4;
+    for (dstStart = 0; dstStart < gDirect.nPnls; dstStart += gDirect.blockDstCount) {
+      int dstCount = MIN(gDirect.blockDstCount, gDirect.nPnls - dstStart);
+      size_t coeffBytes = (size_t)dstCount * (size_t)gDirect.nPnls * sizeof(double);
+      int localD, s;
+
+      for (localD = 0; localD < dstCount; localD++) {
+        int d = dstStart + localD;
+        panel *pnlX = sys->panelByIdx[d];
+        long long base = (long long)localD * (long long)gDirect.nPnls;
+        for (s = 0; s < gDirect.nPnls; s++) {
+          panel *pnlY = sys->panelByIdx[s];
+          double *KER = panelIA0(pnlX, pnlY);
+          long long idx = base + (long long)s;
+          gDirect.h_k0[idx] = KER[0];
+          gDirect.h_k1[idx] = KER[1];
+          gDirect.h_k2[idx] = KER[2];
+          gDirect.h_k3[idx] = KER[3];
+        }
+      }
+
+      err = cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      err = cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      err = cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      err = cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+
+      gridSize = dstCount;
+      directApplyBlockKernel<<<gridSize, blockSize>>>(
+          gDirect.nPnls, dstStart, dstCount,
+          gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
+          alpha, beta, gDirect.d_sgm, gDirect.d_pot);
+      err = cudaGetLastError();
+      if (err != cudaSuccess) return 0;
+      err = cudaDeviceSynchronize();
+      if (err != cudaSuccess) return 0;
+      beta = 1.0;
+    }
+  } else {
+    return 0;
+  }
 
   err = cudaMemcpy(pot, gDirect.d_pot, vecBytes, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) return 0;
