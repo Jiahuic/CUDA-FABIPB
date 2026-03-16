@@ -118,30 +118,38 @@ enough, then the next parameters to widen are:
 
 ### Objective
 
-Establish an external GPU direct-sum reference point.
+Establish a direct-sum GPU reference point for PB matvecs.
 
 ### Plan
 
-1. Retrieve and build the older CUDA direct-sum PB solver from the shared
-   Dropbox location:
-   - `sharing_chen/code/cuda_related`
-2. Run it on the same GPU machine used for the current benchmarks.
-3. Use matching or near-matching cases:
+1. Use the in-tree direct GPU baseline first:
+   - `fabipb -g=1 -r=1`
+2. Restrict this comparison to cases that actually fit the dense direct cache.
+3. Run it on the same GPU machine used for the current benchmarks.
+4. Use matching or near-matching cases:
    - `1ajj`
-   - `1a63`
-   - possibly one density-10 case if feasible
-4. Record:
+   - one medium case only if it fits
+   - do not assume `1a63` at density `10` is feasible
+5. Record:
    - wall time
-   - iteration count if iterative
-   - energy / accuracy agreement if available
+   - iteration count
+   - energy / accuracy agreement
    - GPU hardware
-5. Compare against:
-   - current direct GPU baseline in this repo (`-r=1`) where memory allows
+6. Compare against:
    - current GPU-FMM hybrid path
+7. Only if the in-tree direct path is not sufficient, retrieve and build the
+   older CUDA direct-sum PB solver from the shared Dropbox location:
+   - `sharing_chen/code/cuda_related`
+
+Important implementation note:
+
+- the current in-tree direct baseline is a dense cached operator
+- for large cases it can fail by memory and fall back to FMM
+- this is documented in `docs/direct_gpu_limitations.md`
 
 ### Decision rule
 
-- If the older direct-sum PB solver is much faster than our current near-field
+- If a true direct GPU PB path is much faster than our current near-field
   behavior would suggest, then the near-field CUDA path still needs optimization.
 - If the speedup is in the same regime as the current `19x-26x`, then the
   current near-field implementation is likely reasonable and the emphasis should
@@ -237,8 +245,8 @@ This is aligned with the current project direction:
 
 ## Immediate next steps
 
-1. Retrieve the older direct-sum PB solver and build it on the GPU machine.
-2. Run a matched comparison on `1ajj` and `1a63`.
+1. Use the in-tree direct GPU baseline on small cases that fit memory.
+2. If needed, retrieve the older direct-sum PB solver and compare against it.
 3. Extend the benchmark matrix outputs into a depth-selection study.
 4. Add a report-only `nLev` recommendation mode in this repo after the direct
    comparison is complete.

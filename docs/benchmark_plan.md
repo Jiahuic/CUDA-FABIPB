@@ -223,6 +223,10 @@ Minimum set:
 Optional:
 
 - direct GPU baseline on smaller cases using `scripts/compare_direct_gpu.sh`
+- direct GPU appendix from `scripts/run_benchmark_matrix.sh`
+  - this should be run once per case, not once per depth
+  - it is a dense direct-sum PB reference for comparison against the FMM matrix
+  - it may fall back if the dense cache does not fit GPU memory
 
 ## Output format
 
@@ -231,13 +235,19 @@ The benchmark driver should write:
 - raw repeat CSV: one row per `(case, depth, config, repeat)`
 - raw CSV: one row per `(case, depth, config)`
 - summary CSV: speedups relative to CPU serial at each depth
+- direct raw CSV: one row per direct-GPU repeat
+- direct CSV: averaged direct-GPU appendix row for the case
 
 Current default policy in the benchmark runner:
 
 - `REPEATS=10`
+- `DIRECT_APPENDIX=1`
+- `DIRECT_DEPTH=5`
 - `results_raw.csv` stores every repeat
 - `results.csv` stores the averaged row for each `(case, depth, config)`
 - `summary.csv` stores averaged speedups derived from those averaged rows
+- `direct_results_raw.csv` stores every direct appendix repeat
+- `direct_results.csv` stores the averaged direct appendix result
 
 This keeps the data easy to analyze in Python/R/Excel and easy to reuse for
 paper tables and figures.

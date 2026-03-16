@@ -6,6 +6,8 @@ DEPTHS="${DEPTHS:-5 6 7 8}"
 HYBRID_SETUP_THREADS="${HYBRID_SETUP_THREADS:-8}"
 REPEATS="${REPEATS:-10}"
 MESH_DENSITY="${MESH_DENSITY:-10}"
+DIRECT_APPENDIX="${DIRECT_APPENDIX:-1}"
+DIRECT_DEPTH="${DIRECT_DEPTH:-5}"
 
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 <panel-base-or-pqr-path> [solver options...]" >&2
@@ -33,6 +35,8 @@ mkdir -p "$OUT_DIR"
 raw_csv="$OUT_DIR/results.csv"
 summary_csv="$OUT_DIR/summary.csv"
 raw_repeats_csv="$OUT_DIR/results_raw.csv"
+direct_raw_csv="$OUT_DIR/direct_results_raw.csv"
+direct_csv="$OUT_DIR/direct_results.csv"
 prep_log="$OUT_DIR/prep.log"
 
 echo "Preparing mesh artifacts for $panel at density $MESH_DENSITY ..."
@@ -45,6 +49,14 @@ EOF
 
 cat >"$raw_csv" <<'EOF'
 case_name,depth,config,gpu_mode,gpu_q2m_mode,setup_threads,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,setupFMM_leaf,setupFMM_cube_alloc,setupFMM_layout,setupFMM_apply,setupFMM_panel_index,setupFMM_cubes,setupFMM_m2l_pairs,setupFMM_m2l_groups,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other,applyFMM,Q2M,M2M,M2L,L2L,L2P,Near,near_build,near_h2d,near_kernel,near_d2h,near_meta,near_coeff,near_upload,near_other
+EOF
+
+cat >"$direct_raw_csv" <<'EOF'
+case_name,depth,config,repeat,direct_status,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other
+EOF
+
+cat >"$direct_csv" <<'EOF'
+case_name,depth,config,direct_status,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other
 EOF
 
 extract_metric() {
@@ -192,6 +204,33 @@ run_case() {
   echo "$log"
 }
 
+run_direct_case() {
+  repeat="$1"
+  log="$OUT_DIR/direct_gpu_t${DIRECT_DEPTH}_r$(printf "%02d" "$repeat").log"
+
+  if [ -n "$solver_args" ]; then
+    # shellcheck disable=SC2086
+    FABIPB_SETUP_THREADS=1 \
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 -m=0 -t="$DIRECT_DEPTH" "$panel" $solver_args >"$log" 2>&1
+  else
+    FABIPB_SETUP_THREADS=1 \
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 -m=0 -t="$DIRECT_DEPTH" "$panel" >"$log" 2>&1
+  fi
+
+  echo "$log"
+}
+
+direct_status_from_log() {
+  log="$1"
+  if rg -q "Direct GPU matvec unavailable; using FMM path\\." "$log"; then
+    echo "fallback"
+  elif rg -q "GPU direct cache: panel-pairs=" "$log"; then
+    echo "direct"
+  else
+    echo "unknown"
+  fi
+}
+
 append_raw_row() {
   config="$1"
   depth="$2"
@@ -284,6 +323,73 @@ applyFMM Q2M M2M M2L L2L L2P Near near_build near_h2d near_kernel near_d2h near_
     "$panel" "$depth" "$config" "$gpu_mode" "$q2m_mode" "$setup_threads" "$values" >>"$raw_csv"
 }
 
+append_direct_raw_row() {
+  repeat="$1"
+  log="$2"
+  status="$(direct_status_from_log "$log")"
+  metrics="ttl its energy loadPanel gkInit setupFMM setupPC setupRHS gmres treecode \
+gmres_matvec gmres_psolve gmres_basis gmres_update gmres_residual gmres_other \
+pc_assemble pc_factor pc_solve pc_scatter pc_other"
+
+  values=""
+  for key in $metrics; do
+    value="$(extract_metric "$log" "$key")"
+    if [ -n "$values" ]; then
+      values="$values,$value"
+    else
+      values="$value"
+    fi
+  done
+
+  printf "%s,%s,%s,%s,%s,%s\n" \
+    "$panel" "$DIRECT_DEPTH" "direct_gpu" "$repeat" "$status" "$values" >>"$direct_raw_csv"
+}
+
+average_direct_metric() {
+  key="$1"
+  sum="0"
+  count=0
+  rep=1
+  while [ "$rep" -le "$REPEATS" ]; do
+    log="$OUT_DIR/direct_gpu_t${DIRECT_DEPTH}_r$(printf "%02d" "$rep").log"
+    value="$(extract_metric "$log" "$key")"
+    if [ -n "$value" ]; then
+      sum="$(awk -v a="$sum" -v b="$value" 'BEGIN{printf "%.12f", a+b}')"
+      count=$((count + 1))
+    fi
+    rep=$((rep + 1))
+  done
+  if [ "$count" -eq 0 ]; then
+    echo ""
+  else
+    awk -v s="$sum" -v c="$count" 'BEGIN{printf "%.6f", s/c}'
+  fi
+}
+
+append_direct_avg_row() {
+  status="unknown"
+  if [ "$REPEATS" -ge 1 ]; then
+    status="$(direct_status_from_log "$OUT_DIR/direct_gpu_t${DIRECT_DEPTH}_r01.log")"
+  fi
+
+  metrics="ttl its energy loadPanel gkInit setupFMM setupPC setupRHS gmres treecode \
+gmres_matvec gmres_psolve gmres_basis gmres_update gmres_residual gmres_other \
+pc_assemble pc_factor pc_solve pc_scatter pc_other"
+
+  values=""
+  for key in $metrics; do
+    value="$(average_direct_metric "$key")"
+    if [ -n "$values" ]; then
+      values="$values,$value"
+    else
+      values="$value"
+    fi
+  done
+
+  printf "%s,%s,%s,%s,%s\n" \
+    "$panel" "$DIRECT_DEPTH" "direct_gpu" "$status" "$values" >>"$direct_csv"
+}
+
 cat >"$summary_csv" <<'EOF'
 case_name,depth,cpu_ttl,gpu_full_ttl,hybrid_best_ttl,cpu_applyFMM,gpu_full_applyFMM,hybrid_best_applyFMM,cpu_M2L,gpu_full_M2L,hybrid_best_M2L,cpu_Near,gpu_full_Near,hybrid_best_Near,cpu_its,gpu_full_its,hybrid_best_its,speedup_gpu_full_ttl,speedup_hybrid_best_ttl,speedup_gpu_full_applyFMM,speedup_hybrid_best_applyFMM,speedup_gpu_full_M2L,speedup_hybrid_best_M2L,speedup_gpu_full_Near,speedup_hybrid_best_Near
 EOF
@@ -294,6 +400,8 @@ echo "  depths: $DEPTHS"
 echo "  repeats: $REPEATS"
 echo "  mesh density: $MESH_DENSITY"
 echo "  hybrid setup threads: $HYBRID_SETUP_THREADS"
+echo "  direct appendix: $DIRECT_APPENDIX"
+echo "  direct depth: $DIRECT_DEPTH"
 if [ -f "$prep_log" ]; then
   echo "  prep: $prep_log"
 fi
@@ -348,8 +456,23 @@ for depth in $DEPTHS; do
     "$(ratio "$cpu_near" "$gpu_full_near")" "$(ratio "$cpu_near" "$hybrid_near")" >>"$summary_csv"
 done
 
+if [ "$DIRECT_APPENDIX" -gt 0 ]; then
+  rep=1
+  while [ "$rep" -le "$REPEATS" ]; do
+    echo "  running direct appendix repeat $rep/$REPEATS"
+    direct_log="$(run_direct_case "$rep")"
+    append_direct_raw_row "$rep" "$direct_log"
+    rep=$((rep + 1))
+  done
+  append_direct_avg_row
+fi
+
 echo
 echo "Raw repeat CSV: $raw_repeats_csv"
 echo "Raw CSV: $raw_csv"
 echo "Summary CSV: $summary_csv"
+if [ "$DIRECT_APPENDIX" -gt 0 ]; then
+  echo "Direct raw CSV: $direct_raw_csv"
+  echo "Direct CSV: $direct_csv"
+fi
 echo "Logs: $OUT_DIR"
