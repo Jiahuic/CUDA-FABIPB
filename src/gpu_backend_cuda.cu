@@ -1141,6 +1141,7 @@ int buildDirectTables(const ssystem *sys) {
   size_t blockHostCoeffBytes;
   size_t blockTotalBytes;
   size_t blockCombinedBytes;
+  size_t usableBytes = 0;
   size_t freeBytes = 0, totalGpuBytes = 0;
   int dstBlockCount;
   int i, j;
@@ -1155,7 +1156,27 @@ int buildDirectTables(const ssystem *sys) {
   hostCoeffBytes = 4 * coeffBytes;
   totalBytes = 4 * coeffBytes + 2 * vecBytes;
   combinedBytes = hostCoeffBytes + totalBytes;
-  dstBlockCount = MIN(256, sys->nPnls);
+  dstBlockCount = 1;
+  if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
+    size_t safetyBytes = freeBytes / 5;
+    if (safetyBytes < (size_t)(512U * 1024U * 1024U)) {
+      safetyBytes = (size_t)(512U * 1024U * 1024U);
+    }
+    usableBytes = (freeBytes > safetyBytes) ? (freeBytes - safetyBytes) : 0;
+    if (usableBytes > 2 * vecBytes) {
+      size_t coeffBudget = usableBytes - 2 * vecBytes;
+      size_t bytesPerDstPanel = (size_t)sys->nPnls * 4U * sizeof(double);
+      if (bytesPerDstPanel > 0) {
+        size_t candidate = coeffBudget / bytesPerDstPanel;
+        if (candidate > (size_t)sys->nPnls) {
+          candidate = (size_t)sys->nPnls;
+        }
+        if (candidate > 0) {
+          dstBlockCount = (int)candidate;
+        }
+      }
+    }
+  }
   blockCoeffBytes = (size_t)dstBlockCount * (size_t)sys->nPnls * sizeof(double);
   blockHostCoeffBytes = 4 * blockCoeffBytes;
   blockTotalBytes = 4 * blockCoeffBytes + 2 * vecBytes;
@@ -1172,7 +1193,7 @@ int buildDirectTables(const ssystem *sys) {
            (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
            (double)blockCombinedBytes / (1024.0 * 1024.0 * 1024.0));
   }
-  if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
+  if (freeBytes > 0) {
     if (sys->benchmarkMode > 0)
       printf("Direct GPU device memory: free=%.3f GB total=%.3f GB\n",
              (double)freeBytes / (1024.0 * 1024.0 * 1024.0),
