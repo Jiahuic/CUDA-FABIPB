@@ -18,6 +18,7 @@ extern "C" void setupDerivs(int order, double *x);
 extern "C" double **dG0;
 extern "C" double **dGk;
 extern "C" int *sgn3;
+extern "C" double kappa;
 extern "C" double epsilon;
 extern "C" double **Q2M0;
 extern "C" double **Q2M1;
@@ -160,10 +161,12 @@ struct DirectGpuCache {
   long long nInteractions;
   int mode;
   int blockDstCount;
+  struct DirectPanelGeom *h_panels;
   double *h_k0;
   double *h_k1;
   double *h_k2;
   double *h_k3;
+  struct DirectPanelGeom *d_panels;
   double *d_k0;
   double *d_k1;
   double *d_k2;
@@ -178,6 +181,13 @@ struct RhsPanelGeom {
   double v0[3];
   double a0[3];
   double a2[3];
+  double normal[3];
+  double area;
+};
+
+struct DirectPanelGeom {
+  double vtx[9];
+  double a[9];
   double normal[3];
   double area;
 };
@@ -413,21 +423,25 @@ void freeLeafCache() {
 }
 
 void freeDirectCache() {
+  free(gDirect.h_panels);
   free(gDirect.h_k0);
   free(gDirect.h_k1);
   free(gDirect.h_k2);
   free(gDirect.h_k3);
+  gDirect.h_panels = NULL;
   gDirect.h_k0 = NULL;
   gDirect.h_k1 = NULL;
   gDirect.h_k2 = NULL;
   gDirect.h_k3 = NULL;
 
+  cudaFree(gDirect.d_panels);
   cudaFree(gDirect.d_k0);
   cudaFree(gDirect.d_k1);
   cudaFree(gDirect.d_k2);
   cudaFree(gDirect.d_k3);
   cudaFree(gDirect.d_sgm);
   cudaFree(gDirect.d_pot);
+  gDirect.d_panels = NULL;
   gDirect.d_k0 = NULL;
   gDirect.d_k1 = NULL;
   gDirect.d_k2 = NULL;
@@ -578,6 +592,41 @@ int allocateBlockedDirectArrays(int nPnls, int dstBlockCount) {
   if (err != cudaSuccess) return 0;
 
   return 1;
+}
+
+int allocateOnTheFlyDirectArrays(int nPnls) {
+  size_t panelBytes = (size_t)nPnls * sizeof(DirectPanelGeom);
+  size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
+  cudaError_t err = cudaSuccess;
+
+  gDirect.h_panels = (DirectPanelGeom *)malloc(panelBytes);
+  if (!gDirect.h_panels) {
+    return 0;
+  }
+
+  err = cudaMalloc((void **)&gDirect.d_panels, panelBytes);
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_sgm, vecBytes);
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_pot, vecBytes);
+  if (err != cudaSuccess) return 0;
+
+  return 1;
+}
+
+void fillDirectPanelGeom(const ssystem *sys) {
+  int i, j, k;
+  for (i = 0; i < sys->nPnls; i++) {
+    panel *p = sys->panelByIdx[i];
+    for (j = 0; j < 3; j++) {
+      for (k = 0; k < 3; k++) {
+        gDirect.h_panels[i].vtx[3 * j + k] = p->vtx[j][k];
+        gDirect.h_panels[i].a[3 * j + k] = p->a[j][k];
+      }
+      gDirect.h_panels[i].normal[j] = p->normal[j];
+    }
+    gDirect.h_panels[i].area = p->area;
+  }
 }
 
 int allocateM2LHostArrays() {
@@ -1141,6 +1190,7 @@ int buildDirectTables(const ssystem *sys) {
   size_t blockHostCoeffBytes;
   size_t blockTotalBytes;
   size_t blockCombinedBytes;
+  size_t onTheFlyTotalBytes;
   size_t usableBytes = 0;
   size_t freeBytes = 0, totalGpuBytes = 0;
   int dstBlockCount;
@@ -1181,6 +1231,7 @@ int buildDirectTables(const ssystem *sys) {
   blockHostCoeffBytes = 4 * blockCoeffBytes;
   blockTotalBytes = 4 * blockCoeffBytes + 2 * vecBytes;
   blockCombinedBytes = blockHostCoeffBytes + blockTotalBytes;
+  onTheFlyTotalBytes = (size_t)sys->nPnls * sizeof(DirectPanelGeom) + 2 * vecBytes;
   if (sys->benchmarkMode > 0) {
     printf("Direct GPU memory estimate: solver-host=%.3f GB host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
            (double)memcount / (1024.0 * 1024.0 * 1024.0),
@@ -1192,6 +1243,9 @@ int buildDirectTables(const ssystem *sys) {
            (double)blockHostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
            (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
            (double)blockCombinedBytes / (1024.0 * 1024.0 * 1024.0));
+    printf("On-the-fly direct GPU estimate: panel-geom=%.3f GB device-total=%.3f GB\n",
+           (double)((size_t)sys->nPnls * sizeof(DirectPanelGeom)) / (1024.0 * 1024.0 * 1024.0),
+           (double)onTheFlyTotalBytes / (1024.0 * 1024.0 * 1024.0));
   }
   if (freeBytes > 0) {
     if (sys->benchmarkMode > 0)
@@ -1237,9 +1291,30 @@ int buildDirectTables(const ssystem *sys) {
   }
 
   if (freeBytes > 0 && blockTotalBytes > freeBytes * 7 / 10) {
-    printf("Direct GPU cache unavailable: dense need %.3f GB, blocked need %.3f GB, free %.3f GB\n",
+    if (sys->maxQuadOrder == 1 && onTheFlyTotalBytes <= freeBytes * 7 / 10) {
+      if (!allocateOnTheFlyDirectArrays(sys->nPnls)) {
+        return 0;
+      }
+      fillDirectPanelGeom(sys);
+      if (cudaMemcpy(gDirect.d_panels, gDirect.h_panels,
+                     (size_t)sys->nPnls * sizeof(DirectPanelGeom),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        return 0;
+      }
+      gDirect.sys = sys;
+      gDirect.nPnls = sys->nPnls;
+      gDirect.nInteractions = nInteractions;
+      gDirect.mode = 3;
+      gDirect.blockDstCount = dstBlockCount;
+      if (sys->benchmarkMode > 0)
+        printf("GPU direct cache: panel-pairs=%lld mode=onthefly-q1 dst-block=%d\n",
+               nInteractions, dstBlockCount);
+      return 1;
+    }
+    printf("Direct GPU cache unavailable: dense need %.3f GB, blocked need %.3f GB, on-the-fly need %.3f GB, free %.3f GB\n",
            (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
            (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)onTheFlyTotalBytes / (1024.0 * 1024.0 * 1024.0),
            (double)freeBytes / (1024.0 * 1024.0 * 1024.0));
     return 0;
   }
@@ -1546,6 +1621,212 @@ __global__ void directApplyBlockKernel(
     double x_dpdn = sgm[s + nPnls];
     sumPot += k0[idx] * x_dpdn + k1[idx] * x_pot;
     sumDpdn += k2[idx] * x_dpdn + k3[idx] * x_pot;
+  }
+
+  shPot[tid] = sumPot;
+  shDpdn[tid] = sumDpdn;
+  __syncthreads();
+
+  for (stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shPot[tid] += shPot[tid + stride];
+      shDpdn[tid] += shDpdn[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    pot[d] = beta * pot[d] + alpha * shPot[0];
+    pot[d + nPnls] = beta * pot[d + nPnls] + alpha * shDpdn[0];
+  }
+}
+
+__device__ __forceinline__ int same_vertex3(const double *a, const double *b) {
+  return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+}
+
+__device__ __forceinline__ int nrCommonVtxDev(const DirectPanelGeom *px,
+                                              const DirectPanelGeom *py,
+                                              int *idxX, int *idxY) {
+  int n1, n2, flag, cnt = 0;
+  idxX[0] = idxY[0] = 0;
+  idxX[1] = idxY[1] = 1;
+  idxX[2] = idxY[2] = 2;
+
+  if (px == py) return 3;
+
+  for (n1 = 0; n1 < 3; n1++) {
+    flag = 0;
+    for (n2 = 0; n2 < 3; n2++) {
+      if (same_vertex3(&px->vtx[3 * n1], &py->vtx[3 * n2])) {
+        flag = 1;
+        cnt++;
+        break;
+      }
+    }
+    if (flag) break;
+  }
+  if (!flag) return 0;
+
+  idxX[0] = n1 % 3; idxX[1] = (n1 + 1) % 3; idxX[2] = (n1 + 2) % 3;
+  idxY[0] = n2 % 3; idxY[1] = (n2 + 1) % 3; idxY[2] = (n2 + 2) % 3;
+
+  if (same_vertex3(&px->vtx[3 * idxX[1]], &py->vtx[3 * idxY[2]])) cnt = 2;
+  if (same_vertex3(&px->vtx[3 * idxX[2]], &py->vtx[3 * idxY[1]])) cnt = -2;
+  return cnt;
+}
+
+__device__ __forceinline__ void kernelKER4Dev(const double *x, const double *nrmX,
+                                              const double *nrmY, double kappaDev,
+                                              double epsilonDev, double *y) {
+  const double fourPiI = 1.0 / (4.0 * 3.14159265358979323846);
+  double r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+  double r = sqrt(r2);
+  double expKa = exp(-kappaDev * r);
+  double ip0 = nrmX[0] * nrmY[0] + nrmX[1] * nrmY[1] + nrmX[2] * nrmY[2];
+  double ipX = nrmX[0] * x[0] + nrmX[1] * x[1] + nrmX[2] * x[2];
+  double ipY = nrmY[0] * x[0] + nrmY[1] * x[1] + nrmY[2] * x[2];
+  double G0 = fourPiI / r;
+  double Gk = expKa * G0;
+  double coef = (kappaDev * r + 1.0) * expKa;
+  double dG0dy = ipY * G0 / r2;
+  double dGkdy = coef * dG0dy;
+  double dG0dx = ipX * G0 / r2;
+  double dGkdx = coef * dG0dx;
+  double ddG0dxdy = (ip0 * G0 - dG0dy * ipX * 3.0) / r2;
+  double ddGkdxdy = coef * ddG0dxdy - kappaDev * kappaDev * expKa * ipX * dG0dy;
+
+  y[0] = G0 - Gk;
+  y[1] = epsilonDev * dGkdy - dG0dy;
+  y[2] = dGkdx / epsilonDev - dG0dx;
+  y[3] = ddGkdxdy - ddG0dxdy;
+}
+
+__device__ __forceinline__ void panelIA0Q1Dev(const DirectPanelGeom *px,
+                                              const DirectPanelGeom *py,
+                                              double kappaDev,
+                                              double epsilonDev,
+                                              double *out) {
+  int idxX[3], idxY[3], k, nVtx;
+  double tmp[4];
+  nVtx = nrCommonVtxDev(px, py, idxX, idxY);
+  out[0] = out[1] = out[2] = out[3] = 0.0;
+
+  if (nVtx == 0) {
+    double r[3];
+    for (k = 0; k < 3; k++) {
+      double r0 = px->vtx[k] - py->vtx[k];
+      double ax2 = px->a[6 + k];
+      double ax0 = px->a[k];
+      double ay1 = py->a[6 + k];
+      double ay2 = py->a[k];
+      r[k] = r0 + 0.5 * (ax2 + 0.5 * ax0) - 0.5 * (ay1 + 0.5 * ay2);
+    }
+    kernelKER4Dev(r, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] = px->area * py->area * tmp[k];
+  } else if (nVtx == 1) {
+    double r1[3], r2[3];
+    for (k = 0; k < 3; k++) {
+      double ax2 = px->a[3 * idxX[2] + k];
+      double ax0 = px->a[3 * idxX[0] + k];
+      double by2 = py->a[3 * idxY[2] + k];
+      double by0 = py->a[3 * idxY[0] + k];
+      r1[k] = 0.5 * (ax2 + 0.5 * ax0 - 0.5 * (by2 + 0.5 * by0));
+      r2[k] = 0.5 * (0.5 * (ax2 + 0.5 * ax0) - (by2 + 0.5 * by0));
+    }
+    kernelKER4Dev(r1, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    double tmp2[4];
+    kernelKER4Dev(r2, px->normal, py->normal, kappaDev, epsilonDev, tmp2);
+    for (k = 0; k < 4; k++) out[k] = 0.25 * px->area * py->area * (tmp[k] + tmp2[k]);
+  } else if (nVtx == 2 || nVtx == -2) {
+    double a[3], b[3], c[3];
+    double r1[3], r2[3], r3[3], r4[3], r5[3], r6[3];
+    if (nVtx == 2) {
+      for (k = 0; k < 3; k++) {
+        a[k] = px->a[3 * idxX[2] + k];
+        b[k] = px->a[3 * idxX[0] + k];
+        c[k] = py->a[3 * idxY[0] + k];
+      }
+    } else {
+      for (k = 0; k < 3; k++) {
+        a[k] = px->a[3 * idxX[1] + k];
+        b[k] = -py->a[3 * idxY[0] + k];
+        c[k] = -px->a[3 * idxX[0] + k];
+      }
+    }
+    for (k = 0; k < 3; k++) {
+      r1[k] = 0.25 * (0.5 * (a[k] + 0.5 * b[k]) + 0.5 * c[k]);
+      r2[k] = 0.25 * (0.5 * (b[k] + 0.5 * a[k]) + 0.75 * c[k]);
+      r3[k] = 0.25 * (0.5 * a[k] + b[k] + 0.125 * c[k]);
+      r4[k] = 0.25 * (0.5 * (0.5 * b[k] - 0.5 * a[k]) + c[k]);
+      r5[k] = 0.25 * (0.125 * b[k] - 0.75 * a[k] + 0.5 * c[k]);
+      r6[k] = 0.25 * (0.5 * b[k] - 0.5 * a[k] + 0.125 * c[k]);
+    }
+    kernelKER4Dev(r1, px->normal, py->normal, kappaDev, epsilonDev, out);
+    kernelKER4Dev(r2, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r3, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r4, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r5, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r6, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] = 0.0625 * px->area * py->area * (out[k] + tmp[k]);
+  } else if (nVtx == 3) {
+    double r1[3], r2[3], r3[3], r4[3], r5[3], r6[3];
+    const double *a2 = &px->a[6];
+    const double *a0 = &px->a[0];
+    for (k = 0; k < 3; k++) {
+      r1[k] = 0.25 * (0.5 * a2[k] + a0[k]);
+      r2[k] = 0.25 * (0.5 * a0[k] - 0.5 * a2[k]);
+      r3[k] = 0.25 * (a2[k] + 0.5 * a0[k]);
+      r4[k] = -r1[k];
+      r5[k] = 0.25 * (0.5 * a2[k] - 0.5 * a0[k]);
+      r6[k] = -r3[k];
+    }
+    kernelKER4Dev(r1, px->normal, py->normal, kappaDev, epsilonDev, out);
+    kernelKER4Dev(r2, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r3, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r4, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r5, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] += tmp[k];
+    kernelKER4Dev(r6, px->normal, py->normal, kappaDev, epsilonDev, tmp);
+    for (k = 0; k < 4; k++) out[k] = 0.125 * px->area * py->area * (out[k] + tmp[k]);
+  }
+}
+
+__global__ void directApplyOnTheFlyQ1Kernel(
+    int nPnls,
+    int dstStart,
+    int dstCount,
+    const DirectPanelGeom *panels,
+    double alpha,
+    double beta,
+    double kappaDev,
+    double epsilonDev,
+    const double *sgm,
+    double *pot) {
+  __shared__ double shPot[256];
+  __shared__ double shDpdn[256];
+  int localD = blockIdx.x;
+  int d = dstStart + localD;
+  int tid = threadIdx.x;
+  int s;
+  int stride;
+  double sumPot = 0.0;
+  double sumDpdn = 0.0;
+
+  if (localD >= dstCount || d >= nPnls) return;
+
+  for (s = tid; s < nPnls; s += blockDim.x) {
+    double ker[4];
+    panelIA0Q1Dev(&panels[d], &panels[s], kappaDev, epsilonDev, ker);
+    sumPot += ker[0] * sgm[s + nPnls] + ker[1] * sgm[s];
+    sumDpdn += ker[2] * sgm[s + nPnls] + ker[3] * sgm[s];
   }
 
   shPot[tid] = sumPot;
@@ -1886,6 +2167,19 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
           gDirect.nPnls, dstStart, dstCount,
           gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
           alpha, beta, gDirect.d_sgm, gDirect.d_pot);
+      err = cudaGetLastError();
+      if (err != cudaSuccess) return 0;
+      err = cudaDeviceSynchronize();
+      if (err != cudaSuccess) return 0;
+      beta = 1.0;
+    }
+  } else if (gDirect.mode == 3) {
+    for (dstStart = 0; dstStart < gDirect.nPnls; dstStart += gDirect.blockDstCount) {
+      int dstCount = MIN(gDirect.blockDstCount, gDirect.nPnls - dstStart);
+      gridSize = dstCount;
+      directApplyOnTheFlyQ1Kernel<<<gridSize, blockSize>>>(
+          gDirect.nPnls, dstStart, dstCount, gDirect.d_panels,
+          alpha, beta, kappa, epsilon, gDirect.d_sgm, gDirect.d_pot);
       err = cudaGetLastError();
       if (err != cudaSuccess) return 0;
       err = cudaDeviceSynchronize();
