@@ -64,7 +64,7 @@ Preconditioner development/debug note:
 
 See also:
 
-* `docs/nearfield_roadmap.md` for the detailed near-field bottleneck breakdown and experiment order
+* `docs/archive/nearfield_roadmap.md` for the archived detailed near-field bottleneck breakdown and experiment order
 
 Implication for mainline work:
 

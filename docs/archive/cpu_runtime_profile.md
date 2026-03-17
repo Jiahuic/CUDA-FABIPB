@@ -63,4 +63,4 @@ This matches the current GPU roadmap.
 
 ## Raw profiling artifacts
 
-- [gprof_1a7m_cpu.txt](/home/jiahuic/Garage/electrostatics/GPU-FABIPB/docs/profiling/gprof_1a7m_cpu.txt)
+- [gprof_1a7m_cpu.txt](/home/jiahuic/Garage/electrostatics/GPU-FABIPB/docs/archive/profiling/gprof_1a7m_cpu.txt)
