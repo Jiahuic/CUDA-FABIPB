@@ -16,3 +16,4 @@ msms.*
 test_proteins/*.xyzr
 test_proteins/*.vert
 test_proteins/*.face
+bimpb_cuda/
