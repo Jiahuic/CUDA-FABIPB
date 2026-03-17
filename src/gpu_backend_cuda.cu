@@ -792,7 +792,6 @@ int buildM2LTables(const ssystem *sys) {
   int cubeIdx;
   int pairIdx;
   int groupIdx;
-  double t0;
   double r[3];
 
   gM2L.sys = sys;
@@ -844,7 +843,6 @@ int buildM2LTables(const ssystem *sys) {
     gM2L.h_groupOrder[groupIdx] = sys->m2lPairOrder[start];
   }
 
-  t0 = wall_seconds_cuda_local();
   for (pairIdx = 0; pairIdx < sys->nM2LPairsFlat; pairIdx++) {
     cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[pairIdx]];
     cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[pairIdx]];
@@ -861,7 +859,6 @@ int buildM2LTables(const ssystem *sys) {
     memcpy(&gM2L.h_gk[coeffOffset], dGk[0], (size_t)nMom * sizeof(double));
     gM2L.h_pairCoeffOffset[pairIdx + 1] = coeffOffset + nMom;
   }
-  (void)t0;
 
   if (!allocateM2LDeviceArrays()) {
     return 0;
@@ -1146,11 +1143,13 @@ int buildDirectTables(const ssystem *sys) {
   size_t freeBytes = 0, totalGpuBytes = 0;
   int dstBlockCount;
   int i, j;
+  double t0, t1;
 
   nInteractions = (long long)sys->nPnls * (long long)sys->nPnls;
   if (nInteractions <= 0) {
     return 0;
   }
+  t0 = wall_seconds_cuda_local();
 
   coeffBytes = (size_t)nInteractions * sizeof(double);
   vecBytes = (size_t)(2 * sys->nPnls) * sizeof(double);
@@ -1207,31 +1206,40 @@ int buildDirectTables(const ssystem *sys) {
     }
 
     kernel = kernelKER4;
-    for (i = 0; i < sys->nPnls; i++) {
-      panel *pnlX = sys->panelByIdx[i];
-      long long base = (long long)i * (long long)sys->nPnls;
-      for (j = 0; j < sys->nPnls; j++) {
-        panel *pnlY = sys->panelByIdx[j];
-        double *KER = panelIA0(pnlX, pnlY);
-        long long idx = base + (long long)j;
+    {
+      double tc0 = wall_seconds_cuda_local();
+      for (i = 0; i < sys->nPnls; i++) {
+        panel *pnlX = sys->panelByIdx[i];
+        long long base = (long long)i * (long long)sys->nPnls;
+        for (j = 0; j < sys->nPnls; j++) {
+          panel *pnlY = sys->panelByIdx[j];
+          double *KER = panelIA0(pnlX, pnlY);
+          long long idx = base + (long long)j;
 
-        gDirect.h_k0[idx] = KER[0];
-        gDirect.h_k1[idx] = KER[1];
-        gDirect.h_k2[idx] = KER[2];
-        gDirect.h_k3[idx] = KER[3];
+          gDirect.h_k0[idx] = KER[0];
+          gDirect.h_k1[idx] = KER[1];
+          gDirect.h_k2[idx] = KER[2];
+          gDirect.h_k3[idx] = KER[3];
+        }
       }
+      directGpuCoeffTime += (wall_seconds_cuda_local() - tc0);
     }
 
+    t0 = wall_seconds_cuda_local();
     if (cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     if (cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     if (cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     if (cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    t1 = wall_seconds_cuda_local();
+    directGpuStoreTime += (t1 - t0);
 
     gDirect.sys = sys;
     gDirect.nPnls = sys->nPnls;
     gDirect.nInteractions = nInteractions;
     gDirect.mode = 1;
     gDirect.blockDstCount = sys->nPnls;
+    t1 = wall_seconds_cuda_local();
+    directGpuBuildTime += (t1 - t0);
     if (sys->benchmarkMode > 0)
       printf("GPU direct cache: panel-pairs=%lld mode=dense\n", nInteractions);
     return 1;
@@ -1254,6 +1262,8 @@ int buildDirectTables(const ssystem *sys) {
   gDirect.nInteractions = nInteractions;
   gDirect.mode = 2;
   gDirect.blockDstCount = dstBlockCount;
+  t1 = wall_seconds_cuda_local();
+  directGpuBuildTime += (t1 - t0);
   if (sys->benchmarkMode > 0)
     printf("GPU direct cache: panel-pairs=%lld mode=blocked dst-block=%d\n", nInteractions, dstBlockCount);
   return 1;
@@ -1822,6 +1832,7 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   int blockSize;
   int gridSize;
   int dstStart;
+  double t0, t1;
 
   if (sys == NULL || sgm == NULL || pot == NULL) {
     return 0;
@@ -1836,14 +1847,18 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   }
 
   vecBytes = (size_t)(2 * gDirect.nPnls) * sizeof(double);
+  t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(gDirect.d_sgm, sgm, vecBytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return 0;
   err = cudaMemcpy(gDirect.d_pot, pot, vecBytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  directGpuH2DTime += (t1 - t0);
 
   blockSize = 256;
   if (gDirect.mode == 1) {
     gridSize = gDirect.nPnls;
+    t0 = wall_seconds_cuda_local();
     directApplyKernel<<<gridSize, blockSize>>>(
         gDirect.nPnls, gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
         alpha, beta, gDirect.d_sgm, gDirect.d_pot);
@@ -1851,6 +1866,8 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
     if (err != cudaSuccess) return 0;
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) return 0;
+    t1 = wall_seconds_cuda_local();
+    directGpuKernelTime += (t1 - t0);
   } else if (gDirect.mode == 2) {
     kernel = kernelKER4;
     for (dstStart = 0; dstStart < gDirect.nPnls; dstStart += gDirect.blockDstCount) {
@@ -1858,6 +1875,7 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
       size_t coeffBytes = (size_t)dstCount * (size_t)gDirect.nPnls * sizeof(double);
       int localD, s;
 
+      t0 = wall_seconds_cuda_local();
       for (localD = 0; localD < dstCount; localD++) {
         int d = dstStart + localD;
         panel *pnlX = sys->panelByIdx[d];
@@ -1872,7 +1890,10 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
           gDirect.h_k3[idx] = KER[3];
         }
       }
+      t1 = wall_seconds_cuda_local();
+      directGpuCoeffTime += (t1 - t0);
 
+      t0 = wall_seconds_cuda_local();
       err = cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice);
       if (err != cudaSuccess) return 0;
       err = cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice);
@@ -1881,8 +1902,11 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
       if (err != cudaSuccess) return 0;
       err = cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice);
       if (err != cudaSuccess) return 0;
+      t1 = wall_seconds_cuda_local();
+      directGpuStoreTime += (t1 - t0);
 
       gridSize = dstCount;
+      t0 = wall_seconds_cuda_local();
       directApplyBlockKernel<<<gridSize, blockSize>>>(
           gDirect.nPnls, dstStart, dstCount,
           gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
@@ -1891,14 +1915,19 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
       if (err != cudaSuccess) return 0;
       err = cudaDeviceSynchronize();
       if (err != cudaSuccess) return 0;
+      t1 = wall_seconds_cuda_local();
+      directGpuKernelTime += (t1 - t0);
       beta = 1.0;
     }
   } else {
     return 0;
   }
 
+  t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(pot, gDirect.d_pot, vecBytes, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  directGpuD2HTime += (t1 - t0);
   return 1;
 }
 

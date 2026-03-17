@@ -17,6 +17,7 @@ double setupFmmM2LPairTime, setupFmmM2LGroupTime;
 double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 double fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime;
+double directGpuBuildTime, directGpuCoeffTime, directGpuStoreTime, directGpuH2DTime, directGpuKernelTime, directGpuD2HTime;
 double mtvApplyFMMTime, mtvTotalTime;
 double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
@@ -60,9 +61,48 @@ void resetFmmMatvecStats(void) {
   fmmNearGpuMetaTime = 0.0;
   fmmNearGpuCoeffTime = 0.0;
   fmmNearGpuUploadTime = 0.0;
+  directGpuBuildTime = 0.0;
+  directGpuCoeffTime = 0.0;
+  directGpuStoreTime = 0.0;
+  directGpuH2DTime = 0.0;
+  directGpuKernelTime = 0.0;
+  directGpuD2HTime = 0.0;
   mtvApplyFMMTime = 0.0;
   mtvTotalTime = 0.0;
   mtvCalls = 0;
+}
+
+void printDirectMatvecStats(void) {
+  double invCalls;
+  double buildOther;
+
+  if (sys == NULL || sys->benchmarkMode == 0) {
+    return;
+  }
+  if (gmresMatvecCalls <= 0) {
+    printf("Direct matvec stats: no calls recorded.\n");
+    return;
+  }
+
+  invCalls = 1.0 / (double)gmresMatvecCalls;
+  buildOther = directGpuBuildTime - directGpuCoeffTime;
+  buildOther -= directGpuStoreTime;
+  if (buildOther < 0.0) {
+    buildOther = 0.0;
+  }
+
+  printf("GPU direct breakdown (s): build=%.6f calc=%.6f store=%.6f h2d=%.6f kernel=%.6f d2h=%.6f\n",
+         directGpuBuildTime, directGpuCoeffTime, directGpuStoreTime, directGpuH2DTime,
+         directGpuKernelTime, directGpuD2HTime);
+  printf("GPU direct avg/call (ms): build=%.3f calc=%.3f store=%.3f h2d=%.3f kernel=%.3f d2h=%.3f\n",
+         1.0e3 * directGpuBuildTime * invCalls,
+         1.0e3 * directGpuCoeffTime * invCalls,
+         1.0e3 * directGpuStoreTime * invCalls,
+         1.0e3 * directGpuH2DTime * invCalls,
+         1.0e3 * directGpuKernelTime * invCalls,
+         1.0e3 * directGpuD2HTime * invCalls);
+  printf("GPU direct build breakdown (s): calc=%.6f store=%.6f other=%.6f\n",
+         directGpuCoeffTime, directGpuStoreTime, buildOther);
 }
 
 void printSetupFmmStats(void) {

@@ -224,6 +224,36 @@ And near-field build sub-breakdown:
 
 This supports the paper narrative for the destination-grouped near-field path.
 
+### 4. Direct-sum appendix
+
+Purpose:
+
+- answer the simple GPU-versus-CPU direct-sum question separately from the FMM
+  study
+- separate the algorithmic FMM gain from the hardware GPU gain
+
+Settings:
+
+- CPU direct:
+  - `-g=0 -r=2`
+- GPU direct:
+  - `-g=1 -r=1`
+- compare against:
+  - CPU FMM: `-g=0 -r=0`
+  - hybrid FMM: `-g=1 -Q=0 -r=0`
+
+Interpretation:
+
+- `cpu-direct -> gpu-direct`
+  - GPU speedup for the simple direct algorithm
+- `gpu-direct -> hybrid-fmm`
+  - algorithmic gain from FMM on GPU
+- `cpu-direct -> hybrid-fmm`
+  - combined gain
+
+Use [`scripts/compare_direct_gpu.sh`](/home/jiahuic/Garage/electrostatics/GPU-FABIPB/scripts/compare_direct_gpu.sh)
+for this appendix study.
+
 ## Recommended cases
 
 Minimum set:
@@ -233,9 +263,9 @@ Minimum set:
 - high-density medium/large:
   - regenerate with `-d=10`
 
-Optional:
+Optional direct appendix:
 
-- direct GPU baseline on smaller cases using `scripts/compare_direct_gpu.sh`
+- smaller cases using [`scripts/compare_direct_gpu.sh`](/home/jiahuic/Garage/electrostatics/GPU-FABIPB/scripts/compare_direct_gpu.sh)
 - direct GPU appendix from `scripts/run_benchmark_matrix.sh`
   - this should be run once per case, not once per depth
   - it is a dense direct-sum PB reference for comparison against the FMM matrix

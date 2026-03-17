@@ -468,6 +468,9 @@ int main(int nargs, char *argv[]){
     printFmmMatvecStats();
   } else if (sys->benchmarkMode > 0) {
     printf("Direct baseline run: FMM stage stats omitted.\n");
+    if (sys->gpuMode > 0 && sys->matvecMode == 1) {
+      printDirectMatvecStats();
+    }
   }
 
 }
