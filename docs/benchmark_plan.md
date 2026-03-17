@@ -7,6 +7,13 @@ The goal is to compare:
 - GPU non-parallel "full GPU-enabled" baseline
 - best hybrid runtime policy
 
+Use two benchmark drivers:
+
+- `scripts/run_benchmark_matrix.sh`
+  - depth-focused production benchmark matrix
+- `scripts/run_fmm_param_matrix.sh`
+  - structural and order-policy sweep for adaptive-parameter studies
+
 All benchmark runs should use benchmark output mode:
 
 ```sh
@@ -103,6 +110,7 @@ For structural sweeps beyond depth-only, also vary:
 
 - `-H=<lev>` for FMM height
 - `-S=<val>` for separation ratio
+- `-p=<val>` / `-pm=<val>` for order-policy sweeps
 
 For each `(case, depth, configuration)` run, record:
 
