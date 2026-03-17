@@ -99,6 +99,11 @@ For each case, benchmark across selected tree depths, for example:
 - `7`
 - `8`
 
+For structural sweeps beyond depth-only, also vary:
+
+- `-H=<lev>` for FMM height
+- `-S=<val>` for separation ratio
+
 For each `(case, depth, configuration)` run, record:
 
 - total runtime
@@ -251,6 +256,12 @@ Current default policy in the benchmark runner:
 
 This keeps the data easy to analyze in Python/R/Excel and easy to reuse for
 paper tables and figures.
+
+For structural studies, the benchmark driver may later be extended so the CSV
+keys include:
+
+- `height`
+- `SepRat`
 
 ## Acceptance checks
 

@@ -198,6 +198,7 @@ static void print_usage(const char *prog) {
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
   printf("  -P=0|1|2  original, cached-block, or cached-LU preconditioner (default: 2)\n");
   printf("  -t=<lev>  tree depth\n");
+  printf("  -H=<lev>  coarsest active FMM level (default: 2)\n");
   printf("  -q=<ord>  panel quadrature order\n");
   printf("  -k=<val>  Debye-Huckel kappa\n");
   printf("  -e1=<val> solvent epsilon 1\n");
@@ -303,6 +304,8 @@ int main(int nargs, char *argv[]){
           break;
         case 't': sys->depth = atoi( argv[i]+3 );
           break;
+        case 'H': sys->height = atoi( argv[i]+3 );
+          break;
         case 'd': strcpy(density,argv[i]+3);
           break;
         case 'e':
@@ -353,6 +356,14 @@ int main(int nargs, char *argv[]){
       exit(0);
     }
   }
+  if ( sys->height < 0 ) {
+    printf("Bad FMM height: %d\n", sys->height );
+    exit(0);
+  }
+  if ( sys->height > sys->depth ) {
+    printf("Bad FMM level range: height=%d depth=%d\n", sys->height, sys->depth );
+    exit(0);
+  }
   //printf("PDB id: %s, MSMS density: %s\n", panelfile, density);
   if (sys->gpuMode < 0) {
     sys->gpuMode = gpuBackendAvailable() ? 1 : 0;
@@ -361,8 +372,8 @@ int main(int nargs, char *argv[]){
   if (sys->benchmarkMode > 0) {
     printf("----------------------------\n");
     if (sys->matvecMode == 0) {
-      printf("FMM variables: nLev=%d ord=%d SepRat=%lg qOrd=%d\n",
-        sys->depth, order, sys->maxSepRatio, sys->maxQuadOrder );
+      printf("FMM variables: nLev=%d height=%d ord=%d SepRat=%lg qOrd=%d\n",
+        sys->depth, sys->height, order, sys->maxSepRatio, sys->maxQuadOrder );
     } else {
       printf("Direct GPU baseline mode enabled (no FMM matvec)\n");
     }
