@@ -114,6 +114,94 @@ enough, then the next parameters to widen are:
 2. `order`
 3. `height`
 
+## Next parameter-study plan
+
+After the depth-only study, the next sweeps should be done in two stages rather
+than all at once.
+
+### Stage 1: structural sweep
+
+Vary:
+
+- `depth`
+- `height`
+- `maxSepRatio`
+
+Keep fixed:
+
+- `qOrder = 1`
+- one baseline order policy
+
+Recommended initial values:
+
+- `height`:
+  - `1`
+  - `2`
+  - `3`
+- `maxSepRatio`:
+  - `0.6`
+  - `0.8`
+  - `1.0`
+
+Reason:
+
+- `height` changes the active FMM range and the amount of work at coarse levels
+- `maxSepRatio` changes the near-vs-far split
+- both should be studied before changing expansion-order policy
+
+### Stage 2: order-policy sweep
+
+Once the structural sweep identifies a reasonable region, vary:
+
+- `order`
+- `orderMom`
+
+Keep fixed:
+
+- one or two promising structural settings from Stage 1
+
+Recommended initial order-policy options:
+
+1. fixed order:
+   - `-p=6`
+   - `-p=8`
+   - `-p=10`
+2. variable order with exact/high moments:
+   - `-p=-6 -pm=-1`
+   - `-p=-8 -pm=-1`
+3. variable order with bounded moment offset:
+   - `-p=-6 -pm=0`
+   - `-p=-6 -pm=1`
+   - `-p=-8 -pm=0`
+   - `-p=-8 -pm=1`
+
+Reason:
+
+- this gives a small but meaningful set of fixed-vs-variable policies
+- it avoids an immediate combinatorial explosion
+- it is enough to tell whether adaptive depth also needs adaptive order policy
+
+### Decision logic
+
+Run Stage 1 first and select a narrow structural region.
+
+Then run Stage 2 only on that reduced region.
+
+The final adaptive policy should likely be hierarchical:
+
+1. choose structural regime:
+   - `depth`
+   - `height`
+   - `maxSepRatio`
+2. choose order policy:
+   - fixed or variable
+   - `order`
+   - `orderMom`
+3. choose execution policy:
+   - CPU serial
+   - GPU full
+   - hybrid best
+
 ## Workstream A: direct-sum PB comparison
 
 ### Objective
@@ -215,6 +303,13 @@ where `a`, `b`, and `c` depend on the execution mode:
 In the first pass, this is a depth-only model with all other FMM parameters held
 fixed. Only after that should the model be widened to include additional FMM
 knobs such as `maxSepRatio` or order policy.
+
+After the depth-only model is stable, the widening order should be:
+
+1. `height`
+2. `maxSepRatio`
+3. `order`
+4. `orderMom`
 
 ### Phase 2: runtime policy
 
