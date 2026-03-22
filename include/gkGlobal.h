@@ -127,6 +127,7 @@ extern double setupFmmM2LPairTime, setupFmmM2LGroupTime;
 extern double fmmQ2MTime, fmmM2MTime, fmmM2LTime, fmmL2LTime, fmmL2PTime, fmmNearTime;
 extern double fmmNearGpuBuildTime, fmmNearGpuH2DTime, fmmNearGpuKernelTime, fmmNearGpuD2HTime;
 extern double fmmNearGpuMetaTime, fmmNearGpuCoeffTime, fmmNearGpuUploadTime;
+extern double directGpuBuildTime, directGpuCoeffTime, directGpuStoreTime, directGpuH2DTime, directGpuKernelTime, directGpuD2HTime;
 extern double mtvApplyFMMTime, mtvTotalTime;
 extern double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 extern double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
@@ -145,6 +146,7 @@ extern int oneI;
 
 void resetFmmMatvecStats(void);
 void printFmmMatvecStats(void);
+void printDirectMatvecStats(void);
 void printSetupFmmStats(void);
 void resetGmresStats(void);
 void printGmresStats(double gmresWallTime);

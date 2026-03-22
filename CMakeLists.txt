@@ -30,6 +30,7 @@ set(FMM_PB_SOURCES
   src/precond_fmm.c
   src/gmres.c
   src/treecode.c
+  src/direct_backend.c
 )
 
 option(FMM_PB_ENABLE_CUDA "Build CUDA GPU backend hooks when a CUDA toolkit is available" ON)

@@ -17,6 +17,7 @@
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gmres.h"
+#include "direct_backend.h"
 #include "gpu_backend.h"
 
 /* global variables */
@@ -193,11 +194,12 @@ static void print_usage(const char *prog) {
   printf("  -m=0|1    reuse or regenerate MSMS mesh (default: 1)\n");
   printf("  -B=0|1    quiet default or benchmark/profiling output (default: 0)\n");
   printf("  -d=<val>  MSMS density used when -m=1 (default: 1)\n");
-  printf("  -r=0|1    FMM matvec or direct GPU baseline (default: 0)\n");
+  printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");
   printf("  -Q=0|1    CPU-default or GPU-debug Q2M path (default: 0)\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
   printf("  -P=0|1|2  original, cached-block, or cached-LU preconditioner (default: 2)\n");
   printf("  -t=<lev>  tree depth\n");
+  printf("  -H=<lev>  coarsest active FMM level (default: 2)\n");
   printf("  -q=<ord>  panel quadrature order\n");
   printf("  -k=<val>  Debye-Huckel kappa\n");
   printf("  -e1=<val> solvent epsilon 1\n");
@@ -303,6 +305,8 @@ int main(int nargs, char *argv[]){
           break;
         case 't': sys->depth = atoi( argv[i]+3 );
           break;
+        case 'H': sys->height = atoi( argv[i]+3 );
+          break;
         case 'd': strcpy(density,argv[i]+3);
           break;
         case 'e':
@@ -353,6 +357,14 @@ int main(int nargs, char *argv[]){
       exit(0);
     }
   }
+  if ( sys->height < 0 ) {
+    printf("Bad FMM height: %d\n", sys->height );
+    exit(0);
+  }
+  if ( sys->height > sys->depth ) {
+    printf("Bad FMM level range: height=%d depth=%d\n", sys->height, sys->depth );
+    exit(0);
+  }
   //printf("PDB id: %s, MSMS density: %s\n", panelfile, density);
   if (sys->gpuMode < 0) {
     sys->gpuMode = gpuBackendAvailable() ? 1 : 0;
@@ -361,16 +373,17 @@ int main(int nargs, char *argv[]){
   if (sys->benchmarkMode > 0) {
     printf("----------------------------\n");
     if (sys->matvecMode == 0) {
-      printf("FMM variables: nLev=%d ord=%d SepRat=%lg qOrd=%d\n",
-        sys->depth, order, sys->maxSepRatio, sys->maxQuadOrder );
+      printf("FMM variables: nLev=%d height=%d ord=%d SepRat=%lg qOrd=%d\n",
+        sys->depth, sys->height, order, sys->maxSepRatio, sys->maxQuadOrder );
     } else {
-      printf("Direct GPU baseline mode enabled (no FMM matvec)\n");
+      printf("Direct baseline mode enabled (no FMM matvec)\n");
     }
     printf("GMRES variables: tol=%1.e arnoldiSz=%d maxIt=%d\n",
       tolpar, arnoldiSz, numItr);
     printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
     printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
-    printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline)\n", sys->matvecMode);
+    printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline, 2=direct CPU baseline)\n",
+           sys->matvecMode);
     if (sys->matvecMode == 0) {
       printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
       printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
@@ -404,8 +417,8 @@ int main(int nargs, char *argv[]){
   stage_t0 = wall_seconds();
   setupFMM(sys);
   setupFMM_t_local = wall_seconds() - stage_t0;
-  if (sys->matvecMode == 1) {
-    /* Direct-GPU matvec still uses treecode/FMM-side data for postprocessing. */
+  if (sys->matvecMode != 0) {
+    /* Direct matvec modes still use treecode/FMM-side data for postprocessing. */
     buildPanelIndexDirect(sys);
   }
   stage_t0 = wall_seconds();
@@ -454,7 +467,10 @@ int main(int nargs, char *argv[]){
   if (sys->benchmarkMode > 0 && sys->matvecMode == 0) {
     printFmmMatvecStats();
   } else if (sys->benchmarkMode > 0) {
-    printf("Direct GPU baseline run: FMM stage stats omitted.\n");
+    printf("Direct baseline run: FMM stage stats omitted.\n");
+    if (sys->gpuMode > 0 && sys->matvecMode == 1) {
+      printDirectMatvecStats();
+    }
   }
 
 }
@@ -472,6 +488,7 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
   double scale1, scale2, inv_beta;
   double callStart, callEnd, applyStart, applyEnd;
   static int warnedDirectGpu = 0;
+  static int warnedDirectCpu = 0;
 
   scale1 = (1.0+epsilon)/2.0*(*alpha);
   scale2 = (1.0+1.0/epsilon)/2.0*(*alpha);
@@ -484,6 +501,14 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
       if (!warnedDirectGpu) {
         printf("Direct GPU matvec unavailable; using FMM path.\n");
         warnedDirectGpu = 1;
+      }
+      applyFMM(sys, alpha, sgm, &inv_beta, pot);
+    }
+  } else if (sys->matvecMode == 2) {
+    if (!cpuDirectApply(sys, *alpha, inv_beta, sgm, pot)) {
+      if (!warnedDirectCpu) {
+        printf("Direct CPU matvec unavailable; using FMM path.\n");
+        warnedDirectCpu = 1;
       }
       applyFMM(sys, alpha, sgm, &inv_beta, pot);
     }

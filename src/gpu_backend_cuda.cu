@@ -12,12 +12,14 @@
 #include <vector>
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
+extern "C" int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
 extern "C" void kernelKER4(double *x, double *y);
 extern "C" void (*kernel)(double *x, double *y);
 extern "C" void setupDerivs(int order, double *x);
 extern "C" double **dG0;
 extern "C" double **dGk;
 extern "C" int *sgn3;
+extern "C" double kappa;
 extern "C" double epsilon;
 extern "C" double **Q2M0;
 extern "C" double **Q2M1;
@@ -33,11 +35,37 @@ double wall_seconds_cuda_local() {
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
 
+int nearCaseIndex(int nVtx) {
+  switch (nVtx) {
+    case 0: return 0;
+    case 1: return 1;
+    case 2: return 2;
+    case -2: return 3;
+    case 3: return 4;
+    default: return -1;
+  }
+}
+
+struct NearPanelGeom {
+  double vtx[3][3];
+  double a0[3];
+  double a1[3];
+  double a2[3];
+  double normal[3];
+  double area;
+};
+
 struct NearfieldGpuCache {
   const ssystem *sys;
   int nPnls;
   int nearfieldMode;
   long long nInteractions;
+  long long caseDisjointCount;
+  long long caseOneCommonCount;
+  long long caseTwoCommonCount;
+  long long caseTwoCommonRevCount;
+  long long caseSelfCount;
+  NearPanelGeom *h_panels;
   int *h_src;
   int *h_dst;
   int *h_pairSrcCount;
@@ -56,6 +84,7 @@ struct NearfieldGpuCache {
   int *d_leafPanelStart;
   int *d_leafPanelCount;
   int *d_leafPairOffset;
+  NearPanelGeom *d_panels;
   double *d_k0;
   double *d_k1;
   double *d_k2;
@@ -158,6 +187,8 @@ struct DirectGpuCache {
   const ssystem *sys;
   int nPnls;
   long long nInteractions;
+  int mode;
+  int blockDstCount;
   double *h_k0;
   double *h_k1;
   double *h_k2;
@@ -198,8 +229,21 @@ RhsGpuCache gRhs = {};
 
 __constant__ double c_rhsTLeg[10];
 __constant__ double c_rhsWLeg[10];
+__constant__ double c_nearKappa;
+__constant__ double c_nearEpsilon;
+
+__global__ void nearfieldDisjointQ1BuildKernel(
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double *k0,
+    double *k1,
+    double *k2,
+    double *k3);
 
 void freeNearfieldCache() {
+  free(gNear.h_panels);
   free(gNear.h_src);
   free(gNear.h_dst);
   free(gNear.h_pairSrcCount);
@@ -211,6 +255,7 @@ void freeNearfieldCache() {
   free(gNear.h_k1);
   free(gNear.h_k2);
   free(gNear.h_k3);
+  gNear.h_panels = NULL;
   gNear.h_src = NULL;
   gNear.h_dst = NULL;
   gNear.h_pairSrcCount = NULL;
@@ -223,6 +268,7 @@ void freeNearfieldCache() {
   gNear.h_k2 = NULL;
   gNear.h_k3 = NULL;
 
+  cudaFree(gNear.d_panels);
   cudaFree(gNear.d_src);
   cudaFree(gNear.d_dst);
   cudaFree(gNear.d_pairSrcCount);
@@ -236,6 +282,7 @@ void freeNearfieldCache() {
   cudaFree(gNear.d_k3);
   cudaFree(gNear.d_sgm);
   cudaFree(gNear.d_pot);
+  gNear.d_panels = NULL;
   gNear.d_src = NULL;
   gNear.d_dst = NULL;
   gNear.d_pairSrcCount = NULL;
@@ -436,6 +483,8 @@ void freeDirectCache() {
   gDirect.sys = NULL;
   gDirect.nPnls = 0;
   gDirect.nInteractions = 0;
+  gDirect.mode = 0;
+  gDirect.blockDstCount = 0;
 }
 
 void freeRhsCache() {
@@ -463,6 +512,7 @@ void freeRhsCache() {
 
 int allocateHostArrays(long long n) {
   size_t ni = (size_t)n;
+  gNear.h_panels = (NearPanelGeom *)malloc((size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
   gNear.h_src = (int *)malloc(ni * sizeof(int));
   gNear.h_dst = (int *)malloc(ni * sizeof(int));
   gNear.h_pairSrcCount = (int *)malloc((size_t)gNear.sys->nNearPairsFlat * sizeof(int));
@@ -474,7 +524,7 @@ int allocateHostArrays(long long n) {
   gNear.h_k1 = (double *)malloc(ni * sizeof(double));
   gNear.h_k2 = (double *)malloc(ni * sizeof(double));
   gNear.h_k3 = (double *)malloc(ni * sizeof(double));
-  if (!gNear.h_src || !gNear.h_dst || !gNear.h_pairSrcCount ||
+  if (!gNear.h_panels || !gNear.h_src || !gNear.h_dst || !gNear.h_pairSrcCount ||
       !gNear.h_pairInteractionOffset || !gNear.h_leafPanelStart ||
       !gNear.h_leafPanelCount || !gNear.h_leafPairOffset ||
       !gNear.h_k0 || !gNear.h_k1 || !gNear.h_k2 || !gNear.h_k3) {
@@ -488,6 +538,8 @@ int allocateDeviceArrays(int nPnls, long long nInteractions) {
   size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
   cudaError_t err = cudaSuccess;
 
+  err = cudaMalloc((void **)&gNear.d_panels, (size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
+  if (err != cudaSuccess) return 0;
   err = cudaMalloc((void **)&gNear.d_src, ni * sizeof(int));
   if (err != cudaSuccess) return 0;
   err = cudaMalloc((void **)&gNear.d_dst, ni * sizeof(int));
@@ -518,8 +570,58 @@ int allocateDeviceArrays(int nPnls, long long nInteractions) {
   return 1;
 }
 
+int buildNearfieldPanelGeometry(const ssystem *sys) {
+  int i, j, k;
+
+  for (i = 0; i < sys->nPnls; i++) {
+    panel *pnl = sys->panelByIdx[i];
+    for (j = 0; j < 3; j++) {
+      for (k = 0; k < 3; k++) {
+        gNear.h_panels[i].vtx[j][k] = pnl->vtx[j][k];
+      }
+    }
+    for (k = 0; k < 3; k++) {
+      gNear.h_panels[i].a0[k] = pnl->a[0][k];
+      gNear.h_panels[i].a1[k] = pnl->a[1][k];
+      gNear.h_panels[i].a2[k] = pnl->a[2][k];
+      gNear.h_panels[i].normal[k] = pnl->normal[k];
+    }
+    gNear.h_panels[i].area = pnl->area;
+  }
+  return 1;
+}
+
 int allocateDirectArrays(int nPnls, long long nInteractions) {
   size_t ni = (size_t)nInteractions;
+  size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
+  cudaError_t err = cudaSuccess;
+
+  gDirect.h_k0 = (double *)malloc(ni * sizeof(double));
+  gDirect.h_k1 = (double *)malloc(ni * sizeof(double));
+  gDirect.h_k2 = (double *)malloc(ni * sizeof(double));
+  gDirect.h_k3 = (double *)malloc(ni * sizeof(double));
+  if (!gDirect.h_k0 || !gDirect.h_k1 || !gDirect.h_k2 || !gDirect.h_k3) {
+    return 0;
+  }
+
+  err = cudaMalloc((void **)&gDirect.d_k0, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_k1, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_k2, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_k3, ni * sizeof(double));
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_sgm, vecBytes);
+  if (err != cudaSuccess) return 0;
+  err = cudaMalloc((void **)&gDirect.d_pot, vecBytes);
+  if (err != cudaSuccess) return 0;
+
+  return 1;
+}
+
+int allocateBlockedDirectArrays(int nPnls, int dstBlockCount) {
+  size_t ni = (size_t)nPnls * (size_t)dstBlockCount;
   size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
   cudaError_t err = cudaSuccess;
 
@@ -730,6 +832,41 @@ int nearfieldBuildThreadCount(int nTasks) {
   return threads;
 }
 
+int directBuildThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_DIRECT_THREADS");
+  unsigned int hc = std::thread::hardware_concurrency();
+  int threads;
+
+  if (env != NULL) {
+    threads = atoi(env);
+  } else if (hc > 0U) {
+    threads = (int)hc;
+  } else {
+    threads = 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 32) {
+    threads = 32;
+  }
+  return threads;
+}
+
+int gpuNearfieldDisjointBuildEnabled(const ssystem *sys) {
+  const char *env = getenv("FABIPB_GPU_NEARFIELD_BUILD_DISJOINT");
+  if (env == NULL || atoi(env) == 0) {
+    return 0;
+  }
+  if (sys->maxQuadOrder != 1) {
+    return 0;
+  }
+  return 1;
+}
+
 void buildM2LIndexTables() {
   int i = 0;
   int n, i1, i2;
@@ -758,7 +895,6 @@ int buildM2LTables(const ssystem *sys) {
   int cubeIdx;
   int pairIdx;
   int groupIdx;
-  double t0;
   double r[3];
 
   gM2L.sys = sys;
@@ -810,7 +946,6 @@ int buildM2LTables(const ssystem *sys) {
     gM2L.h_groupOrder[groupIdx] = sys->m2lPairOrder[start];
   }
 
-  t0 = wall_seconds_cuda_local();
   for (pairIdx = 0; pairIdx < sys->nM2LPairsFlat; pairIdx++) {
     cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[pairIdx]];
     cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[pairIdx]];
@@ -827,7 +962,6 @@ int buildM2LTables(const ssystem *sys) {
     memcpy(&gM2L.h_gk[coeffOffset], dGk[0], (size_t)nMom * sizeof(double));
     gM2L.h_pairCoeffOffset[pairIdx + 1] = coeffOffset + nMom;
   }
-  (void)t0;
 
   if (!allocateM2LDeviceArrays()) {
     return 0;
@@ -954,6 +1088,8 @@ int buildNearfieldTables(const ssystem *sys) {
   long long totalInteractions = 0;
   long long k = 0;
   double t0, t1;
+  int collectCaseCounts = (sys->benchmarkMode > 0);
+  int useGpuDisjointBuild = gpuNearfieldDisjointBuildEnabled(sys);
 
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
     int srcLeaf = sys->nearPairSrc[pairIdx];
@@ -968,8 +1104,16 @@ int buildNearfieldTables(const ssystem *sys) {
   }
   gNear.sys = sys;
   gNear.nearfieldMode = sys->gpuNearfieldMode;
+  gNear.caseDisjointCount = 0;
+  gNear.caseOneCommonCount = 0;
+  gNear.caseTwoCommonCount = 0;
+  gNear.caseTwoCommonRevCount = 0;
+  gNear.caseSelfCount = 0;
   t0 = wall_seconds_cuda_local();
   if (!allocateHostArrays(totalInteractions)) {
+    return 0;
+  }
+  if (!buildNearfieldPanelGeometry(sys)) {
     return 0;
   }
 
@@ -1012,27 +1156,51 @@ int buildNearfieldTables(const ssystem *sys) {
             long long idx = base + (long long)i * (long long)srcCount + (long long)j;
             int srcPanelIdx = srcStart + j;
             panel *pnlY = sys->panelByIdx[srcPanelIdx];
-            double *KER = panelIA0(pnlX, pnlY);
-
+            int idxX[3], idxY[3];
+            int nVtx = 0;
+            if (collectCaseCounts || useGpuDisjointBuild) {
+              nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+            }
+            if (collectCaseCounts) {
+              int caseIdx = nearCaseIndex(nVtx);
+              switch (caseIdx) {
+                case 0: gNear.caseDisjointCount++; break;
+                case 1: gNear.caseOneCommonCount++; break;
+                case 2: gNear.caseTwoCommonCount++; break;
+                case 3: gNear.caseTwoCommonRevCount++; break;
+                case 4: gNear.caseSelfCount++; break;
+                default: break;
+              }
+            }
             gNear.h_dst[idx] = dstPanelIdx;
             gNear.h_src[idx] = srcPanelIdx;
-            gNear.h_k0[idx] = KER[0];
-            gNear.h_k1[idx] = KER[1];
-            gNear.h_k2[idx] = KER[2];
-            gNear.h_k3[idx] = KER[3];
+            if (useGpuDisjointBuild && nVtx == 0) {
+              gNear.h_k0[idx] = 0.0;
+              gNear.h_k1[idx] = 0.0;
+              gNear.h_k2[idx] = 0.0;
+              gNear.h_k3[idx] = 0.0;
+            } else {
+              double *KER = panelIA0(pnlX, pnlY);
+              gNear.h_k0[idx] = KER[0];
+              gNear.h_k1[idx] = KER[1];
+              gNear.h_k2[idx] = KER[2];
+              gNear.h_k3[idx] = KER[3];
+            }
           }
         }
       }
     } else {
       std::vector<std::thread> workers;
+      std::vector<long long> threadCounts((size_t)nThreads * 5U, 0);
       int t;
 
       workers.reserve((size_t)nThreads);
       for (t = 0; t < nThreads; t++) {
         int begin = (sys->nNearPairsFlat * t) / nThreads;
         int end = (sys->nNearPairsFlat * (t + 1)) / nThreads;
-        workers.emplace_back([=]() {
+        workers.emplace_back([=, &threadCounts]() {
           int localPairIdx;
+          long long *localCounts = &threadCounts[(size_t)t * 5U];
           for (localPairIdx = begin; localPairIdx < end; localPairIdx++) {
             int srcLeaf = sys->nearPairSrc[localPairIdx];
             int dstLeaf = sys->nearPairDst[localPairIdx];
@@ -1050,14 +1218,31 @@ int buildNearfieldTables(const ssystem *sys) {
                 long long idx = base + (long long)i * (long long)srcCount + (long long)j;
                 int srcPanelIdx = srcStart + j;
                 panel *pnlY = sys->panelByIdx[srcPanelIdx];
-                double *KER = panelIA0(pnlX, pnlY);
-
+                int idxX[3], idxY[3];
+                int nVtx = 0;
+                if (collectCaseCounts || useGpuDisjointBuild) {
+                  nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+                }
+                if (collectCaseCounts) {
+                  int caseIdx = nearCaseIndex(nVtx);
+                  if (caseIdx >= 0) {
+                    localCounts[caseIdx]++;
+                  }
+                }
                 gNear.h_dst[idx] = dstPanelIdx;
                 gNear.h_src[idx] = srcPanelIdx;
-                gNear.h_k0[idx] = KER[0];
-                gNear.h_k1[idx] = KER[1];
-                gNear.h_k2[idx] = KER[2];
-                gNear.h_k3[idx] = KER[3];
+                if (useGpuDisjointBuild && nVtx == 0) {
+                  gNear.h_k0[idx] = 0.0;
+                  gNear.h_k1[idx] = 0.0;
+                  gNear.h_k2[idx] = 0.0;
+                  gNear.h_k3[idx] = 0.0;
+                } else {
+                  double *KER = panelIA0(pnlX, pnlY);
+                  gNear.h_k0[idx] = KER[0];
+                  gNear.h_k1[idx] = KER[1];
+                  gNear.h_k2[idx] = KER[2];
+                  gNear.h_k3[idx] = KER[3];
+                }
               }
             }
           }
@@ -1065,17 +1250,29 @@ int buildNearfieldTables(const ssystem *sys) {
       }
       for (t = 0; t < nThreads; t++) {
         workers[(size_t)t].join();
+        if (collectCaseCounts) {
+          long long *localCounts = &threadCounts[(size_t)t * 5U];
+          gNear.caseDisjointCount += localCounts[0];
+          gNear.caseOneCommonCount += localCounts[1];
+          gNear.caseTwoCommonCount += localCounts[2];
+          gNear.caseTwoCommonRevCount += localCounts[3];
+          gNear.caseSelfCount += localCounts[4];
+        }
       }
     }
   }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuCoeffTime += (t1 - t0);
 
+  gNear.nPnls = sys->nPnls;
+  gNear.nInteractions = totalInteractions;
   t0 = wall_seconds_cuda_local();
   if (!allocateDeviceArrays(sys->nPnls, totalInteractions)) {
     return 0;
   }
 
+  if (cudaMemcpy(gNear.d_panels, gNear.h_panels,
+                 (size_t)sys->nPnls * sizeof(NearPanelGeom), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_src, gNear.h_src, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_dst, gNear.h_dst, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_pairSrcCount, gNear.h_pairSrcCount, (size_t)sys->nNearPairsFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
@@ -1090,82 +1287,204 @@ int buildNearfieldTables(const ssystem *sys) {
   t1 = wall_seconds_cuda_local();
   fmmNearGpuUploadTime += (t1 - t0);
 
-  gNear.nPnls = sys->nPnls;
-  gNear.nInteractions = totalInteractions;
-  if (sys->benchmarkMode > 0)
+  if (useGpuDisjointBuild && gNear.caseDisjointCount > 0) {
+    int blockSize = 256;
+    int gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
+    if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    t0 = wall_seconds_cuda_local();
+    nearfieldDisjointQ1BuildKernel<<<gridSize, blockSize>>>(
+        gNear.nInteractions, gNear.d_panels, gNear.d_src, gNear.d_dst,
+        gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    t1 = wall_seconds_cuda_local();
+    fmmNearGpuCoeffTime += (t1 - t0);
+  }
+  if (sys->benchmarkMode > 0) {
     printf("GPU nearfield cache: panel-pairs=%lld mode=%d\n", totalInteractions, sys->gpuNearfieldMode);
+    printf("GPU nearfield panelIA0 cases: disjoint=%lld one-common=%lld two-common=%lld two-common-rev=%lld self=%lld\n",
+           gNear.caseDisjointCount, gNear.caseOneCommonCount, gNear.caseTwoCommonCount,
+           gNear.caseTwoCommonRevCount, gNear.caseSelfCount);
+    printf("GPU nearfield stage2 metadata: panels=%d disjoint-interactions=%lld\n",
+           sys->nPnls, gNear.caseDisjointCount);
+    if (useGpuDisjointBuild) {
+      printf("GPU nearfield stage2 mode: disjoint-q1 builder enabled\n");
+    }
+  }
   return 1;
 }
 
 int buildDirectTables(const ssystem *sys) {
   long long nInteractions;
   size_t coeffBytes;
+  size_t blockCoeffBytes;
   size_t vecBytes;
   size_t totalBytes;
   size_t hostCoeffBytes;
   size_t combinedBytes;
+  size_t blockHostCoeffBytes;
+  size_t blockTotalBytes;
+  size_t blockCombinedBytes;
+  size_t usableBytes = 0;
   size_t freeBytes = 0, totalGpuBytes = 0;
+  int dstBlockCount;
   int i, j;
+  double t0, t1;
 
   nInteractions = (long long)sys->nPnls * (long long)sys->nPnls;
   if (nInteractions <= 0) {
     return 0;
   }
+  t0 = wall_seconds_cuda_local();
 
   coeffBytes = (size_t)nInteractions * sizeof(double);
   vecBytes = (size_t)(2 * sys->nPnls) * sizeof(double);
   hostCoeffBytes = 4 * coeffBytes;
   totalBytes = 4 * coeffBytes + 2 * vecBytes;
   combinedBytes = hostCoeffBytes + totalBytes;
-  if (sys->benchmarkMode > 0)
+  dstBlockCount = 1;
+  if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
+    size_t safetyBytes = freeBytes / 5;
+    if (safetyBytes < (size_t)(512U * 1024U * 1024U)) {
+      safetyBytes = (size_t)(512U * 1024U * 1024U);
+    }
+    usableBytes = (freeBytes > safetyBytes) ? (freeBytes - safetyBytes) : 0;
+    if (usableBytes > 2 * vecBytes) {
+      size_t coeffBudget = usableBytes - 2 * vecBytes;
+      size_t bytesPerDstPanel = (size_t)sys->nPnls * 4U * sizeof(double);
+      if (bytesPerDstPanel > 0) {
+        size_t candidate = coeffBudget / bytesPerDstPanel;
+        if (candidate > (size_t)sys->nPnls) {
+          candidate = (size_t)sys->nPnls;
+        }
+        if (candidate > 0) {
+          dstBlockCount = (int)candidate;
+        }
+      }
+    }
+  }
+  blockCoeffBytes = (size_t)dstBlockCount * (size_t)sys->nPnls * sizeof(double);
+  blockHostCoeffBytes = 4 * blockCoeffBytes;
+  blockTotalBytes = 4 * blockCoeffBytes + 2 * vecBytes;
+  blockCombinedBytes = blockHostCoeffBytes + blockTotalBytes;
+  if (sys->benchmarkMode > 0) {
     printf("Direct GPU memory estimate: solver-host=%.3f GB host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
            (double)memcount / (1024.0 * 1024.0 * 1024.0),
            (double)hostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
            (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
            (double)combinedBytes / (1024.0 * 1024.0 * 1024.0));
-  if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
+    printf("Blocked direct GPU estimate: dst-block=%d host-coeff=%.3f GB device-total=%.3f GB combined=%.3f GB\n",
+           dstBlockCount,
+           (double)blockHostCoeffBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)blockCombinedBytes / (1024.0 * 1024.0 * 1024.0));
+  }
+  if (freeBytes > 0) {
     if (sys->benchmarkMode > 0)
       printf("Direct GPU device memory: free=%.3f GB total=%.3f GB\n",
              (double)freeBytes / (1024.0 * 1024.0 * 1024.0),
              (double)totalGpuBytes / (1024.0 * 1024.0 * 1024.0));
-    if (totalBytes > freeBytes * 7 / 10) {
-      printf("Direct GPU cache unavailable: need %.3f GB, free %.3f GB\n",
-             (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
-             (double)freeBytes / (1024.0 * 1024.0 * 1024.0));
-      return 0;
-    }
   }
 
-  if (!allocateDirectArrays(sys->nPnls, nInteractions)) {
+  if (freeBytes > 0 && totalBytes <= freeBytes * 7 / 10) {
+    if (!allocateDirectArrays(sys->nPnls, nInteractions)) {
+      return 0;
+    }
+
+    kernel = kernelKER4;
+    {
+      double tc0 = wall_seconds_cuda_local();
+      int nThreads = directBuildThreadCount(sys->nPnls);
+      if (nThreads <= 1) {
+        for (i = 0; i < sys->nPnls; i++) {
+          panel *pnlX = sys->panelByIdx[i];
+          long long base = (long long)i * (long long)sys->nPnls;
+          for (j = 0; j < sys->nPnls; j++) {
+            panel *pnlY = sys->panelByIdx[j];
+            double *KER = panelIA0(pnlX, pnlY);
+            long long idx = base + (long long)j;
+
+            gDirect.h_k0[idx] = KER[0];
+            gDirect.h_k1[idx] = KER[1];
+            gDirect.h_k2[idx] = KER[2];
+            gDirect.h_k3[idx] = KER[3];
+          }
+        }
+      } else {
+        std::vector<std::thread> workers;
+        int t;
+
+        workers.reserve((size_t)nThreads);
+        for (t = 0; t < nThreads; t++) {
+          int begin = (sys->nPnls * t) / nThreads;
+          int end = (sys->nPnls * (t + 1)) / nThreads;
+          workers.emplace_back([=]() {
+            int localI, localJ;
+            for (localI = begin; localI < end; localI++) {
+              panel *pnlX = sys->panelByIdx[localI];
+              long long base = (long long)localI * (long long)sys->nPnls;
+              for (localJ = 0; localJ < sys->nPnls; localJ++) {
+                panel *pnlY = sys->panelByIdx[localJ];
+                double *KER = panelIA0(pnlX, pnlY);
+                long long idx = base + (long long)localJ;
+
+                gDirect.h_k0[idx] = KER[0];
+                gDirect.h_k1[idx] = KER[1];
+                gDirect.h_k2[idx] = KER[2];
+                gDirect.h_k3[idx] = KER[3];
+              }
+            }
+          });
+        }
+        for (t = 0; t < nThreads; t++) {
+          workers[t].join();
+        }
+      }
+      directGpuCoeffTime += (wall_seconds_cuda_local() - tc0);
+    }
+
+    t0 = wall_seconds_cuda_local();
+    if (cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    t1 = wall_seconds_cuda_local();
+    directGpuStoreTime += (t1 - t0);
+
+    gDirect.sys = sys;
+    gDirect.nPnls = sys->nPnls;
+    gDirect.nInteractions = nInteractions;
+    gDirect.mode = 1;
+    gDirect.blockDstCount = sys->nPnls;
+    t1 = wall_seconds_cuda_local();
+    directGpuBuildTime += (t1 - t0);
+    if (sys->benchmarkMode > 0)
+      printf("GPU direct cache: panel-pairs=%lld mode=dense\n", nInteractions);
+    return 1;
+  }
+
+  if (freeBytes > 0 && blockTotalBytes > freeBytes * 7 / 10) {
+    printf("Direct GPU cache unavailable: dense need %.3f GB, blocked need %.3f GB, free %.3f GB\n",
+           (double)totalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)blockTotalBytes / (1024.0 * 1024.0 * 1024.0),
+           (double)freeBytes / (1024.0 * 1024.0 * 1024.0));
     return 0;
   }
 
-  kernel = kernelKER4;
-  for (i = 0; i < sys->nPnls; i++) {
-    panel *pnlX = sys->panelByIdx[i];
-    long long base = (long long)i * (long long)sys->nPnls;
-    for (j = 0; j < sys->nPnls; j++) {
-      panel *pnlY = sys->panelByIdx[j];
-      double *KER = panelIA0(pnlX, pnlY);
-      long long idx = base + (long long)j;
-
-      gDirect.h_k0[idx] = KER[0];
-      gDirect.h_k1[idx] = KER[1];
-      gDirect.h_k2[idx] = KER[2];
-      gDirect.h_k3[idx] = KER[3];
-    }
+  if (!allocateBlockedDirectArrays(sys->nPnls, dstBlockCount)) {
+    return 0;
   }
-
-  if (cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
 
   gDirect.sys = sys;
   gDirect.nPnls = sys->nPnls;
   gDirect.nInteractions = nInteractions;
+  gDirect.mode = 2;
+  gDirect.blockDstCount = dstBlockCount;
+  t1 = wall_seconds_cuda_local();
+  directGpuBuildTime += (t1 - t0);
   if (sys->benchmarkMode > 0)
-    printf("GPU direct cache: panel-pairs=%lld\n", nInteractions);
+    printf("GPU direct cache: panel-pairs=%lld mode=blocked dst-block=%d\n", nInteractions, dstBlockCount);
   return 1;
 }
 
@@ -1323,6 +1642,88 @@ __global__ void rhsApplyKernel(
   sgm[panelIdx + nPnls] = fac * (2.0 * pnl.area * sum1);
 }
 
+__device__ int samePoint3(const double a[3], const double b[3]) {
+  return (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]);
+}
+
+__device__ int nearDisjointCase(const NearPanelGeom *dst, const NearPanelGeom *src) {
+  int i, j;
+  for (i = 0; i < 3; i++) {
+    for (j = 0; j < 3; j++) {
+      if (samePoint3(dst->vtx[i], src->vtx[j])) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+__device__ void kernelKer4Device(
+    const double r[3],
+    const double nrmX[3],
+    const double nrmY[3],
+    double out[4]) {
+  const double fourPiInv = 0.07957747154594767;
+  double r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+  double rnorm = sqrt(r2);
+  double expKa = exp(-c_nearKappa * rnorm);
+  double ip0 = nrmX[0] * nrmY[0] + nrmX[1] * nrmY[1] + nrmX[2] * nrmY[2];
+  double ipX = nrmX[0] * r[0] + nrmX[1] * r[1] + nrmX[2] * r[2];
+  double ipY = nrmY[0] * r[0] + nrmY[1] * r[1] + nrmY[2] * r[2];
+  double G0 = (1.0 / rnorm) * fourPiInv;
+  double Gk = expKa * G0;
+  double coef = (c_nearKappa * rnorm + 1.0) * expKa;
+  double dG0dy = ipY * G0 / r2;
+  double dGkdy = coef * dG0dy;
+  double dG0dx = ipX * G0 / r2;
+  double dGkdx = coef * dG0dx;
+  double ddG0dxdy = (ip0 * G0 - dG0dy * ipX * 3.0) / r2;
+  double ddGkdxdy = coef * ddG0dxdy - c_nearKappa * c_nearKappa * expKa * ipX * dG0dy;
+
+  out[0] = G0 - Gk;
+  out[1] = c_nearEpsilon * dGkdy - dG0dy;
+  out[2] = dGkdx / c_nearEpsilon - dG0dx;
+  out[3] = ddGkdxdy - ddG0dxdy;
+}
+
+__global__ void nearfieldDisjointQ1BuildKernel(
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double *k0,
+    double *k1,
+    double *k2,
+    double *k3) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nInteractions) {
+    return;
+  }
+
+  int srcIdx = src[tid];
+  int dstIdx = dst[tid];
+  const NearPanelGeom *pnlX = &panels[dstIdx];
+  const NearPanelGeom *pnlY = &panels[srcIdx];
+  double r0[3], r1[3], r[3], out[4];
+  int k;
+
+  if (!nearDisjointCase(pnlX, pnlY)) {
+    return;
+  }
+
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k] - pnlY->vtx[0][k];
+    r1[k] = r0[k] + 0.5 * (pnlX->a2[k] + 0.5 * pnlX->a0[k]);
+    r[k] = r1[k] - 0.5 * (pnlY->a2[k] + 0.5 * pnlY->a0[k]);
+  }
+
+  kernelKer4Device(r, pnlX->normal, pnlY->normal, out);
+  k0[tid] = pnlX->area * pnlY->area * out[0];
+  k1[tid] = pnlX->area * pnlY->area * out[1];
+  k2[tid] = pnlX->area * pnlY->area * out[2];
+  k3[tid] = pnlX->area * pnlY->area * out[3];
+}
+
 __global__ void nearfieldLeafApplyKernel(
     int nPnls,
     const int *leafPanelStart,
@@ -1397,6 +1798,60 @@ __global__ void directApplyKernel(
   }
 
   base = (long long)d * (long long)nPnls;
+  for (s = tid; s < nPnls; s += blockDim.x) {
+    long long idx = base + (long long)s;
+    double x_pot = sgm[s];
+    double x_dpdn = sgm[s + nPnls];
+    sumPot += k0[idx] * x_dpdn + k1[idx] * x_pot;
+    sumDpdn += k2[idx] * x_dpdn + k3[idx] * x_pot;
+  }
+
+  shPot[tid] = sumPot;
+  shDpdn[tid] = sumDpdn;
+  __syncthreads();
+
+  for (stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shPot[tid] += shPot[tid + stride];
+      shDpdn[tid] += shDpdn[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    pot[d] = beta * pot[d] + alpha * shPot[0];
+    pot[d + nPnls] = beta * pot[d + nPnls] + alpha * shDpdn[0];
+  }
+}
+
+__global__ void directApplyBlockKernel(
+    int nPnls,
+    int dstStart,
+    int dstCount,
+    const double *k0,
+    const double *k1,
+    const double *k2,
+    const double *k3,
+    double alpha,
+    double beta,
+    const double *sgm,
+    double *pot) {
+  __shared__ double shPot[256];
+  __shared__ double shDpdn[256];
+  int localD = blockIdx.x;
+  int d = dstStart + localD;
+  int tid = threadIdx.x;
+  int s;
+  long long base;
+  double sumPot = 0.0;
+  double sumDpdn = 0.0;
+  int stride;
+
+  if (localD >= dstCount || d >= nPnls) {
+    return;
+  }
+
+  base = (long long)localD * (long long)nPnls;
   for (s = tid; s < nPnls; s += blockDim.x) {
     long long idx = base + (long long)s;
     double x_pot = sgm[s];
@@ -1677,6 +2132,8 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   size_t vecBytes;
   int blockSize;
   int gridSize;
+  int dstStart;
+  double t0, t1;
 
   if (sys == NULL || sgm == NULL || pot == NULL) {
     return 0;
@@ -1691,23 +2148,121 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
   }
 
   vecBytes = (size_t)(2 * gDirect.nPnls) * sizeof(double);
+  t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(gDirect.d_sgm, sgm, vecBytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return 0;
   err = cudaMemcpy(gDirect.d_pot, pot, vecBytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  directGpuH2DTime += (t1 - t0);
 
   blockSize = 256;
-  gridSize = gDirect.nPnls;
-  directApplyKernel<<<gridSize, blockSize>>>(
-      gDirect.nPnls, gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
-      alpha, beta, gDirect.d_sgm, gDirect.d_pot);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return 0;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 0;
+  if (gDirect.mode == 1) {
+    gridSize = gDirect.nPnls;
+    t0 = wall_seconds_cuda_local();
+    directApplyKernel<<<gridSize, blockSize>>>(
+        gDirect.nPnls, gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
+        alpha, beta, gDirect.d_sgm, gDirect.d_pot);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return 0;
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return 0;
+    t1 = wall_seconds_cuda_local();
+    directGpuKernelTime += (t1 - t0);
+  } else if (gDirect.mode == 2) {
+    kernel = kernelKER4;
+    for (dstStart = 0; dstStart < gDirect.nPnls; dstStart += gDirect.blockDstCount) {
+      int dstCount = MIN(gDirect.blockDstCount, gDirect.nPnls - dstStart);
+      size_t coeffBytes = (size_t)dstCount * (size_t)gDirect.nPnls * sizeof(double);
+      int localD, s;
 
+      t0 = wall_seconds_cuda_local();
+      {
+        int nThreads = directBuildThreadCount(dstCount);
+        if (nThreads <= 1) {
+          for (localD = 0; localD < dstCount; localD++) {
+            int d = dstStart + localD;
+            panel *pnlX = sys->panelByIdx[d];
+            long long base = (long long)localD * (long long)gDirect.nPnls;
+            for (s = 0; s < gDirect.nPnls; s++) {
+              panel *pnlY = sys->panelByIdx[s];
+              double *KER = panelIA0(pnlX, pnlY);
+              long long idx = base + (long long)s;
+              gDirect.h_k0[idx] = KER[0];
+              gDirect.h_k1[idx] = KER[1];
+              gDirect.h_k2[idx] = KER[2];
+              gDirect.h_k3[idx] = KER[3];
+            }
+          }
+        } else {
+          std::vector<std::thread> workers;
+          int t;
+
+          workers.reserve((size_t)nThreads);
+          for (t = 0; t < nThreads; t++) {
+            int begin = (dstCount * t) / nThreads;
+            int end = (dstCount * (t + 1)) / nThreads;
+            workers.emplace_back([=]() {
+              int localDst, localS;
+              for (localDst = begin; localDst < end; localDst++) {
+                int d = dstStart + localDst;
+                panel *pnlX = sys->panelByIdx[d];
+                long long base = (long long)localDst * (long long)gDirect.nPnls;
+                for (localS = 0; localS < gDirect.nPnls; localS++) {
+                  panel *pnlY = sys->panelByIdx[localS];
+                  double *KER = panelIA0(pnlX, pnlY);
+                  long long idx = base + (long long)localS;
+                  gDirect.h_k0[idx] = KER[0];
+                  gDirect.h_k1[idx] = KER[1];
+                  gDirect.h_k2[idx] = KER[2];
+                  gDirect.h_k3[idx] = KER[3];
+                }
+              }
+            });
+          }
+          for (t = 0; t < nThreads; t++) {
+            workers[t].join();
+          }
+        }
+      }
+      t1 = wall_seconds_cuda_local();
+      directGpuCoeffTime += (t1 - t0);
+
+      t0 = wall_seconds_cuda_local();
+      err = cudaMemcpy(gDirect.d_k0, gDirect.h_k0, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      err = cudaMemcpy(gDirect.d_k1, gDirect.h_k1, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      err = cudaMemcpy(gDirect.d_k2, gDirect.h_k2, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      err = cudaMemcpy(gDirect.d_k3, gDirect.h_k3, coeffBytes, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess) return 0;
+      t1 = wall_seconds_cuda_local();
+      directGpuStoreTime += (t1 - t0);
+
+      gridSize = dstCount;
+      t0 = wall_seconds_cuda_local();
+      directApplyBlockKernel<<<gridSize, blockSize>>>(
+          gDirect.nPnls, dstStart, dstCount,
+          gDirect.d_k0, gDirect.d_k1, gDirect.d_k2, gDirect.d_k3,
+          alpha, beta, gDirect.d_sgm, gDirect.d_pot);
+      err = cudaGetLastError();
+      if (err != cudaSuccess) return 0;
+      err = cudaDeviceSynchronize();
+      if (err != cudaSuccess) return 0;
+      t1 = wall_seconds_cuda_local();
+      directGpuKernelTime += (t1 - t0);
+      beta = 1.0;
+    }
+  } else {
+    return 0;
+  }
+
+  t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(pot, gDirect.d_pot, vecBytes, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) return 0;
+  t1 = wall_seconds_cuda_local();
+  directGpuD2HTime += (t1 - t0);
   return 1;
 }
 
