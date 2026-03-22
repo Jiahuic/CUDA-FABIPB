@@ -764,6 +764,30 @@ int nearfieldBuildThreadCount(int nTasks) {
   return threads;
 }
 
+int directBuildThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_DIRECT_THREADS");
+  unsigned int hc = std::thread::hardware_concurrency();
+  int threads;
+
+  if (env != NULL) {
+    threads = atoi(env);
+  } else if (hc > 0U) {
+    threads = (int)hc;
+  } else {
+    threads = 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 32) {
+    threads = 32;
+  }
+  return threads;
+}
+
 void buildM2LIndexTables() {
   int i = 0;
   int n, i1, i2;
@@ -1208,18 +1232,50 @@ int buildDirectTables(const ssystem *sys) {
     kernel = kernelKER4;
     {
       double tc0 = wall_seconds_cuda_local();
-      for (i = 0; i < sys->nPnls; i++) {
-        panel *pnlX = sys->panelByIdx[i];
-        long long base = (long long)i * (long long)sys->nPnls;
-        for (j = 0; j < sys->nPnls; j++) {
-          panel *pnlY = sys->panelByIdx[j];
-          double *KER = panelIA0(pnlX, pnlY);
-          long long idx = base + (long long)j;
+      int nThreads = directBuildThreadCount(sys->nPnls);
+      if (nThreads <= 1) {
+        for (i = 0; i < sys->nPnls; i++) {
+          panel *pnlX = sys->panelByIdx[i];
+          long long base = (long long)i * (long long)sys->nPnls;
+          for (j = 0; j < sys->nPnls; j++) {
+            panel *pnlY = sys->panelByIdx[j];
+            double *KER = panelIA0(pnlX, pnlY);
+            long long idx = base + (long long)j;
 
-          gDirect.h_k0[idx] = KER[0];
-          gDirect.h_k1[idx] = KER[1];
-          gDirect.h_k2[idx] = KER[2];
-          gDirect.h_k3[idx] = KER[3];
+            gDirect.h_k0[idx] = KER[0];
+            gDirect.h_k1[idx] = KER[1];
+            gDirect.h_k2[idx] = KER[2];
+            gDirect.h_k3[idx] = KER[3];
+          }
+        }
+      } else {
+        std::vector<std::thread> workers;
+        int t;
+
+        workers.reserve((size_t)nThreads);
+        for (t = 0; t < nThreads; t++) {
+          int begin = (sys->nPnls * t) / nThreads;
+          int end = (sys->nPnls * (t + 1)) / nThreads;
+          workers.emplace_back([=]() {
+            int localI, localJ;
+            for (localI = begin; localI < end; localI++) {
+              panel *pnlX = sys->panelByIdx[localI];
+              long long base = (long long)localI * (long long)sys->nPnls;
+              for (localJ = 0; localJ < sys->nPnls; localJ++) {
+                panel *pnlY = sys->panelByIdx[localJ];
+                double *KER = panelIA0(pnlX, pnlY);
+                long long idx = base + (long long)localJ;
+
+                gDirect.h_k0[idx] = KER[0];
+                gDirect.h_k1[idx] = KER[1];
+                gDirect.h_k2[idx] = KER[2];
+                gDirect.h_k3[idx] = KER[3];
+              }
+            }
+          });
+        }
+        for (t = 0; t < nThreads; t++) {
+          workers[t].join();
         }
       }
       directGpuCoeffTime += (wall_seconds_cuda_local() - tc0);
@@ -1876,18 +1932,52 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
       int localD, s;
 
       t0 = wall_seconds_cuda_local();
-      for (localD = 0; localD < dstCount; localD++) {
-        int d = dstStart + localD;
-        panel *pnlX = sys->panelByIdx[d];
-        long long base = (long long)localD * (long long)gDirect.nPnls;
-        for (s = 0; s < gDirect.nPnls; s++) {
-          panel *pnlY = sys->panelByIdx[s];
-          double *KER = panelIA0(pnlX, pnlY);
-          long long idx = base + (long long)s;
-          gDirect.h_k0[idx] = KER[0];
-          gDirect.h_k1[idx] = KER[1];
-          gDirect.h_k2[idx] = KER[2];
-          gDirect.h_k3[idx] = KER[3];
+      {
+        int nThreads = directBuildThreadCount(dstCount);
+        if (nThreads <= 1) {
+          for (localD = 0; localD < dstCount; localD++) {
+            int d = dstStart + localD;
+            panel *pnlX = sys->panelByIdx[d];
+            long long base = (long long)localD * (long long)gDirect.nPnls;
+            for (s = 0; s < gDirect.nPnls; s++) {
+              panel *pnlY = sys->panelByIdx[s];
+              double *KER = panelIA0(pnlX, pnlY);
+              long long idx = base + (long long)s;
+              gDirect.h_k0[idx] = KER[0];
+              gDirect.h_k1[idx] = KER[1];
+              gDirect.h_k2[idx] = KER[2];
+              gDirect.h_k3[idx] = KER[3];
+            }
+          }
+        } else {
+          std::vector<std::thread> workers;
+          int t;
+
+          workers.reserve((size_t)nThreads);
+          for (t = 0; t < nThreads; t++) {
+            int begin = (dstCount * t) / nThreads;
+            int end = (dstCount * (t + 1)) / nThreads;
+            workers.emplace_back([=]() {
+              int localDst, localS;
+              for (localDst = begin; localDst < end; localDst++) {
+                int d = dstStart + localDst;
+                panel *pnlX = sys->panelByIdx[d];
+                long long base = (long long)localDst * (long long)gDirect.nPnls;
+                for (localS = 0; localS < gDirect.nPnls; localS++) {
+                  panel *pnlY = sys->panelByIdx[localS];
+                  double *KER = panelIA0(pnlX, pnlY);
+                  long long idx = base + (long long)localS;
+                  gDirect.h_k0[idx] = KER[0];
+                  gDirect.h_k1[idx] = KER[1];
+                  gDirect.h_k2[idx] = KER[2];
+                  gDirect.h_k3[idx] = KER[3];
+                }
+              }
+            });
+          }
+          for (t = 0; t < nThreads; t++) {
+            workers[t].join();
+          }
         }
       }
       t1 = wall_seconds_cuda_local();
