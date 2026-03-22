@@ -21,6 +21,7 @@ double directGpuBuildTime, directGpuCoeffTime, directGpuStoreTime, directGpuH2DT
 double mtvApplyFMMTime, mtvTotalTime;
 double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
+long long pcCaseDisjointCount, pcCaseOneCommonCount, pcCaseTwoCommonCount, pcCaseTwoCommonRevCount, pcCaseSelfCount;
 long mtvCalls;
 long gmresMatvecCalls, gmresPsolveCalls;
 
@@ -125,6 +126,24 @@ void printSetupFmmStats(void) {
            setupFmmApplyLayoutTime, setupFmmPanelIndexTime, setupFmmCubeLayoutTime,
            setupFmmM2LPairTime, setupFmmM2LGroupTime, layoutTracked);
   }
+}
+
+void printPrecondSetupStats(void) {
+  long long total;
+
+  if (sys == NULL || sys->benchmarkMode == 0) {
+    return;
+  }
+
+  total = pcCaseDisjointCount + pcCaseOneCommonCount + pcCaseTwoCommonCount +
+          pcCaseTwoCommonRevCount + pcCaseSelfCount;
+  if (total <= 0) {
+    return;
+  }
+
+  printf("Preconditioner panelIA0 cases: disjoint=%lld one-common=%lld two-common=%lld two-common-rev=%lld self=%lld total=%lld\n",
+         pcCaseDisjointCount, pcCaseOneCommonCount, pcCaseTwoCommonCount,
+         pcCaseTwoCommonRevCount, pcCaseSelfCount, total);
 }
 
 void resetGmresStats(void) {

@@ -131,6 +131,7 @@ extern double directGpuBuildTime, directGpuCoeffTime, directGpuStoreTime, direct
 extern double mtvApplyFMMTime, mtvTotalTime;
 extern double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 extern double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
+extern long long pcCaseDisjointCount, pcCaseOneCommonCount, pcCaseTwoCommonCount, pcCaseTwoCommonRevCount, pcCaseSelfCount;
 extern long mtvCalls;
 extern long gmresMatvecCalls, gmresPsolveCalls;
 /* counts of memory usage */
@@ -148,5 +149,6 @@ void resetFmmMatvecStats(void);
 void printFmmMatvecStats(void);
 void printDirectMatvecStats(void);
 void printSetupFmmStats(void);
+void printPrecondSetupStats(void);
 void resetGmresStats(void);
 void printGmresStats(double gmresWallTime);

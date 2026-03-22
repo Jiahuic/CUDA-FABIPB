@@ -463,6 +463,7 @@ int main(int nargs, char *argv[]){
            loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);
   }
   printSetupFmmStats();
+  printPrecondSetupStats();
   printGmresStats(gmres_t);
   if (sys->benchmarkMode > 0 && sys->matvecMode == 0) {
     printFmmMatvecStats();
