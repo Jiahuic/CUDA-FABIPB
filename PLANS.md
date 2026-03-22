@@ -1,3 +1,65 @@
+## Current Status (March 21, 2026)
+
+`main` now includes the validated production path for the PB solver:
+
+- grouped GPU near-field apply
+- cached-LU preconditioner
+- GPU `M2L`
+- GPU `L2P`
+- GPU RHS setup
+- CPU-default `Q2M` with GPU `Q2M` still available for experiments
+- parallel preconditioner setup
+
+Most importantly, the `panelIA0()` near-field setup bottleneck has now been addressed in a staged way:
+
+- Stage 1:
+  - exact `panelIA0()` case histogram added to near-field setup
+  - on `1a63`, disjoint interactions dominate overwhelmingly:
+    - `173,656,278 / 175,399,037`
+- Stage 2:
+  - disjoint-only near-field coefficient generation moved to GPU for `qOrder=1`
+  - touching/singular cases remain on CPU
+  - this is now merged into `main`
+
+Validated `1a63` comparison:
+
+- baseline GPU near-field build:
+  - `ttl = 13.93 s`
+  - `near-build = 7.34 s`
+  - `coeff = 6.58 s`
+- disjoint GPU near-field build:
+  - `ttl = 8.36 s`
+  - `near-build = 1.69 s`
+  - `coeff = 0.89 s`
+- correctness:
+  - same `gmres-its = 13`
+  - same solvation energy `-2385.222778`
+
+This means the high-value part of the `panelIA0()` plan is complete:
+
+- full all-case GPU `panelIA0()` is no longer required for the main paper result
+- singular-case GPU port remains optional future work
+
+Recommended near-field policy going forward:
+
+- keep the disjoint-only GPU builder as the preferred `qOrder=1` setup path
+- keep singular/touching cases on CPU unless a future branch shows clear additional payoff
+- use [`scripts/compare_nearfield_build.sh`](/home/jiahuic/Garage/electrostatics/GPU-FABIPB/scripts/compare_nearfield_build.sh) for baseline vs disjoint-builder comparisons
+
+Remaining paper-oriented priorities:
+
+1. adaptive choice of `nLev` and `SepRat`
+2. clean direct-sum appendix:
+   - CPU direct
+   - GPU direct
+   - CPU FMM
+   - hybrid GPU-FMM
+3. benchmark tables and final figure selection
+
+Historical planning notes follow below.
+
+---
+
 Below is a concrete, **paper-driven plan** to turn your existing **FMM-based Poisson–Boltzmann (PB) solver** into a **GPU-accelerated** method suitable for a strong computational math / scientific computing journal submission.
 
 ---
