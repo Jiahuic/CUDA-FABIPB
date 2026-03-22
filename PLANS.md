@@ -56,6 +56,16 @@ Remaining paper-oriented priorities:
    - hybrid GPU-FMM
 3. benchmark tables and final figure selection
 
+Possible follow-up, but lower priority than the items above:
+
+- `setupPC()` also uses `panelIA0()` and could potentially reuse the same
+  disjoint-only GPU build idea
+- however, the expected payoff is likely smaller than near-field because the
+  preconditioner builds much smaller local leaf blocks and may have a lower
+  disjoint fraction
+- do not optimize this blindly; first add a `panelIA0()` case histogram for
+  preconditioner assembly and check whether disjoint interactions dominate
+
 Historical planning notes follow below.
 
 ---
