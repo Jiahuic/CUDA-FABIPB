@@ -46,6 +46,15 @@ int nearCaseIndex(int nVtx) {
   }
 }
 
+struct NearPanelGeom {
+  double vtx[3][3];
+  double a0[3];
+  double a1[3];
+  double a2[3];
+  double normal[3];
+  double area;
+};
+
 struct NearfieldGpuCache {
   const ssystem *sys;
   int nPnls;
@@ -56,6 +65,7 @@ struct NearfieldGpuCache {
   long long caseTwoCommonCount;
   long long caseTwoCommonRevCount;
   long long caseSelfCount;
+  NearPanelGeom *h_panels;
   int *h_src;
   int *h_dst;
   int *h_pairSrcCount;
@@ -74,6 +84,7 @@ struct NearfieldGpuCache {
   int *d_leafPanelStart;
   int *d_leafPanelCount;
   int *d_leafPairOffset;
+  NearPanelGeom *d_panels;
   double *d_k0;
   double *d_k1;
   double *d_k2;
@@ -218,8 +229,21 @@ RhsGpuCache gRhs = {};
 
 __constant__ double c_rhsTLeg[10];
 __constant__ double c_rhsWLeg[10];
+__constant__ double c_nearKappa;
+__constant__ double c_nearEpsilon;
+
+__global__ void nearfieldDisjointQ1BuildKernel(
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double *k0,
+    double *k1,
+    double *k2,
+    double *k3);
 
 void freeNearfieldCache() {
+  free(gNear.h_panels);
   free(gNear.h_src);
   free(gNear.h_dst);
   free(gNear.h_pairSrcCount);
@@ -231,6 +255,7 @@ void freeNearfieldCache() {
   free(gNear.h_k1);
   free(gNear.h_k2);
   free(gNear.h_k3);
+  gNear.h_panels = NULL;
   gNear.h_src = NULL;
   gNear.h_dst = NULL;
   gNear.h_pairSrcCount = NULL;
@@ -243,6 +268,7 @@ void freeNearfieldCache() {
   gNear.h_k2 = NULL;
   gNear.h_k3 = NULL;
 
+  cudaFree(gNear.d_panels);
   cudaFree(gNear.d_src);
   cudaFree(gNear.d_dst);
   cudaFree(gNear.d_pairSrcCount);
@@ -256,6 +282,7 @@ void freeNearfieldCache() {
   cudaFree(gNear.d_k3);
   cudaFree(gNear.d_sgm);
   cudaFree(gNear.d_pot);
+  gNear.d_panels = NULL;
   gNear.d_src = NULL;
   gNear.d_dst = NULL;
   gNear.d_pairSrcCount = NULL;
@@ -485,6 +512,7 @@ void freeRhsCache() {
 
 int allocateHostArrays(long long n) {
   size_t ni = (size_t)n;
+  gNear.h_panels = (NearPanelGeom *)malloc((size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
   gNear.h_src = (int *)malloc(ni * sizeof(int));
   gNear.h_dst = (int *)malloc(ni * sizeof(int));
   gNear.h_pairSrcCount = (int *)malloc((size_t)gNear.sys->nNearPairsFlat * sizeof(int));
@@ -496,7 +524,7 @@ int allocateHostArrays(long long n) {
   gNear.h_k1 = (double *)malloc(ni * sizeof(double));
   gNear.h_k2 = (double *)malloc(ni * sizeof(double));
   gNear.h_k3 = (double *)malloc(ni * sizeof(double));
-  if (!gNear.h_src || !gNear.h_dst || !gNear.h_pairSrcCount ||
+  if (!gNear.h_panels || !gNear.h_src || !gNear.h_dst || !gNear.h_pairSrcCount ||
       !gNear.h_pairInteractionOffset || !gNear.h_leafPanelStart ||
       !gNear.h_leafPanelCount || !gNear.h_leafPairOffset ||
       !gNear.h_k0 || !gNear.h_k1 || !gNear.h_k2 || !gNear.h_k3) {
@@ -510,6 +538,8 @@ int allocateDeviceArrays(int nPnls, long long nInteractions) {
   size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
   cudaError_t err = cudaSuccess;
 
+  err = cudaMalloc((void **)&gNear.d_panels, (size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
+  if (err != cudaSuccess) return 0;
   err = cudaMalloc((void **)&gNear.d_src, ni * sizeof(int));
   if (err != cudaSuccess) return 0;
   err = cudaMalloc((void **)&gNear.d_dst, ni * sizeof(int));
@@ -537,6 +567,27 @@ int allocateDeviceArrays(int nPnls, long long nInteractions) {
   err = cudaMalloc((void **)&gNear.d_pot, vecBytes);
   if (err != cudaSuccess) return 0;
 
+  return 1;
+}
+
+int buildNearfieldPanelGeometry(const ssystem *sys) {
+  int i, j, k;
+
+  for (i = 0; i < sys->nPnls; i++) {
+    panel *pnl = sys->panelByIdx[i];
+    for (j = 0; j < 3; j++) {
+      for (k = 0; k < 3; k++) {
+        gNear.h_panels[i].vtx[j][k] = pnl->vtx[j][k];
+      }
+    }
+    for (k = 0; k < 3; k++) {
+      gNear.h_panels[i].a0[k] = pnl->a[0][k];
+      gNear.h_panels[i].a1[k] = pnl->a[1][k];
+      gNear.h_panels[i].a2[k] = pnl->a[2][k];
+      gNear.h_panels[i].normal[k] = pnl->normal[k];
+    }
+    gNear.h_panels[i].area = pnl->area;
+  }
   return 1;
 }
 
@@ -805,6 +856,17 @@ int directBuildThreadCount(int nTasks) {
   return threads;
 }
 
+int gpuNearfieldDisjointBuildEnabled(const ssystem *sys) {
+  const char *env = getenv("FABIPB_GPU_NEARFIELD_BUILD_DISJOINT");
+  if (env == NULL || atoi(env) == 0) {
+    return 0;
+  }
+  if (sys->maxQuadOrder != 1) {
+    return 0;
+  }
+  return 1;
+}
+
 void buildM2LIndexTables() {
   int i = 0;
   int n, i1, i2;
@@ -1027,6 +1089,7 @@ int buildNearfieldTables(const ssystem *sys) {
   long long k = 0;
   double t0, t1;
   int collectCaseCounts = (sys->benchmarkMode > 0);
+  int useGpuDisjointBuild = gpuNearfieldDisjointBuildEnabled(sys);
 
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
     int srcLeaf = sys->nearPairSrc[pairIdx];
@@ -1048,6 +1111,9 @@ int buildNearfieldTables(const ssystem *sys) {
   gNear.caseSelfCount = 0;
   t0 = wall_seconds_cuda_local();
   if (!allocateHostArrays(totalInteractions)) {
+    return 0;
+  }
+  if (!buildNearfieldPanelGeometry(sys)) {
     return 0;
   }
 
@@ -1090,9 +1156,13 @@ int buildNearfieldTables(const ssystem *sys) {
             long long idx = base + (long long)i * (long long)srcCount + (long long)j;
             int srcPanelIdx = srcStart + j;
             panel *pnlY = sys->panelByIdx[srcPanelIdx];
+            int idxX[3], idxY[3];
+            int nVtx = 0;
+            if (collectCaseCounts || useGpuDisjointBuild) {
+              nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+            }
             if (collectCaseCounts) {
-              int idxX[3], idxY[3];
-              int caseIdx = nearCaseIndex(nrCommonVtx(pnlX, pnlY, idxX, idxY));
+              int caseIdx = nearCaseIndex(nVtx);
               switch (caseIdx) {
                 case 0: gNear.caseDisjointCount++; break;
                 case 1: gNear.caseOneCommonCount++; break;
@@ -1102,14 +1172,20 @@ int buildNearfieldTables(const ssystem *sys) {
                 default: break;
               }
             }
-            double *KER = panelIA0(pnlX, pnlY);
-
             gNear.h_dst[idx] = dstPanelIdx;
             gNear.h_src[idx] = srcPanelIdx;
-            gNear.h_k0[idx] = KER[0];
-            gNear.h_k1[idx] = KER[1];
-            gNear.h_k2[idx] = KER[2];
-            gNear.h_k3[idx] = KER[3];
+            if (useGpuDisjointBuild && nVtx == 0) {
+              gNear.h_k0[idx] = 0.0;
+              gNear.h_k1[idx] = 0.0;
+              gNear.h_k2[idx] = 0.0;
+              gNear.h_k3[idx] = 0.0;
+            } else {
+              double *KER = panelIA0(pnlX, pnlY);
+              gNear.h_k0[idx] = KER[0];
+              gNear.h_k1[idx] = KER[1];
+              gNear.h_k2[idx] = KER[2];
+              gNear.h_k3[idx] = KER[3];
+            }
           }
         }
       }
@@ -1142,21 +1218,31 @@ int buildNearfieldTables(const ssystem *sys) {
                 long long idx = base + (long long)i * (long long)srcCount + (long long)j;
                 int srcPanelIdx = srcStart + j;
                 panel *pnlY = sys->panelByIdx[srcPanelIdx];
+                int idxX[3], idxY[3];
+                int nVtx = 0;
+                if (collectCaseCounts || useGpuDisjointBuild) {
+                  nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+                }
                 if (collectCaseCounts) {
-                  int idxX[3], idxY[3];
-                  int caseIdx = nearCaseIndex(nrCommonVtx(pnlX, pnlY, idxX, idxY));
+                  int caseIdx = nearCaseIndex(nVtx);
                   if (caseIdx >= 0) {
                     localCounts[caseIdx]++;
                   }
                 }
-                double *KER = panelIA0(pnlX, pnlY);
-
                 gNear.h_dst[idx] = dstPanelIdx;
                 gNear.h_src[idx] = srcPanelIdx;
-                gNear.h_k0[idx] = KER[0];
-                gNear.h_k1[idx] = KER[1];
-                gNear.h_k2[idx] = KER[2];
-                gNear.h_k3[idx] = KER[3];
+                if (useGpuDisjointBuild && nVtx == 0) {
+                  gNear.h_k0[idx] = 0.0;
+                  gNear.h_k1[idx] = 0.0;
+                  gNear.h_k2[idx] = 0.0;
+                  gNear.h_k3[idx] = 0.0;
+                } else {
+                  double *KER = panelIA0(pnlX, pnlY);
+                  gNear.h_k0[idx] = KER[0];
+                  gNear.h_k1[idx] = KER[1];
+                  gNear.h_k2[idx] = KER[2];
+                  gNear.h_k3[idx] = KER[3];
+                }
               }
             }
           }
@@ -1178,11 +1264,15 @@ int buildNearfieldTables(const ssystem *sys) {
   t1 = wall_seconds_cuda_local();
   fmmNearGpuCoeffTime += (t1 - t0);
 
+  gNear.nPnls = sys->nPnls;
+  gNear.nInteractions = totalInteractions;
   t0 = wall_seconds_cuda_local();
   if (!allocateDeviceArrays(sys->nPnls, totalInteractions)) {
     return 0;
   }
 
+  if (cudaMemcpy(gNear.d_panels, gNear.h_panels,
+                 (size_t)sys->nPnls * sizeof(NearPanelGeom), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_src, gNear.h_src, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_dst, gNear.h_dst, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gNear.d_pairSrcCount, gNear.h_pairSrcCount, (size_t)sys->nNearPairsFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
@@ -1197,13 +1287,30 @@ int buildNearfieldTables(const ssystem *sys) {
   t1 = wall_seconds_cuda_local();
   fmmNearGpuUploadTime += (t1 - t0);
 
-  gNear.nPnls = sys->nPnls;
-  gNear.nInteractions = totalInteractions;
+  if (useGpuDisjointBuild && gNear.caseDisjointCount > 0) {
+    int blockSize = 256;
+    int gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
+    if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    t0 = wall_seconds_cuda_local();
+    nearfieldDisjointQ1BuildKernel<<<gridSize, blockSize>>>(
+        gNear.nInteractions, gNear.d_panels, gNear.d_src, gNear.d_dst,
+        gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    t1 = wall_seconds_cuda_local();
+    fmmNearGpuCoeffTime += (t1 - t0);
+  }
   if (sys->benchmarkMode > 0) {
     printf("GPU nearfield cache: panel-pairs=%lld mode=%d\n", totalInteractions, sys->gpuNearfieldMode);
     printf("GPU nearfield panelIA0 cases: disjoint=%lld one-common=%lld two-common=%lld two-common-rev=%lld self=%lld\n",
            gNear.caseDisjointCount, gNear.caseOneCommonCount, gNear.caseTwoCommonCount,
            gNear.caseTwoCommonRevCount, gNear.caseSelfCount);
+    printf("GPU nearfield stage2 metadata: panels=%d disjoint-interactions=%lld\n",
+           sys->nPnls, gNear.caseDisjointCount);
+    if (useGpuDisjointBuild) {
+      printf("GPU nearfield stage2 mode: disjoint-q1 builder enabled\n");
+    }
   }
   return 1;
 }
@@ -1533,6 +1640,88 @@ __global__ void rhsApplyKernel(
 
   sgm[panelIdx] = fac * (2.0 * pnl.area * sum0);
   sgm[panelIdx + nPnls] = fac * (2.0 * pnl.area * sum1);
+}
+
+__device__ int samePoint3(const double a[3], const double b[3]) {
+  return (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]);
+}
+
+__device__ int nearDisjointCase(const NearPanelGeom *dst, const NearPanelGeom *src) {
+  int i, j;
+  for (i = 0; i < 3; i++) {
+    for (j = 0; j < 3; j++) {
+      if (samePoint3(dst->vtx[i], src->vtx[j])) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+__device__ void kernelKer4Device(
+    const double r[3],
+    const double nrmX[3],
+    const double nrmY[3],
+    double out[4]) {
+  const double fourPiInv = 0.07957747154594767;
+  double r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+  double rnorm = sqrt(r2);
+  double expKa = exp(-c_nearKappa * rnorm);
+  double ip0 = nrmX[0] * nrmY[0] + nrmX[1] * nrmY[1] + nrmX[2] * nrmY[2];
+  double ipX = nrmX[0] * r[0] + nrmX[1] * r[1] + nrmX[2] * r[2];
+  double ipY = nrmY[0] * r[0] + nrmY[1] * r[1] + nrmY[2] * r[2];
+  double G0 = (1.0 / rnorm) * fourPiInv;
+  double Gk = expKa * G0;
+  double coef = (c_nearKappa * rnorm + 1.0) * expKa;
+  double dG0dy = ipY * G0 / r2;
+  double dGkdy = coef * dG0dy;
+  double dG0dx = ipX * G0 / r2;
+  double dGkdx = coef * dG0dx;
+  double ddG0dxdy = (ip0 * G0 - dG0dy * ipX * 3.0) / r2;
+  double ddGkdxdy = coef * ddG0dxdy - c_nearKappa * c_nearKappa * expKa * ipX * dG0dy;
+
+  out[0] = G0 - Gk;
+  out[1] = c_nearEpsilon * dGkdy - dG0dy;
+  out[2] = dGkdx / c_nearEpsilon - dG0dx;
+  out[3] = ddGkdxdy - ddG0dxdy;
+}
+
+__global__ void nearfieldDisjointQ1BuildKernel(
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double *k0,
+    double *k1,
+    double *k2,
+    double *k3) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nInteractions) {
+    return;
+  }
+
+  int srcIdx = src[tid];
+  int dstIdx = dst[tid];
+  const NearPanelGeom *pnlX = &panels[dstIdx];
+  const NearPanelGeom *pnlY = &panels[srcIdx];
+  double r0[3], r1[3], r[3], out[4];
+  int k;
+
+  if (!nearDisjointCase(pnlX, pnlY)) {
+    return;
+  }
+
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k] - pnlY->vtx[0][k];
+    r1[k] = r0[k] + 0.5 * (pnlX->a2[k] + 0.5 * pnlX->a0[k]);
+    r[k] = r1[k] - 0.5 * (pnlY->a2[k] + 0.5 * pnlY->a0[k]);
+  }
+
+  kernelKer4Device(r, pnlX->normal, pnlY->normal, out);
+  k0[tid] = pnlX->area * pnlY->area * out[0];
+  k1[tid] = pnlX->area * pnlY->area * out[1];
+  k2[tid] = pnlX->area * pnlY->area * out[2];
+  k3[tid] = pnlX->area * pnlY->area * out[3];
 }
 
 __global__ void nearfieldLeafApplyKernel(
