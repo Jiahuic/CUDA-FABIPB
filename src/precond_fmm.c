@@ -497,6 +497,7 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       cube **applyCubes = (cube **)calloc((size_t)nPrecondBlocks, sizeof(cube *));
       pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
       PrecondApplyTask *tasks = (PrecondApplyTask *)calloc((size_t)nThreads, sizeof(PrecondApplyTask));
+      double wallStart, wallEnd;
       ASSERT(applyCubes != NULL);
       ASSERT(threads != NULL);
       ASSERT(tasks != NULL);
@@ -504,6 +505,7 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
         applyCubes[idx] = cb;
       }
+      wallStart = wall_seconds_pc();
       for (idx = 0; idx < nThreads; idx++) {
         int maxRhs = 2 * pcBlockSizeMax;
         tasks[idx].cubes = applyCubes;
@@ -523,9 +525,6 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       }
       for (idx = 0; idx < nThreads; idx++) {
         pthread_join(threads[idx], NULL);
-        pcAssembleTime += tasks[idx].assembleTime;
-        pcSolveTime += tasks[idx].solveTime;
-        pcScatterTime += tasks[idx].scatterTime;
         if (tasks[idx].info != 0) {
           fprintf(stderr, "Error: dgetrs failed in cached LU apply for leaf %d (info=%d)\n",
                   tasks[idx].failedIdx, tasks[idx].info);
@@ -533,6 +532,8 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
         }
         free(tasks[idx].rhsLocal);
       }
+      wallEnd = wall_seconds_pc();
+      pcSolveTime += wallEnd - wallStart;
       free(tasks);
       free(threads);
       free(applyCubes);
