@@ -464,6 +464,7 @@ int main(int nargs, char *argv[]){
   }
   printSetupFmmStats();
   printPrecondSetupStats();
+  printPrecondApplyStats();
   printGmresStats(gmres_t);
   if (sys->benchmarkMode > 0 && sys->matvecMode == 0) {
     printFmmMatvecStats();

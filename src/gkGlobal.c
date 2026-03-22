@@ -22,6 +22,8 @@ double mtvApplyFMMTime, mtvTotalTime;
 double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
 long long pcCaseDisjointCount, pcCaseOneCommonCount, pcCaseTwoCommonCount, pcCaseTwoCommonRevCount, pcCaseSelfCount;
+long long pcBlockCount, pcBlockSizeSum, pcBlockSizeSqSum;
+int pcBlockSizeMin, pcBlockSizeMax;
 long mtvCalls;
 long gmresMatvecCalls, gmresPsolveCalls;
 
@@ -144,6 +146,22 @@ void printPrecondSetupStats(void) {
   printf("Preconditioner panelIA0 cases: disjoint=%lld one-common=%lld two-common=%lld two-common-rev=%lld self=%lld total=%lld\n",
          pcCaseDisjointCount, pcCaseOneCommonCount, pcCaseTwoCommonCount,
          pcCaseTwoCommonRevCount, pcCaseSelfCount, total);
+}
+
+void printPrecondApplyStats(void) {
+  double avgSize, rmsSize;
+
+  if (sys == NULL || sys->benchmarkMode == 0) {
+    return;
+  }
+  if (pcBlockCount <= 0) {
+    return;
+  }
+
+  avgSize = (double)pcBlockSizeSum / (double)pcBlockCount;
+  rmsSize = sqrt((double)pcBlockSizeSqSum / (double)pcBlockCount);
+  printf("Preconditioner block stats: blocks=%lld min=%d max=%d avg=%.2f rms=%.2f\n",
+         pcBlockCount, pcBlockSizeMin, pcBlockSizeMax, avgSize, rmsSize);
 }
 
 void resetGmresStats(void) {

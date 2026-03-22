@@ -132,6 +132,8 @@ extern double mtvApplyFMMTime, mtvTotalTime;
 extern double gmresMatvecTime, gmresPsolveTime, gmresBasisTime, gmresUpdateTime, gmresResidualTime;
 extern double pcAssembleTime, pcFactorTime, pcSolveTime, pcScatterTime;
 extern long long pcCaseDisjointCount, pcCaseOneCommonCount, pcCaseTwoCommonCount, pcCaseTwoCommonRevCount, pcCaseSelfCount;
+extern long long pcBlockCount, pcBlockSizeSum, pcBlockSizeSqSum;
+extern int pcBlockSizeMin, pcBlockSizeMax;
 extern long mtvCalls;
 extern long gmresMatvecCalls, gmresPsolveCalls;
 /* counts of memory usage */
@@ -150,5 +152,6 @@ void printFmmMatvecStats(void);
 void printDirectMatvecStats(void);
 void printSetupFmmStats(void);
 void printPrecondSetupStats(void);
+void printPrecondApplyStats(void);
 void resetGmresStats(void);
 void printGmresStats(double gmresWallTime);
