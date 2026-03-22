@@ -222,9 +222,9 @@ run_direct_case() {
 
 direct_status_from_log() {
   log="$1"
-  if rg -q "Direct GPU matvec unavailable; using FMM path\\." "$log"; then
+  if grep -q "Direct GPU matvec unavailable; using FMM path\\." "$log"; then
     echo "fallback"
-  elif rg -q "GPU direct cache: panel-pairs=" "$log"; then
+  elif grep -q "GPU direct cache: panel-pairs=" "$log"; then
     echo "direct"
   else
     echo "unknown"
