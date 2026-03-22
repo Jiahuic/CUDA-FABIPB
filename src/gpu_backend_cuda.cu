@@ -966,10 +966,10 @@ int directBuildThreadCount(int nTasks) {
 
 int gpuNearfieldDisjointBuildEnabled(const ssystem *sys) {
   const char *env = getenv("FABIPB_GPU_NEARFIELD_BUILD_DISJOINT");
-  if (env == NULL || atoi(env) == 0) {
+  if (sys->maxQuadOrder != 1) {
     return 0;
   }
-  if (sys->maxQuadOrder != 1) {
+  if (env != NULL && atoi(env) == 0) {
     return 0;
   }
   return 1;

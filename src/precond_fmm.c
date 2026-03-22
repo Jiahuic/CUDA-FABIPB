@@ -115,7 +115,7 @@ static int applyThreadCountPc(int nTasks) {
 static int useGpuPrecondDisjoint(const ssystem *sys) {
   const char *env = getenv("FABIPB_GPU_PRECOND_BUILD_DISJOINT");
   return (sys != NULL && sys->gpuMode > 0 && sys->maxQuadOrder == 1 &&
-          env != NULL && atoi(env) > 0);
+          !(env != NULL && atoi(env) == 0));
 }
 
 static void *precondSetupWorker(void *arg) {
