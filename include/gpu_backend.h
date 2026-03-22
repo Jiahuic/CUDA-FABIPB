@@ -1,6 +1,7 @@
 #ifndef GPU_BACKEND_H
 #define GPU_BACKEND_H
 
+struct panel;
 struct ssystem;
 
 #ifdef __cplusplus
