@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <thread>
 #include <vector>
+#include <mutex>
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
 extern "C" int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
@@ -202,6 +203,28 @@ struct DirectGpuCache {
 };
 
 DirectGpuCache gDirect = {};
+
+struct PrecondGpuCache {
+  int panelCapacity;
+  int pairCapacity;
+  NearPanelGeom *h_panels;
+  int *h_src;
+  int *h_dst;
+  double *h_k0;
+  double *h_k1;
+  double *h_k2;
+  double *h_k3;
+  NearPanelGeom *d_panels;
+  int *d_src;
+  int *d_dst;
+  double *d_k0;
+  double *d_k1;
+  double *d_k2;
+  double *d_k3;
+};
+
+PrecondGpuCache gPrecond = {};
+std::mutex gPrecondMutex;
 
 struct RhsPanelGeom {
   double v0[3];
@@ -508,6 +531,91 @@ void freeRhsCache() {
   gRhs.nPnls = 0;
   gRhs.nChar = 0;
   gRhs.qOrder = 0;
+}
+
+void freePrecondCache() {
+  free(gPrecond.h_panels);
+  free(gPrecond.h_src);
+  free(gPrecond.h_dst);
+  free(gPrecond.h_k0);
+  free(gPrecond.h_k1);
+  free(gPrecond.h_k2);
+  free(gPrecond.h_k3);
+  gPrecond.h_panels = NULL;
+  gPrecond.h_src = NULL;
+  gPrecond.h_dst = NULL;
+  gPrecond.h_k0 = NULL;
+  gPrecond.h_k1 = NULL;
+  gPrecond.h_k2 = NULL;
+  gPrecond.h_k3 = NULL;
+
+  cudaFree(gPrecond.d_panels);
+  cudaFree(gPrecond.d_src);
+  cudaFree(gPrecond.d_dst);
+  cudaFree(gPrecond.d_k0);
+  cudaFree(gPrecond.d_k1);
+  cudaFree(gPrecond.d_k2);
+  cudaFree(gPrecond.d_k3);
+  gPrecond.d_panels = NULL;
+  gPrecond.d_src = NULL;
+  gPrecond.d_dst = NULL;
+  gPrecond.d_k0 = NULL;
+  gPrecond.d_k1 = NULL;
+  gPrecond.d_k2 = NULL;
+  gPrecond.d_k3 = NULL;
+  gPrecond.panelCapacity = 0;
+  gPrecond.pairCapacity = 0;
+}
+
+int ensurePrecondCapacity(int nPanels, int nPairs) {
+  if (nPanels > gPrecond.panelCapacity) {
+    free(gPrecond.h_panels);
+    cudaFree(gPrecond.d_panels);
+    gPrecond.h_panels = (NearPanelGeom *)malloc((size_t)nPanels * sizeof(NearPanelGeom));
+    if (gPrecond.h_panels == NULL) return 0;
+    if (cudaMalloc((void **)&gPrecond.d_panels, (size_t)nPanels * sizeof(NearPanelGeom)) != cudaSuccess) {
+      freePrecondCache();
+      return 0;
+    }
+    gPrecond.panelCapacity = nPanels;
+  }
+  if (nPairs > gPrecond.pairCapacity) {
+    free(gPrecond.h_src);
+    free(gPrecond.h_dst);
+    free(gPrecond.h_k0);
+    free(gPrecond.h_k1);
+    free(gPrecond.h_k2);
+    free(gPrecond.h_k3);
+    cudaFree(gPrecond.d_src);
+    cudaFree(gPrecond.d_dst);
+    cudaFree(gPrecond.d_k0);
+    cudaFree(gPrecond.d_k1);
+    cudaFree(gPrecond.d_k2);
+    cudaFree(gPrecond.d_k3);
+    gPrecond.h_src = (int *)malloc((size_t)nPairs * sizeof(int));
+    gPrecond.h_dst = (int *)malloc((size_t)nPairs * sizeof(int));
+    gPrecond.h_k0 = (double *)malloc((size_t)nPairs * sizeof(double));
+    gPrecond.h_k1 = (double *)malloc((size_t)nPairs * sizeof(double));
+    gPrecond.h_k2 = (double *)malloc((size_t)nPairs * sizeof(double));
+    gPrecond.h_k3 = (double *)malloc((size_t)nPairs * sizeof(double));
+    if (gPrecond.h_src == NULL || gPrecond.h_dst == NULL ||
+        gPrecond.h_k0 == NULL || gPrecond.h_k1 == NULL ||
+        gPrecond.h_k2 == NULL || gPrecond.h_k3 == NULL) {
+      freePrecondCache();
+      return 0;
+    }
+    if (cudaMalloc((void **)&gPrecond.d_src, (size_t)nPairs * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void **)&gPrecond.d_dst, (size_t)nPairs * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void **)&gPrecond.d_k0, (size_t)nPairs * sizeof(double)) != cudaSuccess ||
+        cudaMalloc((void **)&gPrecond.d_k1, (size_t)nPairs * sizeof(double)) != cudaSuccess ||
+        cudaMalloc((void **)&gPrecond.d_k2, (size_t)nPairs * sizeof(double)) != cudaSuccess ||
+        cudaMalloc((void **)&gPrecond.d_k3, (size_t)nPairs * sizeof(double)) != cudaSuccess) {
+      freePrecondCache();
+      return 0;
+    }
+    gPrecond.pairCapacity = nPairs;
+  }
+  return 1;
 }
 
 int allocateHostArrays(long long n) {
@@ -2501,5 +2609,92 @@ int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
 
   err = cudaMemcpy(sgm, gRhs.d_sgm, sgmBytes, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) return 0;
+  return 1;
+}
+
+int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
+                                 const int *dstLocal, const int *srcLocal,
+                                 int nPairs, double *block) {
+  cudaError_t err;
+  int i, blockSize, gridSize;
+  std::lock_guard<std::mutex> lock(gPrecondMutex);
+
+  if (panels == NULL || dstLocal == NULL || srcLocal == NULL || block == NULL ||
+      nPanels <= 0 || nPairs <= 0) {
+    return 0;
+  }
+
+  if (!ensurePrecondCapacity(nPanels, nPairs)) {
+    return 0;
+  }
+
+  for (i = 0; i < nPanels; i++) {
+    panel *p = panels[i];
+    int j, k;
+    for (j = 0; j < 3; j++) {
+      for (k = 0; k < 3; k++) {
+        gPrecond.h_panels[i].vtx[j][k] = p->vtx[j][k];
+        gPrecond.h_panels[i].a0[k] = p->a[0][k];
+        gPrecond.h_panels[i].a1[k] = p->a[1][k];
+        gPrecond.h_panels[i].a2[k] = p->a[2][k];
+        gPrecond.h_panels[i].normal[k] = p->normal[k];
+      }
+    }
+    gPrecond.h_panels[i].area = p->area;
+  }
+  memcpy(gPrecond.h_dst, dstLocal, (size_t)nPairs * sizeof(int));
+  memcpy(gPrecond.h_src, srcLocal, (size_t)nPairs * sizeof(int));
+
+  if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double)) != cudaSuccess) return 0;
+  if (cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double)) != cudaSuccess) return 0;
+  err = cudaMemcpy(gPrecond.d_panels, gPrecond.h_panels,
+                   (size_t)nPanels * sizeof(NearPanelGeom), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) return 0;
+  err = cudaMemcpy(gPrecond.d_dst, gPrecond.h_dst,
+                   (size_t)nPairs * sizeof(int), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) return 0;
+  err = cudaMemcpy(gPrecond.d_src, gPrecond.h_src,
+                   (size_t)nPairs * sizeof(int), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) return 0;
+
+  blockSize = 256;
+  gridSize = (nPairs + blockSize - 1) / blockSize;
+  nearfieldDisjointQ1BuildKernel<<<gridSize, blockSize>>>(
+      (long long)nPairs,
+      gPrecond.d_panels,
+      gPrecond.d_src,
+      gPrecond.d_dst,
+      gPrecond.d_k0,
+      gPrecond.d_k1,
+      gPrecond.d_k2,
+      gPrecond.d_k3);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return 0;
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) return 0;
+
+  err = cudaMemcpy(gPrecond.h_k0, gPrecond.d_k0,
+                   (size_t)nPairs * sizeof(double), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) return 0;
+  err = cudaMemcpy(gPrecond.h_k1, gPrecond.d_k1,
+                   (size_t)nPairs * sizeof(double), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) return 0;
+  err = cudaMemcpy(gPrecond.h_k2, gPrecond.d_k2,
+                   (size_t)nPairs * sizeof(double), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) return 0;
+  err = cudaMemcpy(gPrecond.h_k3, gPrecond.d_k3,
+                   (size_t)nPairs * sizeof(double), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) return 0;
+
+  for (i = 0; i < nPairs; i++) {
+    int dst = dstLocal[i];
+    int src = srcLocal[i];
+    int hm = nPanels;
+    int msize = 2 * hm;
+    block[dst * msize + src] = -gPrecond.h_k1[i];
+    block[dst * msize + src + hm] = -gPrecond.h_k0[i];
+    block[(dst + hm) * msize + src] = -gPrecond.h_k3[i];
+    block[(dst + hm) * msize + src + hm] = -gPrecond.h_k2[i];
+  }
   return 1;
 }

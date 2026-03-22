@@ -7,10 +7,12 @@
 #include <pthread.h>
 #include "gkGlobal.h"
 #include "gk.h"
+#include "gpu_backend.h"
 
 extern double **Q2PK1, **Q2PK2, **Q2PK3, **Q2PK4;
 extern void (*kernel)();
 double *panelIA0(panel *pnlX, panel *pnlY );
+int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
 void kernelKER4( double *x, double *y);
 
 /* lapack: LU solver */
@@ -72,9 +74,20 @@ static int setupThreadCountPc(int nTasks) {
   return threads;
 }
 
+static int useGpuPrecondDisjoint(const ssystem *sys) {
+  const char *env = getenv("FABIPB_GPU_PRECOND_BUILD_DISJOINT");
+  return (sys != NULL && sys->gpuMode > 0 && sys->maxQuadOrder == 1 &&
+          env != NULL && atoi(env) > 0);
+}
+
 static void *precondSetupWorker(void *arg) {
   PrecondSetupTask *task = (PrecondSetupTask *)arg;
   int idx;
+  long long localDisjoint = 0;
+  long long localOneCommon = 0;
+  long long localTwoCommon = 0;
+  long long localTwoCommonRev = 0;
+  long long localSelf = 0;
 
   for (idx = task->begin; idx < task->end; idx++) {
     cube *cb = task->cubes[idx];
@@ -82,18 +95,80 @@ static void *precondSetupWorker(void *arg) {
     int Msize = 2 * HMsize;
     panel *pnlX, *pnlY;
     int i, j;
+    int useGpuDisjoint = useGpuPrecondDisjoint(task->sys);
+    panel **blockPanels = NULL;
+    int *disjointDst = NULL;
+    int *disjointSrc = NULL;
+    int nDisjoint = 0;
+
+    if (useGpuDisjoint) {
+      blockPanels = (panel **)malloc((size_t)HMsize * sizeof(panel *));
+      disjointDst = (int *)malloc((size_t)HMsize * (size_t)HMsize * sizeof(int));
+      disjointSrc = (int *)malloc((size_t)HMsize * (size_t)HMsize * sizeof(int));
+      if (blockPanels == NULL || disjointDst == NULL || disjointSrc == NULL) {
+        free(blockPanels);
+        free(disjointDst);
+        free(disjointSrc);
+        blockPanels = NULL;
+        disjointDst = NULL;
+        disjointSrc = NULL;
+        useGpuDisjoint = 0;
+      }
+    }
 
     for (i = 0, pnlY = cb->pnls; i < HMsize; i++, pnlY = pnlY->nextC) {
+      if (blockPanels != NULL) {
+        blockPanels[i] = pnlY;
+      }
+    }
+    for (i = 0, pnlY = cb->pnls; i < HMsize; i++, pnlY = pnlY->nextC) {
       for (j = 0, pnlX = cb->pnls; j < HMsize; j++, pnlX = pnlX->nextC) {
-        double *KER = panelIA0(pnlX, pnlY);
-        pcBlocks[idx][i*Msize+j]                 = -KER[1];
-        pcBlocks[idx][i*Msize+j+HMsize]          = -KER[0];
-        pcBlocks[idx][(i+HMsize)*Msize+j]        = -KER[3];
-        pcBlocks[idx][(i+HMsize)*Msize+j+HMsize] = -KER[2];
+        int idxX[3], idxY[3];
+        int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+        if (task->sys->benchmarkMode > 0) {
+          if (nVtx == 0) localDisjoint++;
+          else if (nVtx == 1) localOneCommon++;
+          else if (nVtx == 2) localTwoCommon++;
+          else if (nVtx == -2) localTwoCommonRev++;
+          else if (nVtx == 3) localSelf++;
+        }
+        if (useGpuDisjoint && nVtx == 0) {
+          disjointDst[nDisjoint] = i;
+          disjointSrc[nDisjoint] = j;
+          nDisjoint++;
+        } else {
+          double *KER = panelIA0(pnlX, pnlY);
+          pcBlocks[idx][i*Msize+j]                 = -KER[1];
+          pcBlocks[idx][i*Msize+j+HMsize]          = -KER[0];
+          pcBlocks[idx][(i+HMsize)*Msize+j]        = -KER[3];
+          pcBlocks[idx][(i+HMsize)*Msize+j+HMsize] = -KER[2];
+        }
       }
       pcBlocks[idx][i*Msize+i] += task->scale1 * pnlY->area;
       pcBlocks[idx][(i+HMsize)*Msize+i+HMsize] += task->scale2 * pnlY->area;
     }
+
+    if (useGpuDisjoint && nDisjoint > 0) {
+      if (!gpuBuildPrecondDisjointBlock(blockPanels, HMsize, disjointDst, disjointSrc,
+                                        nDisjoint, pcBlocks[idx])) {
+        for (i = 0; i < nDisjoint; i++) {
+          pnlY = blockPanels[disjointDst[i]];
+          pnlX = blockPanels[disjointSrc[i]];
+          {
+            double *KER = panelIA0(pnlX, pnlY);
+            int dst = disjointDst[i];
+            int src = disjointSrc[i];
+            pcBlocks[idx][dst*Msize+src]                 = -KER[1];
+            pcBlocks[idx][dst*Msize+src+HMsize]          = -KER[0];
+            pcBlocks[idx][(dst+HMsize)*Msize+src]        = -KER[3];
+            pcBlocks[idx][(dst+HMsize)*Msize+src+HMsize] = -KER[2];
+          }
+        }
+      }
+    }
+    free(blockPanels);
+    free(disjointDst);
+    free(disjointSrc);
 
     if (task->buildLU) {
       int info;
@@ -105,6 +180,13 @@ static void *precondSetupWorker(void *arg) {
         exit(1);
       }
     }
+  }
+  if (task->sys->benchmarkMode > 0) {
+    __sync_fetch_and_add(&pcCaseDisjointCount, localDisjoint);
+    __sync_fetch_and_add(&pcCaseOneCommonCount, localOneCommon);
+    __sync_fetch_and_add(&pcCaseTwoCommonCount, localTwoCommon);
+    __sync_fetch_and_add(&pcCaseTwoCommonRevCount, localTwoCommonRev);
+    __sync_fetch_and_add(&pcCaseSelfCount, localSelf);
   }
   return NULL;
 }
@@ -120,6 +202,11 @@ void setupPreconditioning(ssystem *sys) {
   kernel = kernelKER4;
   scale1 = (1.0+epsilon)/2.0;
   scale2 = (1.0+1.0/epsilon)/2.0;
+  pcCaseDisjointCount = 0;
+  pcCaseOneCommonCount = 0;
+  pcCaseTwoCommonCount = 0;
+  pcCaseTwoCommonRevCount = 0;
+  pcCaseSelfCount = 0;
 
   for ( idx=0, cb=sys->cubeList[nlevel]; cb!=NULL; cb=cb->next,idx++ ) {
     maxnPnls = cb->nPnls > maxnPnls ? cb->nPnls : maxnPnls;

@@ -48,3 +48,15 @@ int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
   (void)sgm;
   return 0;
 }
+
+int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
+                                 const int *dstLocal, const int *srcLocal,
+                                 int nPairs, double *block) {
+  (void)panels;
+  (void)nPanels;
+  (void)dstLocal;
+  (void)srcLocal;
+  (void)nPairs;
+  (void)block;
+  return 0;
+}

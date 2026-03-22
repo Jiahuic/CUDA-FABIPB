@@ -14,6 +14,9 @@ int gpuM2LApply(struct ssystem *sys);
 int gpuQ2MApply(struct ssystem *sys, const double *sgm);
 int gpuL2PApply(struct ssystem *sys, double alpha, double beta, double *pot);
 int gpuSetupRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
+int gpuBuildPrecondDisjointBlock(struct panel **panels, int nPanels,
+                                 const int *dstLocal, const int *srcLocal,
+                                 int nPairs, double *block);
 
 #ifdef __cplusplus
 }
