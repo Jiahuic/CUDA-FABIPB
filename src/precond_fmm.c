@@ -45,6 +45,21 @@ typedef struct {
   int buildLU;
 } PrecondSetupTask;
 
+typedef struct {
+  cube **cubes;
+  int begin;
+  int end;
+  int nPnls;
+  double *sgm;
+  double *pot;
+  double *rhsLocal;
+  double assembleTime;
+  double solveTime;
+  double scatterTime;
+  int info;
+  int failedIdx;
+} PrecondApplyTask;
+
 static double wall_seconds_pc(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -53,6 +68,29 @@ static double wall_seconds_pc(void) {
 
 static int setupThreadCountPc(int nTasks) {
   const char *env = getenv("FABIPB_SETUP_THREADS");
+  long hc;
+  int threads;
+
+  if (env != NULL) {
+    threads = atoi(env);
+  } else {
+    hc = sysconf(_SC_NPROCESSORS_ONLN);
+    threads = (hc > 0) ? (int)hc : 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 32) {
+    threads = 32;
+  }
+  return threads;
+}
+
+static int applyThreadCountPc(int nTasks) {
+  const char *env = getenv("FABIPB_PRECOND_APPLY_THREADS");
   long hc;
   int threads;
 
@@ -191,6 +229,46 @@ static void *precondSetupWorker(void *arg) {
   return NULL;
 }
 
+static void *precondApplyLUWorker(void *arg) {
+  PrecondApplyTask *task = (PrecondApplyTask *)arg;
+  int idx;
+
+  for (idx = task->begin; idx < task->end; idx++) {
+    cube *cb = task->cubes[idx];
+    int Msize = pcBlockSize[idx];
+    int HMsize = cb->nPnls;
+    double *rhsLocal = task->rhsLocal;
+    double t0;
+    int i;
+    int info;
+
+    t0 = wall_seconds_pc();
+    for (i = 0; i < HMsize; i++) {
+      rhsLocal[i] = task->sgm[cb->pnls->idx + i];
+      rhsLocal[i + HMsize] = task->sgm[task->nPnls + cb->pnls->idx + i];
+    }
+    task->assembleTime += wall_seconds_pc() - t0;
+
+    t0 = wall_seconds_pc();
+    dgetrs_(&nChr, &Msize, &oneI, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], rhsLocal, &Msize, &info);
+    if (info != 0) {
+      task->info = info;
+      task->failedIdx = idx;
+      return NULL;
+    }
+    task->solveTime += wall_seconds_pc() - t0;
+
+    t0 = wall_seconds_pc();
+    for (i = 0; i < HMsize; i++) {
+      task->pot[cb->pnls->idx + i] = rhsLocal[i];
+      task->pot[task->nPnls + cb->pnls->idx + i] = rhsLocal[i + HMsize];
+    }
+    task->scatterTime += wall_seconds_pc() - t0;
+  }
+
+  return NULL;
+}
+
 void setupPreconditioning(ssystem *sys) {
 
   int maxnPnls=0, idx, ttlcube=0;
@@ -207,10 +285,24 @@ void setupPreconditioning(ssystem *sys) {
   pcCaseTwoCommonCount = 0;
   pcCaseTwoCommonRevCount = 0;
   pcCaseSelfCount = 0;
+  pcBlockCount = 0;
+  pcBlockSizeSum = 0;
+  pcBlockSizeSqSum = 0;
+  pcBlockSizeMin = 0;
+  pcBlockSizeMax = 0;
 
   for ( idx=0, cb=sys->cubeList[nlevel]; cb!=NULL; cb=cb->next,idx++ ) {
     maxnPnls = cb->nPnls > maxnPnls ? cb->nPnls : maxnPnls;
     ttlcube += cb->nPnls;
+    if (pcBlockCount == 0 || cb->nPnls < pcBlockSizeMin) {
+      pcBlockSizeMin = cb->nPnls;
+    }
+    if (pcBlockCount == 0 || cb->nPnls > pcBlockSizeMax) {
+      pcBlockSizeMax = cb->nPnls;
+    }
+    pcBlockCount++;
+    pcBlockSizeSum += cb->nPnls;
+    pcBlockSizeSqSum += (long long)cb->nPnls * (long long)cb->nPnls;
   }
 
   nPrecondBlocks = idx;
@@ -398,6 +490,56 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
   ASSERT(pcLUBlocks != NULL);
   ASSERT(pcIpivBlocks != NULL);
   ASSERT(pcBlockSize != NULL);
+
+  if (nPrecondBlocks > 1) {
+    int nThreads = applyThreadCountPc(nPrecondBlocks);
+    if (nThreads > 1) {
+      cube **applyCubes = (cube **)calloc((size_t)nPrecondBlocks, sizeof(cube *));
+      pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+      PrecondApplyTask *tasks = (PrecondApplyTask *)calloc((size_t)nThreads, sizeof(PrecondApplyTask));
+      double wallStart, wallEnd;
+      ASSERT(applyCubes != NULL);
+      ASSERT(threads != NULL);
+      ASSERT(tasks != NULL);
+
+      for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
+        applyCubes[idx] = cb;
+      }
+      wallStart = wall_seconds_pc();
+      for (idx = 0; idx < nThreads; idx++) {
+        int maxRhs = 2 * pcBlockSizeMax;
+        tasks[idx].cubes = applyCubes;
+        tasks[idx].begin = (nPrecondBlocks * idx) / nThreads;
+        tasks[idx].end = (nPrecondBlocks * (idx + 1)) / nThreads;
+        tasks[idx].nPnls = nPnls;
+        tasks[idx].sgm = sgm;
+        tasks[idx].pot = pot;
+        tasks[idx].rhsLocal = (double *)calloc((size_t)maxRhs, sizeof(double));
+        tasks[idx].assembleTime = 0.0;
+        tasks[idx].solveTime = 0.0;
+        tasks[idx].scatterTime = 0.0;
+        tasks[idx].info = 0;
+        tasks[idx].failedIdx = -1;
+        ASSERT(tasks[idx].rhsLocal != NULL);
+        pthread_create(&threads[idx], NULL, precondApplyLUWorker, &tasks[idx]);
+      }
+      for (idx = 0; idx < nThreads; idx++) {
+        pthread_join(threads[idx], NULL);
+        if (tasks[idx].info != 0) {
+          fprintf(stderr, "Error: dgetrs failed in cached LU apply for leaf %d (info=%d)\n",
+                  tasks[idx].failedIdx, tasks[idx].info);
+          exit(1);
+        }
+        free(tasks[idx].rhsLocal);
+      }
+      wallEnd = wall_seconds_pc();
+      pcSolveTime += wallEnd - wallStart;
+      free(tasks);
+      free(threads);
+      free(applyCubes);
+      return 0;
+    }
+  }
 
   for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
     Msize = pcBlockSize[idx];
