@@ -12,6 +12,7 @@
 #include <vector>
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
+extern "C" int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
 extern "C" void kernelKER4(double *x, double *y);
 extern "C" void (*kernel)(double *x, double *y);
 extern "C" void setupDerivs(int order, double *x);
@@ -34,11 +35,27 @@ double wall_seconds_cuda_local() {
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
 
+int nearCaseIndex(int nVtx) {
+  switch (nVtx) {
+    case 0: return 0;
+    case 1: return 1;
+    case 2: return 2;
+    case -2: return 3;
+    case 3: return 4;
+    default: return -1;
+  }
+}
+
 struct NearfieldGpuCache {
   const ssystem *sys;
   int nPnls;
   int nearfieldMode;
   long long nInteractions;
+  long long caseDisjointCount;
+  long long caseOneCommonCount;
+  long long caseTwoCommonCount;
+  long long caseTwoCommonRevCount;
+  long long caseSelfCount;
   int *h_src;
   int *h_dst;
   int *h_pairSrcCount;
@@ -1009,6 +1026,7 @@ int buildNearfieldTables(const ssystem *sys) {
   long long totalInteractions = 0;
   long long k = 0;
   double t0, t1;
+  int collectCaseCounts = (sys->benchmarkMode > 0);
 
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
     int srcLeaf = sys->nearPairSrc[pairIdx];
@@ -1023,6 +1041,11 @@ int buildNearfieldTables(const ssystem *sys) {
   }
   gNear.sys = sys;
   gNear.nearfieldMode = sys->gpuNearfieldMode;
+  gNear.caseDisjointCount = 0;
+  gNear.caseOneCommonCount = 0;
+  gNear.caseTwoCommonCount = 0;
+  gNear.caseTwoCommonRevCount = 0;
+  gNear.caseSelfCount = 0;
   t0 = wall_seconds_cuda_local();
   if (!allocateHostArrays(totalInteractions)) {
     return 0;
@@ -1067,6 +1090,18 @@ int buildNearfieldTables(const ssystem *sys) {
             long long idx = base + (long long)i * (long long)srcCount + (long long)j;
             int srcPanelIdx = srcStart + j;
             panel *pnlY = sys->panelByIdx[srcPanelIdx];
+            if (collectCaseCounts) {
+              int idxX[3], idxY[3];
+              int caseIdx = nearCaseIndex(nrCommonVtx(pnlX, pnlY, idxX, idxY));
+              switch (caseIdx) {
+                case 0: gNear.caseDisjointCount++; break;
+                case 1: gNear.caseOneCommonCount++; break;
+                case 2: gNear.caseTwoCommonCount++; break;
+                case 3: gNear.caseTwoCommonRevCount++; break;
+                case 4: gNear.caseSelfCount++; break;
+                default: break;
+              }
+            }
             double *KER = panelIA0(pnlX, pnlY);
 
             gNear.h_dst[idx] = dstPanelIdx;
@@ -1080,14 +1115,16 @@ int buildNearfieldTables(const ssystem *sys) {
       }
     } else {
       std::vector<std::thread> workers;
+      std::vector<long long> threadCounts((size_t)nThreads * 5U, 0);
       int t;
 
       workers.reserve((size_t)nThreads);
       for (t = 0; t < nThreads; t++) {
         int begin = (sys->nNearPairsFlat * t) / nThreads;
         int end = (sys->nNearPairsFlat * (t + 1)) / nThreads;
-        workers.emplace_back([=]() {
+        workers.emplace_back([=, &threadCounts]() {
           int localPairIdx;
+          long long *localCounts = &threadCounts[(size_t)t * 5U];
           for (localPairIdx = begin; localPairIdx < end; localPairIdx++) {
             int srcLeaf = sys->nearPairSrc[localPairIdx];
             int dstLeaf = sys->nearPairDst[localPairIdx];
@@ -1105,6 +1142,13 @@ int buildNearfieldTables(const ssystem *sys) {
                 long long idx = base + (long long)i * (long long)srcCount + (long long)j;
                 int srcPanelIdx = srcStart + j;
                 panel *pnlY = sys->panelByIdx[srcPanelIdx];
+                if (collectCaseCounts) {
+                  int idxX[3], idxY[3];
+                  int caseIdx = nearCaseIndex(nrCommonVtx(pnlX, pnlY, idxX, idxY));
+                  if (caseIdx >= 0) {
+                    localCounts[caseIdx]++;
+                  }
+                }
                 double *KER = panelIA0(pnlX, pnlY);
 
                 gNear.h_dst[idx] = dstPanelIdx;
@@ -1120,6 +1164,14 @@ int buildNearfieldTables(const ssystem *sys) {
       }
       for (t = 0; t < nThreads; t++) {
         workers[(size_t)t].join();
+        if (collectCaseCounts) {
+          long long *localCounts = &threadCounts[(size_t)t * 5U];
+          gNear.caseDisjointCount += localCounts[0];
+          gNear.caseOneCommonCount += localCounts[1];
+          gNear.caseTwoCommonCount += localCounts[2];
+          gNear.caseTwoCommonRevCount += localCounts[3];
+          gNear.caseSelfCount += localCounts[4];
+        }
       }
     }
   }
@@ -1147,8 +1199,12 @@ int buildNearfieldTables(const ssystem *sys) {
 
   gNear.nPnls = sys->nPnls;
   gNear.nInteractions = totalInteractions;
-  if (sys->benchmarkMode > 0)
+  if (sys->benchmarkMode > 0) {
     printf("GPU nearfield cache: panel-pairs=%lld mode=%d\n", totalInteractions, sys->gpuNearfieldMode);
+    printf("GPU nearfield panelIA0 cases: disjoint=%lld one-common=%lld two-common=%lld two-common-rev=%lld self=%lld\n",
+           gNear.caseDisjointCount, gNear.caseOneCommonCount, gNear.caseTwoCommonCount,
+           gNear.caseTwoCommonRevCount, gNear.caseSelfCount);
+  }
   return 1;
 }
 
