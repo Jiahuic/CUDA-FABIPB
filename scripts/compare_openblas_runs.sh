@@ -27,6 +27,7 @@ run_case() {
   label="$1"
   libdir="$2"
   log="$3"
+  shift 3
   LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   FABIPB_GMRES_LOG_RESID=1 \
   ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 "$panel" "$@" >"$log" 2>&1
