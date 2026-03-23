@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
 
@@ -162,6 +164,12 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
     double bnrm2;
     double rnorm;
     double tol;
+    int logResid = 0;
+    const char *logResidEnv = getenv("FABIPB_GMRES_LOG_RESID");
+
+    if (logResidEnv != NULL && atoi(logResidEnv) > 0) {
+        logResid = 1;
+    }
 
     *info = 0;
     if (n < 0) {
@@ -260,6 +268,9 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
             aa = wall_seconds();
             *resid = fabs(work[s_col * ldw + i]) / bnrm2;
             gmresResidualTime += wall_seconds() - aa;
+            if (logResid) {
+                printf("GMRES residual: iter=%d resid=%e\n", *iter, *resid);
+            }
 
             if (*resid <= tol) {
                 aa = wall_seconds();
@@ -291,6 +302,9 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
         work[s_col * ldw + i] = dnrm2_(&n, &work[r_col * ldw], &inc);
         *resid = work[s_col * ldw + i] / bnrm2;
         gmresResidualTime += wall_seconds() - aa;
+        if (logResid) {
+            printf("GMRES residual: iter=%d resid=%e\n", *iter, *resid);
+        }
         if (*resid <= tol) {
             return 0;
         }

@@ -14,6 +14,12 @@ Use two benchmark drivers:
 - `scripts/run_fmm_param_matrix.sh`
   - structural and order-policy sweep for adaptive-parameter studies
 
+For BLAS-version sensitivity checks, use:
+
+- `scripts/compare_openblas_runs.sh`
+  - runs the exact same case twice with different `LD_LIBRARY_PATH` prefixes
+  - enables GMRES residual logging to compare divergence history
+
 All benchmark runs should use benchmark output mode:
 
 ```sh
