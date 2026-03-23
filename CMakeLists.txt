@@ -17,6 +17,10 @@ if(FMM_PB_BLA_VENDOR)
   set(BLA_VENDOR "${FMM_PB_BLA_VENDOR}")
 endif()
 
+option(FMM_PB_ALLOW_UNSTABLE_OPENBLAS_0320
+  "Allow configure with OpenBLAS 0.3.20, which is known to trigger unstable preconditioner solves on some machines"
+  OFF)
+
 set(FMM_PB_SOURCES
   src/fabipb.c
   src/gkSetup.c
@@ -75,6 +79,39 @@ if(NOT LAPACK_FOUND)
   )
 endif()
 
+set(FMM_PB_OPENBLAS_REALPATHS "")
+foreach(_blas_lib IN LISTS BLAS_LIBRARIES LAPACK_LIBRARIES)
+  if(IS_ABSOLUTE "${_blas_lib}" AND EXISTS "${_blas_lib}")
+    get_filename_component(_blas_realpath "${_blas_lib}" REALPATH)
+    if(_blas_realpath MATCHES "openblas")
+      list(APPEND FMM_PB_OPENBLAS_REALPATHS "${_blas_realpath}")
+    endif()
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES FMM_PB_OPENBLAS_REALPATHS)
+
+set(FMM_PB_OPENBLAS_0320_DETECTED OFF)
+foreach(_openblas_path IN LISTS FMM_PB_OPENBLAS_REALPATHS)
+  if(_openblas_path MATCHES "0\.3\.20")
+    set(FMM_PB_OPENBLAS_0320_DETECTED ON)
+  endif()
+endforeach()
+
+if(FMM_PB_OPENBLAS_0320_DETECTED)
+  if(FMM_PB_ALLOW_UNSTABLE_OPENBLAS_0320)
+    message(WARNING
+      "OpenBLAS 0.3.20 was detected in the resolved BLAS/LAPACK libraries: ${FMM_PB_OPENBLAS_REALPATHS}. "
+      "This version has triggered unstable preconditioner solves on tested machines. Continue only for explicit comparison work."
+    )
+  else()
+    message(FATAL_ERROR
+      "OpenBLAS 0.3.20 was detected in the resolved BLAS/LAPACK libraries: ${FMM_PB_OPENBLAS_REALPATHS}. "
+      "This version is blocked by default because it has triggered unstable preconditioner solves on tested machines. "
+      "Use a different OpenBLAS version such as 0.3.21+ or rerun CMake with -DFMM_PB_ALLOW_UNSTABLE_OPENBLAS_0320=ON only for controlled comparison work."
+    )
+  endif()
+endif()
+
 find_package(Threads REQUIRED)
 
 target_link_libraries(fabipb
@@ -101,3 +138,5 @@ message(STATUS "BLA_VENDOR hint: ${BLA_VENDOR}")
 message(STATUS "CUDA backend enabled: ${FMM_PB_HAS_CUDA}")
 message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
 message(STATUS "LAPACK libraries: ${LAPACK_LIBRARIES}")
+message(STATUS "Resolved OpenBLAS libraries: ${FMM_PB_OPENBLAS_REALPATHS}")
+message(STATUS "Allow unstable OpenBLAS 0.3.20: ${FMM_PB_ALLOW_UNSTABLE_OPENBLAS_0320}")

@@ -45,6 +45,24 @@ cmake -S . -B build
 cmake --build build
 ```
 
+If CMake stops because it detected OpenBLAS `0.3.20`, install or build a newer
+local OpenBLAS and prefer that runtime instead of forcing the unstable one.
+For example, with `gfortran` installed:
+
+```sh
+curl -L -o /tmp/OpenBLAS-0.3.31.tar.gz   https://github.com/OpenMathLib/OpenBLAS/archive/refs/tags/v0.3.31.tar.gz
+tar -xzf /tmp/OpenBLAS-0.3.31.tar.gz -C /tmp
+cd /tmp/OpenBLAS-0.3.31
+make -j4 PREFIX=/tmp/openblas-0.3.31-install   NO_SHARED=0 USE_OPENMP=0 USE_THREAD=1 DYNAMIC_ARCH=1
+make PREFIX=/tmp/openblas-0.3.31-install install
+```
+
+Then run `fabipb` against that local runtime:
+
+```sh
+env LD_LIBRARY_PATH=/tmp/openblas-0.3.31-install/lib   FABIPB_SETUP_THREADS=1 FABIPB_PRECOND_APPLY_THREADS=1   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1   ./build/fabipb -B=1 -g=0 -P=2 -m=0 test_proteins/1a63
+```
+
 For apples-to-apples benchmarking against macOS, run:
 
 ```sh

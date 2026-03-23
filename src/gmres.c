@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
 
@@ -27,6 +29,26 @@ static double wall_seconds(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
+}
+
+static void gmres_vector_preview(const char *tag, int iter, const double *x, int n)
+{
+    int i;
+    int limit = (n < 6) ? n : 6;
+    double inf = 0.0;
+
+    for (i = 0; i < n; ++i) {
+        double ax = fabs(x[i]);
+        if (ax > inf) {
+            inf = ax;
+        }
+    }
+
+    printf("GMRES vector %s: iter=%d inf=%e", tag, iter, inf);
+    for (i = 0; i < limit; ++i) {
+        printf(" x[%d]=%e", i, x[i]);
+    }
+    printf("\n");
 }
 
 /*  -- Iterative template routine --
@@ -162,6 +184,22 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
     double bnrm2;
     double rnorm;
     double tol;
+    int logResid = 0;
+    int stopAfterIter = 0;
+    int logVectors = 0;
+    const char *logResidEnv = getenv("FABIPB_GMRES_LOG_RESID");
+    const char *stopAfterIterEnv = getenv("FABIPB_GMRES_STOP_AFTER_ITER");
+    const char *logVectorsEnv = getenv("FABIPB_GMRES_LOG_VECTORS");
+
+    if (logResidEnv != NULL && atoi(logResidEnv) > 0) {
+        logResid = 1;
+    }
+    if (stopAfterIterEnv != NULL && atoi(stopAfterIterEnv) > 0) {
+        stopAfterIter = atoi(stopAfterIterEnv);
+    }
+    if (logVectorsEnv != NULL && atoi(logVectorsEnv) > 0) {
+        logVectors = 1;
+    }
 
     *info = 0;
     if (n < 0) {
@@ -198,10 +236,16 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
         gmresMatvecCalls++;
     }
 
+    if (logVectors) {
+        gmres_vector_preview("b", 0, &work[av_col * ldw], n);
+    }
     aa = wall_seconds();
     psolve(&work[r_col * ldw], &work[av_col * ldw]);
     gmresPsolveTime += wall_seconds() - aa;
     gmresPsolveCalls++;
+    if (logVectors) {
+        gmres_vector_preview("Mb", 0, &work[r_col * ldw], n);
+    }
     bnrm2 = dnrm2_(&n, b, &inc);
     if (bnrm2 == 0.0) {
         bnrm2 = 1.0;
@@ -219,6 +263,9 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
         rnorm = dnrm2_(&n, &work[v_col * ldw], &inc);
         aa = 1.0 / rnorm;
         dscal_(&n, &aa, &work[v_col * ldw], &inc);
+        if (logVectors) {
+            gmres_vector_preview("v", 0, &work[v_col * ldw], n);
+        }
 
         work[s_col * ldw] = rnorm;
         for (k = 1; k < n; ++k) {
@@ -234,10 +281,16 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
                    &work[av_col * ldw]);
             gmresMatvecTime += wall_seconds() - aa;
             gmresMatvecCalls++;
+            if (logVectors && *iter == 1) {
+                gmres_vector_preview("Av", *iter, &work[av_col * ldw], n);
+            }
             aa = wall_seconds();
             psolve(&work[w_col * ldw], &work[av_col * ldw]);
             gmresPsolveTime += wall_seconds() - aa;
             gmresPsolveCalls++;
+            if (logVectors && *iter == 1) {
+                gmres_vector_preview("MAv", *iter, &work[w_col * ldw], n);
+            }
 
             aa = wall_seconds();
             gmres_basis(i, n, &h[(i - 1) * ldh], &work[v_col * ldw], ldw,
@@ -260,6 +313,14 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
             aa = wall_seconds();
             *resid = fabs(work[s_col * ldw + i]) / bnrm2;
             gmresResidualTime += wall_seconds() - aa;
+            if (logResid) {
+                printf("GMRES residual: iter=%d resid=%e\n", *iter, *resid);
+            }
+            if (stopAfterIter > 0 && *iter >= stopAfterIter) {
+                fprintf(stderr, "GMRES debug stop after iter=%d\n", *iter);
+                *info = 77;
+                return 0;
+            }
 
             if (*resid <= tol) {
                 aa = wall_seconds();
@@ -291,6 +352,14 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
         work[s_col * ldw + i] = dnrm2_(&n, &work[r_col * ldw], &inc);
         *resid = work[s_col * ldw + i] / bnrm2;
         gmresResidualTime += wall_seconds() - aa;
+        if (logResid) {
+            printf("GMRES residual: iter=%d resid=%e\n", *iter, *resid);
+        }
+        if (stopAfterIter > 0 && *iter >= stopAfterIter) {
+            fprintf(stderr, "GMRES debug stop after iter=%d\n", *iter);
+            *info = 77;
+            return 0;
+        }
         if (*resid <= tol) {
             return 0;
         }
