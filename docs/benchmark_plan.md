@@ -20,6 +20,13 @@ For BLAS-version sensitivity checks, use:
   - runs the exact same case twice with different `LD_LIBRARY_PATH` prefixes
   - enables GMRES residual logging to compare divergence history
 
+Important:
+
+- keep the mesh fixed with `-m=0`
+- record the exact OpenBLAS library path and version in benchmark notes
+- if a machine converges under one OpenBLAS version and fails under another,
+  treat that as an environment-sensitive result and document it explicitly
+
 All benchmark runs should use benchmark output mode:
 
 ```sh

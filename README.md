@@ -120,6 +120,31 @@ for the CPU and GPU matvec outputs before GMRES starts.
 
 If `OpenBLAS` is unavailable, install it first (see `docs/dependencies.md`).
 
+### OpenBLAS Version Sensitivity
+
+We have observed that solver convergence can depend on the OpenBLAS version on
+some machines. In particular, one tested environment converged with the Ubuntu
+`0.3.8` pthread build but not with `0.3.20` for the same mesh and input.
+
+For this reason:
+
+- record the exact OpenBLAS version when reporting benchmark or convergence data
+- compare BLAS versions using the same mesh with `-m=0`
+- prefer switching `LD_LIBRARY_PATH` to a locally built OpenBLAS for comparison,
+  rather than replacing the system BLAS install
+
+Use the dedicated comparison runner:
+
+```sh
+./scripts/compare_openblas_runs.sh \
+  /usr/lib/x86_64-linux-gnu/openblas-pthread \
+  /tmp/openblas-0.3.20/lib \
+  test_proteins/1a63 -g=0 -P=0 -m=0
+```
+
+This runner enables GMRES residual logging and writes side-by-side logs so the
+iteration history can be diffed directly.
+
 Clean rebuild:
 
 ```sh
