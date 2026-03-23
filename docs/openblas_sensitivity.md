@@ -10,9 +10,13 @@ under different OpenBLAS versions:
 
 - OpenBLAS `0.3.8` pthread build: converged
 - OpenBLAS `0.3.20` pthread build: did not converge on the same fixed mesh
+- OpenBLAS `0.3.21` pthread build: converged on the same fixed mesh
 
-This means benchmark and convergence results should not be treated as BLAS
-version independent without verification.
+The first divergence was traced to the LU-based preconditioner block solves.
+The raw preconditioner block matrices matched before factorization, while the
+`dgetrf`/`dgetrs` results did not. This means the immediate split is not in the
+FMM operator, although the underlying issue is still numerical fragility in the
+preconditioner blocks.
 
 ## Required Comparison Rules
 
@@ -26,10 +30,14 @@ version independent without verification.
 Use:
 
 ```sh
-./scripts/compare_openblas_runs.sh \
-  /path/to/openblas-0.3.8/lib \
-  /path/to/openblas-0.3.20/lib \
-  test_proteins/1a63 -g=0 -P=0 -m=0
+./scripts/compare_openblas_runs.sh   /path/to/openblas-0.3.8/lib   /path/to/openblas-0.3.21/lib   test_proteins/1a63 -g=0 -P=2 -m=0
+```
+
+If you need to reproduce the unstable environment explicitly, compare against
+`0.3.20` in a separate run:
+
+```sh
+./scripts/compare_openblas_runs.sh   /path/to/openblas-0.3.20/lib   /path/to/openblas-0.3.21/lib   test_proteins/1a63 -g=0 -P=2 -m=0
 ```
 
 The script:
@@ -39,19 +47,18 @@ The script:
 - writes two full logs
 - allows direct residual-history diffing
 
-## Local 0.3.20 Build
+## Build-System Guard
 
-On machines where the package manager only provides `0.3.8`, build `0.3.20`
-locally instead of replacing the system BLAS.
+CMake now blocks OpenBLAS `0.3.20` by default when it can resolve the linked
+OpenBLAS shared library to a `0.3.20` runtime.
 
-Example local install target:
+Override only for controlled comparison work:
 
 ```sh
-/tmp/openblas-0.3.20
+cmake -S . -B build -DFMM_PB_ALLOW_UNSTABLE_OPENBLAS_0320=ON
 ```
 
-Then compare by prefixing `LD_LIBRARY_PATH` instead of reinstalling system
-packages.
+For regular development and benchmarking, prefer `0.3.21` or newer.
 
 ## Interpretation
 

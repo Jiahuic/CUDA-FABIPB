@@ -2,6 +2,8 @@
 set -eu
 
 BUILD_DIR="${BUILD_DIR:-build}"
+FABIPB_SETUP_THREADS="${FABIPB_SETUP_THREADS:-1}"
+FABIPB_PRECOND_APPLY_THREADS="${FABIPB_PRECOND_APPLY_THREADS:-1}"
 
 if [ "$#" -lt 3 ]; then
   echo "Usage: $0 <openblas_a_libdir> <openblas_b_libdir> <panel-base-or-pqr-path> [solver options...]" >&2
@@ -29,6 +31,8 @@ run_case() {
   log="$3"
   shift 3
   LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  FABIPB_SETUP_THREADS="$FABIPB_SETUP_THREADS" \
+  FABIPB_PRECOND_APPLY_THREADS="$FABIPB_PRECOND_APPLY_THREADS" \
   FABIPB_GMRES_LOG_RESID=1 \
   ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 "$panel" "$@" >"$log" 2>&1
   echo "$label,$libdir,$log"
@@ -80,6 +84,7 @@ energy_delta="$(awk -v a="$energy_a" -v b="$energy_b" 'BEGIN{d=a-b; if(d<0)d=-d;
 
 echo "OpenBLAS comparison"
 echo "  panel: $panel"
+echo "  FABIPB_SETUP_THREADS=$FABIPB_SETUP_THREADS FABIPB_PRECOND_APPLY_THREADS=$FABIPB_PRECOND_APPLY_THREADS"
 echo "  A: libdir=$OPENBLAS_A_LIBDIR ttl=${ttl_a}s its=${its_a} energy=${energy_a} setupPC=${setupPC_a}s gmres=${gmres_a}s last_resid=${resid_a}"
 echo "  B: libdir=$OPENBLAS_B_LIBDIR ttl=${ttl_b}s its=${its_b} energy=${energy_b} setupPC=${setupPC_b}s gmres=${gmres_b}s last_resid=${resid_b}"
 echo "  delta: |energy|=${energy_delta}"
