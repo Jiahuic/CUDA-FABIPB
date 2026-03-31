@@ -57,6 +57,11 @@ target_include_directories(fabipb
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper-master/build/NanoShaper")
+  target_compile_definitions(fabipb PRIVATE
+    FMM_PB_DEFAULT_NANOSHAPER_BIN="${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper-master/build/NanoShaper")
+endif()
+
 if(FMM_PB_HAS_CUDA)
   target_compile_definitions(fabipb PRIVATE FMM_PB_HAS_CUDA_BACKEND=1)
 else()

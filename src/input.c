@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #define MAXCOND 50
@@ -29,6 +30,53 @@ static void buildPath(char *fname, size_t fnameSize, const char *fpath, const ch
     fprintf(stderr, "Error: generated path is too long for buffer\n");
     exit(1);
   }
+}
+
+static int parsePqrAtomLine(const char *line, double *x, double *y, double *z,
+                            double *charge, double *radius, int *isMalformedAtomLine) {
+  char rec[16], a2[32], a3[32], a4[32], a5[32];
+  int nread;
+
+  *isMalformedAtomLine = 0;
+  nread = sscanf(line, "%15s %31s %31s %31s %31s %lf %lf %lf %lf %lf",
+                 rec, a2, a3, a4, a5, x, y, z, charge, radius);
+  if (nread == EOF || nread <= 0) {
+    return 0;
+  }
+
+  if (strcmp(rec, "ATOM") != 0 && strcmp(rec, "HETATM") != 0) {
+    return 0;
+  }
+
+  if (nread != 10) {
+    *isMalformedAtomLine = 1;
+    return 0;
+  }
+
+  return 1;
+}
+
+static const char *getNanoShaperBin(void) {
+  const char *bin = getenv("FABIPB_NANOSHAPER_BIN");
+  if (bin != NULL && bin[0] != '\0') {
+    return bin;
+  }
+
+#ifdef FMM_PB_DEFAULT_NANOSHAPER_BIN
+  if (access(FMM_PB_DEFAULT_NANOSHAPER_BIN, X_OK) == 0) {
+    return FMM_PB_DEFAULT_NANOSHAPER_BIN;
+  }
+#endif
+
+  if (access("./nanoshaper-master/build/NanoShaper", X_OK) == 0) {
+    return "./nanoshaper-master/build/NanoShaper";
+  }
+
+  if (access("../nanoshaper-master/build/NanoShaper", X_OK) == 0) {
+    return "../nanoshaper-master/build/NanoShaper";
+  }
+
+  return "NanoShaper";
 }
 
 /*
@@ -60,7 +108,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   char fpath[256], fname[256];
   FILE *fp, *wfp;
 
-  char c,c1[10],c2[10],c3[10],c4[10],c5[10],c6[10];
+  char c, line[512];
   double a1,a2,a3,b1,b2,b3;//a_norm,r0_norm,v0_norm;
   int i1,i2,i3,j1,j2,j3,ierr,iface[3],jface[3],ialert;
   double den,prob_rds,xx[3],yy[3],face[3][3],tface[3][3],s_area;
@@ -68,6 +116,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   int **extr_v, **extr_f, *nvert;
   double dist_local, area_local, cpuf;
   int nspt, natm, nface;
+  int malformedAtomLines, skippedZeroRadius, parsedAtom, filledAtoms;
 
   double *nrm, len;
 
@@ -84,17 +133,30 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   }
   buildPath(fname, sizeof(fname), fpath, panelfile, ".xyzr");
   wfp=fopen(fname,"w");
-  /* new version of pqr file, 11 entries per line */
-  /*while(fscanf(fp,"%s %s %s %s %s %lf %lf %lf %lf %lf %s",c1,c2,c3,
-               c4,c5,&a1,&a2,&a3,&b1,&b2,c6) != EOF){ */
-  /* old version of pqr file, 10 entries per line */
-    while(fscanf(fp,"%s %s %s %s %s %lf %lf %lf %lf %lf",c1,c2,c3,
-               c4,c5,&a1,&a2,&a3,&b1,&b2) != EOF){ 
-    if (strcmp(c1,"ATOM")==0)
-    {
-      fprintf(wfp,"%f %f %f %f\n",a1,a2,a3,b2);
-      sys->nChar++;
+  malformedAtomLines = 0;
+  skippedZeroRadius = 0;
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    int malformedThisLine = 0;
+    parsedAtom = parsePqrAtomLine(line, &a1, &a2, &a3, &b1, &b2, &malformedThisLine);
+    if (malformedThisLine) {
+      malformedAtomLines++;
+      continue;
     }
+    if (!parsedAtom) {
+      continue;
+    }
+    if (b2 <= 0.0) {
+      skippedZeroRadius++;
+      continue;
+    }
+    fprintf(wfp,"%f %f %f %f\n",a1,a2,a3,b2);
+    sys->nChar++;
+  }
+  if (skippedZeroRadius > 0) {
+    fprintf(stderr, "Warning: skipped %d zero-radius atoms from '%s'\n", skippedZeroRadius, panelfile);
+  }
+  if (malformedAtomLines > 0) {
+    fprintf(stderr, "Warning: skipped %d malformed ATOM/HETATM lines from '%s'\n", malformedAtomLines, panelfile);
   }
   if (sys->benchmarkMode > 0) {
     printf("PDB ID = %s\n",panelfile);
@@ -103,26 +165,34 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   fclose(fp);
   fclose(wfp);
 
+  if (sys->nChar <= 0) {
+    fprintf(stderr, "Error: no positive-radius ATOM/HETATM records were parsed from '%s'\n", panelfile);
+    exit(1);
+  }
+
   CALLOC(sys->pos, 3*sys->nChar, double);
   CALLOC(sys->chr, sys->nChar, double);
   buildPath(fname, sizeof(fname), fpath, panelfile, ".pqr");
   fp=fopen(fname,"r");
-  for ( i=0; i<sys->nChar; i++ ){
-    /* new version of pqr file, 11 entries per line */
-    /*ierr=fscanf(fp,"%s %s %s %s %s %lf %lf %lf %lf %lf %s",c1,c2,c3,
-                 c4,c5,&a1,&a2,&a3,&b1,&b2,c6);*/
-    /* old version of pqr file, 10 entries per line */
-    ierr=fscanf(fp,"%s %s %s %s %s %lf %lf %lf %lf %lf",c1,c2,c3,
-                 c4,c5,&a1,&a2,&a3,&b1,&b2);
-    if (strcmp(c1,"ATOM")==0)
-    {
-      sys->pos[3*i]=a1;
-      sys->pos[3*i+1]=a2;
-      sys->pos[3*i+2]=a3;
-      sys->chr[i]=b1;
+  filledAtoms = 0;
+  while (fgets(line, sizeof(line), fp) != NULL && filledAtoms < sys->nChar) {
+    int malformedThisLine = 0;
+    parsedAtom = parsePqrAtomLine(line, &a1, &a2, &a3, &b1, &b2, &malformedThisLine);
+    if (!parsedAtom || malformedThisLine || b2 <= 0.0) {
+      continue;
     }
+    sys->pos[3*filledAtoms]=a1;
+    sys->pos[3*filledAtoms+1]=a2;
+    sys->pos[3*filledAtoms+2]=a3;
+    sys->chr[filledAtoms]=b1;
+    filledAtoms++;
   }
   fclose(fp);
+  if (filledAtoms != sys->nChar) {
+    fprintf(stderr, "Error: parsed atom count mismatch for '%s' (%d expected, %d loaded)\n",
+            panelfile, sys->nChar, filledAtoms);
+    exit(1);
+  }
 
   if ( mesh_flag == 1 ) {
   /* run msms */
@@ -144,6 +214,8 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     sprintf(fname,"rm msms.output");
     //ierr=system(fname);
   } else if ( mesh_flag == 2 ) {
+    const char *nanoBin = getNanoShaperBin();
+    int nwritten;
     wfp = fopen("surfaceConfiguration.prm", "w");
     fprintf(wfp, "Grid_scale = %s\n", density);
     fprintf(wfp, "Grid_perfil = 90.0\n");
@@ -172,7 +244,16 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     fprintf(wfp, "Save_PovRay = false\n");
     fclose(wfp);
 
-    ierr = system("NanoShaper >> nsout.txt");
+    nwritten = snprintf(fname, sizeof(fname), "%s surfaceConfiguration.prm >> nsout.txt", nanoBin);
+    if (nwritten < 0 || (size_t)nwritten >= sizeof(fname)) {
+      fprintf(stderr, "Error: NanoShaper command is too long for buffer\n");
+      exit(1);
+    }
+    ierr = system(fname);
+    if (ierr != 0) {
+      fprintf(stderr, "Error: NanoShaper failed while processing '%s' using executable '%s'\n",
+              panelfile, nanoBin);
+    }
     remove("nsout.txt");
 
     buildPath(fname, sizeof(fname), fpath, panelfile, ".face");
@@ -192,7 +273,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   buildPath(fname, sizeof(fname), fpath, panelfile, ".vert");
   fp=fopen(fname,"r");
   if (fp == NULL) {
-    fprintf(stderr, "Error: cannot open vertices file '%s' (run msms first)\n", fname);
+    fprintf(stderr, "Error: cannot open vertices file '%s' (generate the mesh with -m=1 or -m=2 first)\n", fname);
     exit(1);
   }
 

@@ -191,7 +191,7 @@ static void print_usage(const char *prog) {
   printf("Usage: %s [options] <panel-base-or-pqr-path>\n", prog);
   printf("Core options:\n");
   printf("  -g=0|1    CPU only or request GPU (default: auto)\n");
-  printf("  -m=0|1    reuse or regenerate MSMS mesh (default: 1)\n");
+  printf("  -m=0|1|2  reuse mesh, regenerate with MSMS, or regenerate with NanoShaper (default: 1)\n");
   printf("  -B=0|1    quiet default or benchmark/profiling output (default: 0)\n");
   printf("  -d=<val>  MSMS density used when -m=1 (default: 1)\n");
   printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");

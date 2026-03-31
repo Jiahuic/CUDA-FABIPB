@@ -16,4 +16,5 @@ msms.*
 test_proteins/*.xyzr
 test_proteins/*.vert
 test_proteins/*.face
+test_proteins/H1N1.pqr
 bimpb_cuda/
