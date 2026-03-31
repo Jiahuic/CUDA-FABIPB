@@ -84,11 +84,23 @@ VECLIB_MAXIMUM_THREADS
 BLIS_NUM_THREADS
 ```
 
-This is a runtime concern, not a reliable compile-time setting across BLAS
-vendors. For explicit, reproducible benchmark logs, prefer:
+However, some BLAS/OpenMP runtimes may read these settings before `main()`.
+That means late in-process defaults are not a reliable substitute for exporting
+the environment before startup. For explicit, reproducible benchmark logs,
+prefer:
 
 ```sh
 ./scripts/with_benchmark_env.sh <command> ...
+```
+
+The benchmark wrapper also pins the solver's own worker-thread controls to `1`
+unless you override them:
+
+```sh
+FABIPB_SETUP_THREADS
+FABIPB_PRECOND_APPLY_THREADS
+FABIPB_NEARFIELD_BUILD_THREADS
+FABIPB_DIRECT_THREADS
 ```
 
 Recommended manual comparison workflow:

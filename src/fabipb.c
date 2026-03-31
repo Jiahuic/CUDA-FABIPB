@@ -56,7 +56,11 @@ static void set_benchmark_thread_defaults(void) {
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS"
+    "BLIS_NUM_THREADS",
+    "FABIPB_SETUP_THREADS",
+    "FABIPB_PRECOND_APPLY_THREADS",
+    "FABIPB_NEARFIELD_BUILD_THREADS",
+    "FABIPB_DIRECT_THREADS"
   };
   size_t i;
 
@@ -65,6 +69,24 @@ static void set_benchmark_thread_defaults(void) {
       setenv(vars[i], "1", 0);
     }
   }
+}
+
+static int missing_external_thread_env(void) {
+  const char *vars[] = {
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS"
+  };
+  size_t i;
+
+  for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+    if (getenv(vars[i]) == NULL) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static void buildPanelIndexDirect(ssystem *sys) {
@@ -371,6 +393,12 @@ int main(int nargs, char *argv[]){
   }
 
   if (sys->benchmarkMode > 0) {
+    if (missing_external_thread_env()) {
+      fprintf(stderr,
+              "Warning: BLAS/OpenMP thread env vars were not exported before startup. "
+              "For reproducible benchmarking, prefer scripts/with_benchmark_env.sh because "
+              "late in-process defaults may be too late for some libraries.\n");
+    }
     printf("----------------------------\n");
     if (sys->matvecMode == 0) {
       printf("FMM variables: nLev=%d height=%d ord=%d SepRat=%lg qOrd=%d\n",
