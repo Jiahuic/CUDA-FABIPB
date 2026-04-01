@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include "gkGlobal.h"
@@ -87,6 +88,40 @@ static int missing_external_thread_env(void) {
     }
   }
   return 0;
+}
+
+static void ensure_startup_thread_env(int nargs, char *argv[]) {
+  const char *vars[] = {
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "FABIPB_SETUP_THREADS",
+    "FABIPB_PRECOND_APPLY_THREADS",
+    "FABIPB_NEARFIELD_BUILD_THREADS",
+    "FABIPB_DIRECT_THREADS"
+  };
+  int needsExec = 0;
+  size_t i;
+
+  for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+    if (getenv(vars[i]) == NULL) {
+      setenv(vars[i], "1", 0);
+      needsExec = 1;
+    }
+  }
+
+  if (!needsExec || getenv("FABIPB_THREAD_ENV_REEXEC") != NULL) {
+    return;
+  }
+
+  setenv("FABIPB_THREAD_ENV_REEXEC", "1", 1);
+  execvp(argv[0], argv);
+  fprintf(stderr,
+          "Warning: failed to restart fabipb with pinned thread env (%s). "
+          "Continuing in-process; benchmark reproducibility may be affected.\n",
+          strerror(errno));
 }
 
 static void buildPanelIndexDirect(ssystem *sys) {
@@ -285,6 +320,7 @@ int main(int nargs, char *argv[]){
   double stage_t0, loadPanel_t, gkInit_t, setupFMM_t_local;
   double setupPC_t, setupRHS_t, gmres_t, treecode_t;
 
+  ensure_startup_thread_env(nargs, argv);
   CALLOC(sys, 1, ssystem);
   set_benchmark_thread_defaults();
   sys->height = 2;

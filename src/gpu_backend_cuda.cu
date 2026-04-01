@@ -1195,6 +1195,7 @@ int buildNearfieldTables(const ssystem *sys) {
   int pairIdx;
   long long totalInteractions = 0;
   long long k = 0;
+  long long disjointBuildCount = 0;
   double t0, t1;
   int collectCaseCounts = (sys->benchmarkMode > 0);
   int useGpuDisjointBuild = gpuNearfieldDisjointBuildEnabled(sys);
@@ -1270,19 +1271,23 @@ int buildNearfieldTables(const ssystem *sys) {
               nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
             }
             if (collectCaseCounts) {
-              int caseIdx = nearCaseIndex(nVtx);
-              switch (caseIdx) {
-                case 0: gNear.caseDisjointCount++; break;
-                case 1: gNear.caseOneCommonCount++; break;
-                case 2: gNear.caseTwoCommonCount++; break;
-                case 3: gNear.caseTwoCommonRevCount++; break;
-                case 4: gNear.caseSelfCount++; break;
-                default: break;
+              if (nVtx == 0) {
+                gNear.caseDisjointCount++;
+              } else {
+                int caseIdx = nearCaseIndex(nVtx);
+                switch (caseIdx) {
+                  case 1: gNear.caseOneCommonCount++; break;
+                  case 2: gNear.caseTwoCommonCount++; break;
+                  case 3: gNear.caseTwoCommonRevCount++; break;
+                  case 4: gNear.caseSelfCount++; break;
+                  default: break;
+                }
               }
             }
             gNear.h_dst[idx] = dstPanelIdx;
             gNear.h_src[idx] = srcPanelIdx;
             if (useGpuDisjointBuild && nVtx == 0) {
+              disjointBuildCount++;
               gNear.h_k0[idx] = 0.0;
               gNear.h_k1[idx] = 0.0;
               gNear.h_k2[idx] = 0.0;
@@ -1300,15 +1305,17 @@ int buildNearfieldTables(const ssystem *sys) {
     } else {
       std::vector<std::thread> workers;
       std::vector<long long> threadCounts((size_t)nThreads * 5U, 0);
+      std::vector<long long> threadDisjointBuildCounts((size_t)nThreads, 0);
       int t;
 
       workers.reserve((size_t)nThreads);
       for (t = 0; t < nThreads; t++) {
         int begin = (sys->nNearPairsFlat * t) / nThreads;
         int end = (sys->nNearPairsFlat * (t + 1)) / nThreads;
-        workers.emplace_back([=, &threadCounts]() {
+        workers.emplace_back([=, &threadCounts, &threadDisjointBuildCounts]() {
           int localPairIdx;
           long long *localCounts = &threadCounts[(size_t)t * 5U];
+          long long localDisjointBuildCount = 0;
           for (localPairIdx = begin; localPairIdx < end; localPairIdx++) {
             int srcLeaf = sys->nearPairSrc[localPairIdx];
             int dstLeaf = sys->nearPairDst[localPairIdx];
@@ -1332,14 +1339,19 @@ int buildNearfieldTables(const ssystem *sys) {
                   nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
                 }
                 if (collectCaseCounts) {
-                  int caseIdx = nearCaseIndex(nVtx);
-                  if (caseIdx >= 0) {
-                    localCounts[caseIdx]++;
+                  if (nVtx == 0) {
+                    localCounts[0]++;
+                  } else {
+                    int caseIdx = nearCaseIndex(nVtx);
+                    if (caseIdx >= 1 && caseIdx <= 4) {
+                      localCounts[caseIdx]++;
+                    }
                   }
                 }
                 gNear.h_dst[idx] = dstPanelIdx;
                 gNear.h_src[idx] = srcPanelIdx;
                 if (useGpuDisjointBuild && nVtx == 0) {
+                  localDisjointBuildCount++;
                   gNear.h_k0[idx] = 0.0;
                   gNear.h_k1[idx] = 0.0;
                   gNear.h_k2[idx] = 0.0;
@@ -1354,10 +1366,12 @@ int buildNearfieldTables(const ssystem *sys) {
               }
             }
           }
+          threadDisjointBuildCounts[(size_t)t] = localDisjointBuildCount;
         });
       }
       for (t = 0; t < nThreads; t++) {
         workers[(size_t)t].join();
+        disjointBuildCount += threadDisjointBuildCounts[(size_t)t];
         if (collectCaseCounts) {
           long long *localCounts = &threadCounts[(size_t)t * 5U];
           gNear.caseDisjointCount += localCounts[0];
@@ -1395,7 +1409,7 @@ int buildNearfieldTables(const ssystem *sys) {
   t1 = wall_seconds_cuda_local();
   fmmNearGpuUploadTime += (t1 - t0);
 
-  if (useGpuDisjointBuild && gNear.caseDisjointCount > 0) {
+  if (useGpuDisjointBuild && disjointBuildCount > 0) {
     int blockSize = 256;
     int gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
     if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
@@ -1415,7 +1429,7 @@ int buildNearfieldTables(const ssystem *sys) {
            gNear.caseDisjointCount, gNear.caseOneCommonCount, gNear.caseTwoCommonCount,
            gNear.caseTwoCommonRevCount, gNear.caseSelfCount);
     printf("GPU nearfield stage2 metadata: panels=%d disjoint-interactions=%lld\n",
-           sys->nPnls, gNear.caseDisjointCount);
+           sys->nPnls, disjointBuildCount);
     if (useGpuDisjointBuild) {
       printf("GPU nearfield stage2 mode: disjoint-q1 builder enabled\n");
     }
