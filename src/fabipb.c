@@ -35,7 +35,9 @@ void (*kernelDS)(double r, int p, double *G);
 int (*MtV)(), (*PtV)();
 
 /* routines used by the main routine */
-panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys);
+panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *sys,
+                 const char *meshControlName, double meshControlValue,
+                 const char *backendParamName, double backendParamValue);
 void gkInit(ssystem *sys, panel *pnlList, int order, int orderMom);
 void setupFMM(ssystem *sys);
 void applyFMM( ssystem *sys, double *alpha, double *sgm, double *beta, double *pot );
@@ -244,17 +246,75 @@ static double wall_seconds(void) {
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
 
+static int parse_double_arg(const char *arg, double *value) {
+  char *endptr;
+
+  errno = 0;
+  *value = strtod(arg, &endptr);
+  if (errno != 0 || endptr == arg || *endptr != '\0') {
+    return 0;
+  }
+  return 1;
+}
+
+static int resolve_mesh_parameter(int meshFlag,
+                                  int meshOverrideSet,
+                                  double meshOverrideValue,
+                                  double meshResolution,
+                                  double *backendParamValue,
+                                  const char **meshControlName,
+                                  double *meshControlValue,
+                                  const char **backendParamName) {
+  if (meshOverrideSet) {
+    *backendParamValue = meshOverrideValue;
+    *meshControlName = "backend_override";
+    *meshControlValue = meshOverrideValue;
+  } else {
+    /*
+     * Backend-neutral mesh control:
+     *   mesh_resolution ~ target spacing in Angstrom.
+     * Resolve this to the backend-specific knobs used by the meshers:
+     *   MSMS density      ~ 1 / R^2
+     *   NanoShaper scale  ~ 1 / R
+     * The two backends will still produce different meshes for the same R,
+     * but this gives one monotone control surface for branch experiments.
+     */
+    *meshControlName = "mesh_resolution";
+    *meshControlValue = meshResolution;
+    if (meshFlag == 1) {
+      *backendParamValue = 1.0 / (meshResolution * meshResolution);
+    } else if (meshFlag == 2) {
+      *backendParamValue = 1.0 / meshResolution;
+    } else {
+      return 0;
+    }
+  }
+
+  if (meshFlag == 1) {
+    *backendParamName = "msms_density";
+  } else if (meshFlag == 2) {
+    *backendParamName = "nanoshaper_grid_scale";
+  } else {
+    return 0;
+  }
+
+  return 1;
+}
+
 static void print_usage(const char *prog) {
   printf("Usage: %s [options] <panel-base-or-pqr-path>\n", prog);
   printf("Core options:\n");
   printf("  -g=0|1    CPU only or request GPU (default: auto)\n");
-  printf("  -m=0|1|2  reuse mesh, regenerate with MSMS, or regenerate with NanoShaper (default: 1)\n");
+  printf("  -m=1|2    regenerate with MSMS or NanoShaper (default: 1)\n");
   printf("  -B=0|1    quiet default or benchmark/profiling output (default: 0)\n");
-  printf("  -d=<val>  MSMS density used when -m=1 (default: 1)\n");
+  printf("  -R=<A>    backend-neutral mesh resolution in angstroms (default: 1)\n");
+  printf("            MSMS uses 1/R^2, NanoShaper uses 1/R\n");
+  printf("  -d=<val>  backend-specific override: MSMS density or NanoShaper Grid_scale\n");
+  printf("  -M=0|1    full solve or mesh-only calibration run (default: 0)\n");
   printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");
   printf("  -Q=0|1    CPU-default or GPU-debug Q2M path (default: 0)\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
-  printf("  -P=0|1|2  original, cached-block, or cached-LU preconditioner (default: 2)\n");
+  printf("  -P=-1|0|1|2  disabled, original, cached-block, or cached-LU preconditioner (default: 2)\n");
   printf("  -t=<lev>  tree depth\n");
   printf("  -H=<lev>  coarsest active FMM level (default: 2)\n");
   printf("  -q=<ord>  panel quadrature order\n");
@@ -306,7 +366,7 @@ void setupRHS(ssystem *sys, double *sgm) {
 
 
 int main(int nargs, char *argv[]){
-  char panelfile[80], density[80];
+  char panelfile[80], meshParam[80];
   int order=-1, image=0, refineLev=0, numSurfOne=1;
   int i, j, k, n, nPnls, nChar;
   int numItr=100, arnoldiSz=30, ldw, ldh;
@@ -315,6 +375,14 @@ int main(int nargs, char *argv[]){
   double tolpar=1.0e-4, para=332.0716;
   double *sgm, *pot, *GMRES_work, *GMRES_h, ptl;
   static int info;
+  double meshResolution = 1.0;
+  double meshOverrideValue = 0.0;
+  double meshBackendValue = 0.0;
+  double meshControlValue = 0.0;
+  int meshOverrideSet = 0;
+  int meshOnlyMode = 0;
+  const char *meshControlName = NULL;
+  const char *backendParamName = NULL;
 
   double start_t, end_t;
   double stage_t0, loadPanel_t, gkInit_t, setupFMM_t_local;
@@ -337,7 +405,6 @@ int main(int nargs, char *argv[]){
   sys->gpuQ2MMode = 0;
   sys->gpuNearfieldMode = 1;
   sys->precondCacheMode = 2;
-  sprintf(density,"1");
   double bulk_strength = 0.15;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2);
   kappa = 0.1257;
@@ -365,7 +432,11 @@ int main(int nargs, char *argv[]){
           break;
         case 'H': sys->height = atoi( argv[i]+3 );
           break;
-        case 'd': strcpy(density,argv[i]+3);
+        case 'R':
+          if (!parse_double_arg(argv[i] + 3, &meshResolution)) {
+            printf("Bad mesh resolution: %s\n", argv[i] + 3);
+            exit(0);
+          }
           break;
         case 'e':
           if ( argv[i][4] == '1' ) epsilon1 = atof( argv[i]+6 );
@@ -374,6 +445,8 @@ int main(int nargs, char *argv[]){
         case 'k': kappa = atof( argv[i]+3 );
           break;
         case 'm': sys->mesh_flag = atoi( argv[i]+3 );
+          break;
+        case 'M': meshOnlyMode = atoi( argv[i]+3 );
           break;
         case 'B': sys->benchmarkMode = atoi( argv[i]+3 );
           break;
@@ -390,6 +463,13 @@ int main(int nargs, char *argv[]){
         case 'G': sys->gpuNearfieldMode = atoi( argv[i]+3 );
           break;
         case 'P': sys->precondCacheMode = atoi( argv[i]+3 );
+          break;
+        case 'd':
+          if (!parse_double_arg(argv[i] + 3, &meshOverrideValue)) {
+            printf("Bad mesh override: %s\n", argv[i] + 3);
+            exit(0);
+          }
+          meshOverrideSet = 1;
           break;
       }
     else {
@@ -423,6 +503,26 @@ int main(int nargs, char *argv[]){
     printf("Bad FMM level range: height=%d depth=%d\n", sys->height, sys->depth );
     exit(0);
   }
+  if (sys->mesh_flag != 1 && sys->mesh_flag != 2) {
+    printf("Bad mesh mode: %d (use -m=1 for MSMS or -m=2 for NanoShaper)\n", sys->mesh_flag);
+    exit(0);
+  }
+  if (meshResolution <= 0.0) {
+    printf("Bad mesh resolution: %g (must be > 0)\n", meshResolution);
+    exit(0);
+  }
+  if (meshOverrideSet && meshOverrideValue <= 0.0) {
+    printf("Bad mesh override: %g (must be > 0)\n", meshOverrideValue);
+    exit(0);
+  }
+  if (!resolve_mesh_parameter(sys->mesh_flag, meshOverrideSet, meshOverrideValue,
+                              meshResolution, &meshBackendValue,
+                              &meshControlName, &meshControlValue,
+                              &backendParamName)) {
+    printf("Failed to resolve mesh control parameters for mesh mode %d\n", sys->mesh_flag);
+    exit(0);
+  }
+  snprintf(meshParam, sizeof(meshParam), "%.12g", meshBackendValue);
   //printf("PDB id: %s, MSMS density: %s\n", panelfile, density);
   if (sys->gpuMode < 0) {
     sys->gpuMode = gpuBackendAvailable() ? 1 : 0;
@@ -446,13 +546,15 @@ int main(int nargs, char *argv[]){
       tolpar, arnoldiSz, numItr);
     printf("kappa=%f, eps1=%f, eps2=%f\n", kappa, epsilon1, epsilon2);
     printf("GPU mode=%d (0=CPU, 1=GPU)\n", sys->gpuMode);
+    printf("Mesh control=%s (%g) -> %s=%g\n",
+           meshControlName, meshControlValue, backendParamName, meshBackendValue);
     printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline, 2=direct CPU baseline)\n",
            sys->matvecMode);
     if (sys->matvecMode == 0) {
       printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
       printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
     }
-    printf("Preconditioner mode=%d (0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
+    printf("Preconditioner mode=%d (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
     if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
       printf("Debug compare flags: apply=%d precond=%d\n",
              sys->debugCompareApply, sys->debugComparePrecond);
@@ -467,7 +569,13 @@ int main(int nargs, char *argv[]){
    */
   start_t = wall_seconds();
   stage_t0 = start_t;
-  inputLst = loadPanel(panelfile, density, &nPnls, sys);
+  inputLst = loadPanel(panelfile, meshParam, &nPnls, sys,
+                       meshControlName, meshControlValue,
+                       backendParamName, meshBackendValue);
+  if (meshOnlyMode > 0) {
+    printf("Mesh-only mode: stopping after mesh generation.\n");
+    return 0;
+  }
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
 
@@ -596,6 +704,15 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
 } /* MtVmain */
 
 int PtVmain(double *pot, double *sgm) {
+  int i;
+  int n = 2 * sys->nPnls;
+
+  if (sys->precondCacheMode < 0) {
+    for (i = 0; i < n; i++) {
+      pot[i] = sgm[i];
+    }
+    return 0;
+  }
   if (sys->precondCacheMode > 1) {
     return PtVfmmCachedLU(pot, sgm);
   }

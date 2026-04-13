@@ -30,7 +30,7 @@ This is a dense cached operator, not an on-the-fly direct solver.
 
 ## Why large cases fail
 
-On a large case such as `1a63` at density `10`, the direct GPU path requires
+On a large case such as `1a63` at MSMS density `10`, the direct GPU path requires
 hundreds of gigabytes of device memory.
 
 Example observation from the benchmark machine:
@@ -44,7 +44,7 @@ So the current dense direct GPU path cannot run. It falls back to FMM.
 This is why a run like:
 
 ```sh
-./scripts/with_benchmark_env.sh ./build/fabipb -B=1 -g=1 -r=1 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb -B=1 -g=1 -r=1 -m=1 -R=0.5 test_proteins/1a63
 ```
 
 prints:

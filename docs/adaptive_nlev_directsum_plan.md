@@ -17,7 +17,7 @@ The goal is to answer two related questions:
 
 ## Current evidence
 
-From the current benchmark matrix on `1a63` at density `10`:
+From the current benchmark matrix on `1a63` at MSMS density `10`:
 
 - GPU grouped near-field gives about `19x-26x` speedup over CPU
 - GPU `M2L` gives about `4x-5x` speedup over CPU
@@ -217,7 +217,7 @@ Establish a direct-sum GPU reference point for PB matvecs.
 4. Use matching or near-matching cases:
    - `1ajj`
    - one medium case only if it fits
-   - do not assume `1a63` at density `10` is feasible
+   - do not assume `1a63` at MSMS density `10` is feasible
 5. Record:
    - wall time
    - iteration count

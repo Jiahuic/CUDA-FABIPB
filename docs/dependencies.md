@@ -60,7 +60,7 @@ make PREFIX=/tmp/openblas-0.3.31-install install
 Then run `fabipb` against that local runtime:
 
 ```sh
-env LD_LIBRARY_PATH=/tmp/openblas-0.3.31-install/lib   FABIPB_SETUP_THREADS=1 FABIPB_PRECOND_APPLY_THREADS=1   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1   ./build/fabipb -B=1 -g=0 -P=2 -m=0 test_proteins/1a63
+env LD_LIBRARY_PATH=/tmp/openblas-0.3.31-install/lib   FABIPB_SETUP_THREADS=1 FABIPB_PRECOND_APPLY_THREADS=1   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1   ./build/fabipb -B=1 -g=0 -P=2 -m=1 -R=1.0 test_proteins/1a63
 ```
 
 For apples-to-apples benchmarking against macOS, run:

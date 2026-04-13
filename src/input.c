@@ -79,6 +79,17 @@ static const char *getNanoShaperBin(void) {
   return "NanoShaper";
 }
 
+static void removePanelArtifacts(const char *fpath, const char *panelfile) {
+  char fname[256];
+
+  buildPath(fname, sizeof(fname), fpath, panelfile, ".xyzr");
+  remove(fname);
+  buildPath(fname, sizeof(fname), fpath, panelfile, ".vert");
+  remove(fname);
+  buildPath(fname, sizeof(fname), fpath, panelfile, ".face");
+  remove(fname);
+}
+
 /*
  * calculate area and normal
  */
@@ -102,7 +113,9 @@ double triangle_area(double v[3][3]){
  * loadpanel returns a list of panel structs derived from passed data:
  * shape, vertices, and type.
  */
-panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
+panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *sys,
+                 const char *meshControlName, double meshControlValue,
+                 const char *backendParamName, double backendParamValue) {
   int i, j, k, ii, shape, type, nSurf, mesh_flag=sys->mesh_flag;
   panel *pnlList, *pnl;
   char fpath[256], fname[256];
@@ -158,10 +171,13 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   if (malformedAtomLines > 0) {
     fprintf(stderr, "Warning: skipped %d malformed ATOM/HETATM lines from '%s'\n", malformedAtomLines, panelfile);
   }
-  if (sys->benchmarkMode > 0) {
-    printf("PDB ID = %s\n",panelfile);
-    printf("#Atoms = %d\n",sys->nChar);
-  }
+  printf("Mesh input: panel=%s atoms=%d mode=%s param=%s\n",
+         panelfile,
+         sys->nChar,
+         (mesh_flag == 1) ? "msms" : ((mesh_flag == 2) ? "nanoshaper" : "unknown"),
+         meshParam);
+  printf("Mesh control: %s=%g resolved-%s=%g\n",
+         meshControlName, meshControlValue, backendParamName, backendParamValue);
   fclose(fp);
   fclose(wfp);
 
@@ -203,7 +219,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
       buildPath(ofbase, sizeof(ofbase), fpath, panelfile, "");
       nwritten = snprintf(fname, sizeof(fname),
                           "msms -if %s -prob 1.4 -de %s -of %s > msms.output",
-                          xyzrpath, density, ofbase);
+                          xyzrpath, meshParam, ofbase);
       if (nwritten < 0 || (size_t)nwritten >= sizeof(fname)) {
         fprintf(stderr, "Error: msms command is too long for buffer\n");
         exit(1);
@@ -217,7 +233,7 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     const char *nanoBin = getNanoShaperBin();
     int nwritten;
     wfp = fopen("surfaceConfiguration.prm", "w");
-    fprintf(wfp, "Grid_scale = %s\n", density);
+    fprintf(wfp, "Grid_scale = %s\n", meshParam);
     fprintf(wfp, "Grid_perfil = 90.0\n");
     {
       char xyzrpath[256];
@@ -253,6 +269,16 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     if (ierr != 0) {
       fprintf(stderr, "Error: NanoShaper failed while processing '%s' using executable '%s'\n",
               panelfile, nanoBin);
+      remove("surfaceConfiguration.prm");
+      remove("nsout.txt");
+      remove("stderror.txt");
+      remove("triangleAreas.txt");
+      remove("exposed.xyz");
+      remove("exposedIndices.txt");
+      remove("triangulatedSurf.face");
+      remove("triangulatedSurf.vert");
+      removePanelArtifacts(fpath, panelfile);
+      exit(1);
     }
     remove("nsout.txt");
 
@@ -266,6 +292,11 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     remove("triangleAreas.txt");
     remove("exposed.xyz");
     remove("exposedIndices.txt");
+  } else {
+    fprintf(stderr, "Error: unsupported mesh mode %d (use 1 for MSMS or 2 for NanoShaper)\n",
+            mesh_flag);
+    removePanelArtifacts(fpath, panelfile);
+    exit(1);
   }
   /*======================================================================*/
 
@@ -325,6 +356,8 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
   } else if ( mesh_flag == 2 ) {
     ierr = fscanf(fp, "%d", &nface);
   }
+
+  printf("Mesh raw counts: vertices=%d faces=%d\n", nspt, nface);
 
   /* allocate variables for vertices file */
   CALLOC(nvert, 3*nface, int);
@@ -421,13 +454,10 @@ panel *loadPanel(char *panelfile, char *density, int *numSing, ssystem *sys) {
     }
   }
 
-  if (sys->benchmarkMode > 0) {
-    printf("Area=%f \n",s_area);
-  }
+  printf("Mesh filtered panels: kept=%d area=%f\n", *numSing, s_area);
   //printf("%d ugly faces are deleted\n", nface-*numSing);
 
-  /* Keep generated mesh artifacts on disk so repeated runs can use -m=0
-   * for apples-to-apples CPU/GPU comparisons without remeshing. */
+  removePanelArtifacts(fpath, panelfile);
 
   for (i=0;i<3;i++){
     free(sptpos[i]);

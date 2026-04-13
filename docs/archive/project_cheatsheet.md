@@ -195,7 +195,7 @@ Next highest-value work:
 That harness now exists as a one-shot `applyFMM` comparison mode:
 
 ```sh
-./build/fabipb -g=1 -c=1 -m=0 test_proteins/1a63
+./build/fabipb -g=1 -c=1 -m=1 -R=1.0 test_proteins/1a63
 ```
 
 Look for:

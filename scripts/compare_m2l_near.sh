@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 DEPTHS="${DEPTHS:-5 6 7 8}"
 SETUP_THREADS="${FABIPB_SETUP_THREADS:-1}"
@@ -24,18 +26,14 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   exit 2
 fi
 
+mesh_control_init
+
 timestamp="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${OUT_DIR:-$BUILD_DIR/m2l_near_logs/$timestamp}"
 mkdir -p "$OUT_DIR"
 
-prep_log="$OUT_DIR/prep.log"
-mesh_vert="${panel}.vert"
-mesh_face="${panel}.face"
-if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
-  echo "Preparing mesh artifacts for $panel ..."
-  FABIPB_SETUP_THREADS="$SETUP_THREADS" \
-    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" >"$prep_log" 2>&1
-fi
+prep_log="$OUT_DIR/mesh_control.txt"
+mesh_control_write_summary "$prep_log" "$panel"
 
 run_case() {
   mode="$1"
@@ -44,10 +42,10 @@ run_case() {
   if [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$SETUP_THREADS" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$mode" -m=0 -t="$depth" "$panel" $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" "$panel" $solver_args >"$log" 2>&1
   else
     FABIPB_SETUP_THREADS="$SETUP_THREADS" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$mode" -m=0 -t="$depth" "$panel" >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" "$panel" >"$log" 2>&1
   fi
   echo "$log"
 }
@@ -100,10 +98,9 @@ ratio() {
 echo "M2L/Near comparison"
 echo "  panel: $panel"
 echo "  depths: $DEPTHS"
+echo "  mesh: $MESH_BACKEND via $MESH_CONTROL_LABEL=$MESH_CONTROL_VALUE"
 echo "  FABIPB_SETUP_THREADS: $SETUP_THREADS"
-if [ -f "$prep_log" ]; then
-  echo "  prep: $prep_log"
-fi
+echo "  mesh control log: $prep_log"
 echo
 
 summary="$OUT_DIR/summary.tsv"

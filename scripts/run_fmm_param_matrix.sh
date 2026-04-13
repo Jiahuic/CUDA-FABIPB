@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 DEPTHS="${DEPTHS:-5 6 7 8}"
 HEIGHTS="${HEIGHTS:-1 2 3}"
@@ -9,7 +11,6 @@ ORDER_CASES="${ORDER_CASES:-baseline}"
 CONFIGS="${CONFIGS:-cpu_serial gpu_full hybrid_best}"
 HYBRID_SETUP_THREADS="${HYBRID_SETUP_THREADS:-8}"
 REPEATS="${REPEATS:-10}"
-MESH_DENSITY="${MESH_DENSITY:-10}"
 PREP_MESH="${PREP_MESH:-1}"
 
 if [ "$#" -lt 1 ]; then
@@ -30,6 +31,8 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   echo "  cmake -S . -B $BUILD_DIR && cmake --build $BUILD_DIR" >&2
   exit 2
 fi
+
+mesh_control_init
 
 order_case_args() {
   case "$1" in
@@ -74,16 +77,8 @@ mkdir -p "$OUT_DIR"
 raw_repeats_csv="$OUT_DIR/results_raw.csv"
 raw_csv="$OUT_DIR/results.csv"
 summary_csv="$OUT_DIR/summary.csv"
-prep_log="$OUT_DIR/prep.log"
-
-if [ "$PREP_MESH" = "1" ]; then
-  echo "Preparing mesh artifacts for $panel at density $MESH_DENSITY ..."
-  FABIPB_SETUP_THREADS=1 \
-    ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -m=1 -d="$MESH_DENSITY" "$panel" >"$prep_log" 2>&1
-else
-  echo "Reusing existing mesh artifacts for $panel (PREP_MESH=0)"
-  : >"$prep_log"
-fi
+prep_log="$OUT_DIR/mesh_control.txt"
+mesh_control_write_summary "$prep_log" "$panel"
 
 cat >"$raw_repeats_csv" <<'EOF'
 case_name,depth,height,seprat,order_case,order_arg,ordermom_arg,config,repeat,gpu_mode,gpu_q2m_mode,setup_threads,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,setupFMM_leaf,setupFMM_cube_alloc,setupFMM_layout,setupFMM_apply,setupFMM_panel_index,setupFMM_cubes,setupFMM_m2l_pairs,setupFMM_m2l_groups,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other,applyFMM,Q2M,M2M,M2L,L2L,L2P,Near,near_build,near_h2d,near_kernel,near_d2h,near_meta,near_coeff,near_upload,near_other
@@ -237,18 +232,18 @@ run_case() {
   if [ -n "$solver_args" ] && [ -n "$order_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args $solver_args >"$log" 2>&1
   elif [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" $solver_args >"$log" 2>&1
   elif [ -n "$order_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args >"$log" 2>&1
   else
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" >"$log" 2>&1
   fi
 
   echo "$log"
@@ -368,9 +363,10 @@ echo "  SepRat values: $SEPRATS"
 echo "  order cases: $ORDER_CASES"
 echo "  configs: $CONFIGS"
 echo "  repeats: $REPEATS"
-echo "  mesh density: $MESH_DENSITY"
+echo "  mesh backend: $MESH_BACKEND"
+echo "  mesh control: $MESH_CONTROL_LABEL = $MESH_CONTROL_VALUE"
 echo "  hybrid setup threads: $HYBRID_SETUP_THREADS"
-echo "  prep: $prep_log"
+echo "  mesh control log: $prep_log"
 echo
 
 for depth in $DEPTHS; do

@@ -22,7 +22,8 @@ For BLAS-version sensitivity checks, use:
 
 Important:
 
-- keep the mesh fixed with `-m=0`
+- remesh every run for release-style benchmarks
+- keep the mesher and `-R` value fixed across compared runs
 - record the exact OpenBLAS library path and version in benchmark notes
 - if a machine converges under one OpenBLAS version and fails under another,
   treat that as an environment-sensitive result and document it explicitly
