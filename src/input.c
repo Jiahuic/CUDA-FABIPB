@@ -10,6 +10,9 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #define MAXCOND 50
@@ -88,6 +91,112 @@ static void removePanelArtifacts(const char *fpath, const char *panelfile) {
   remove(fname);
   buildPath(fname, sizeof(fname), fpath, panelfile, ".face");
   remove(fname);
+}
+
+static void joinPath(char *out, size_t outSize, const char *dir, const char *name) {
+  int nwritten = snprintf(out, outSize, "%s/%s", dir, name);
+  if (nwritten < 0 || (size_t)nwritten >= outSize) {
+    fprintf(stderr, "Error: generated path is too long for buffer\n");
+    exit(1);
+  }
+}
+
+static void makeAbsolutePath(char *out, size_t outSize, const char *path) {
+  char cwd[512];
+  int nwritten;
+
+  if (path[0] == '/') {
+    nwritten = snprintf(out, outSize, "%s", path);
+  } else {
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+      fprintf(stderr, "Error: getcwd failed while building absolute path\n");
+      exit(1);
+    }
+    nwritten = snprintf(out, outSize, "%s/%s", cwd, path);
+  }
+  if (nwritten < 0 || (size_t)nwritten >= outSize) {
+    fprintf(stderr, "Error: generated absolute path is too long for buffer\n");
+    exit(1);
+  }
+}
+
+static void shellQuote(char *out, size_t outSize, const char *in) {
+  size_t pos = 0;
+  size_t i;
+
+  if (outSize < 3) {
+    fprintf(stderr, "Error: shell quote buffer too small\n");
+    exit(1);
+  }
+  out[pos++] = '\'';
+  for (i = 0; in[i] != '\0'; i++) {
+    if (in[i] == '\'') {
+      const char *esc = "'\\''";
+      size_t j;
+      for (j = 0; esc[j] != '\0'; j++) {
+        if (pos + 1 >= outSize) {
+          fprintf(stderr, "Error: shell-quoted path is too long for buffer\n");
+          exit(1);
+        }
+        out[pos++] = esc[j];
+      }
+    } else {
+      if (pos + 1 >= outSize) {
+        fprintf(stderr, "Error: shell-quoted path is too long for buffer\n");
+        exit(1);
+      }
+      out[pos++] = in[i];
+    }
+  }
+  if (pos + 1 >= outSize) {
+    fprintf(stderr, "Error: shell-quoted path is too long for buffer\n");
+    exit(1);
+  }
+  out[pos++] = '\'';
+  out[pos] = '\0';
+}
+
+static void makeNanoTempDir(char *tmpDir, size_t tmpDirSize) {
+  int attempt;
+  long pid = (long)getpid();
+
+  for (attempt = 0; attempt < 100; attempt++) {
+    int nwritten = snprintf(tmpDir, tmpDirSize, ".fabipb_nanoshaper_%ld_%d", pid, attempt);
+    if (nwritten < 0 || (size_t)nwritten >= tmpDirSize) {
+      fprintf(stderr, "Error: NanoShaper temp directory path is too long\n");
+      exit(1);
+    }
+    if (mkdir(tmpDir, 0700) == 0) {
+      return;
+    }
+    if (errno != EEXIST) {
+      fprintf(stderr, "Error: cannot create NanoShaper temp directory '%s'\n", tmpDir);
+      exit(1);
+    }
+  }
+  fprintf(stderr, "Error: could not create a unique NanoShaper temp directory\n");
+  exit(1);
+}
+
+static void cleanupNanoTempDir(const char *tmpDir) {
+  const char *files[] = {
+    "surfaceConfiguration.prm",
+    "nsout.txt",
+    "stderror.txt",
+    "triangleAreas.txt",
+    "exposed.xyz",
+    "exposedIndices.txt",
+    "triangulatedSurf.face",
+    "triangulatedSurf.vert"
+  };
+  char path[512];
+  size_t i;
+
+  for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    joinPath(path, sizeof(path), tmpDir, files[i]);
+    remove(path);
+  }
+  rmdir(tmpDir);
 }
 
 /*
@@ -232,14 +341,36 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   } else if ( mesh_flag == 2 ) {
     const char *nanoBin = getNanoShaperBin();
     int nwritten;
-    wfp = fopen("surfaceConfiguration.prm", "w");
+    char tmpDir[256], prmPath[512], faceTmp[512], vertTmp[512];
+    char xyzrpath[256], xyzrAbs[512], nanoBinPath[512];
+    char quotedTmpDir[768], quotedNanoBin[768], command[2048];
+
+    makeNanoTempDir(tmpDir, sizeof(tmpDir));
+    joinPath(prmPath, sizeof(prmPath), tmpDir, "surfaceConfiguration.prm");
+    joinPath(faceTmp, sizeof(faceTmp), tmpDir, "triangulatedSurf.face");
+    joinPath(vertTmp, sizeof(vertTmp), tmpDir, "triangulatedSurf.vert");
+    buildPath(xyzrpath, sizeof(xyzrpath), fpath, panelfile, ".xyzr");
+    makeAbsolutePath(xyzrAbs, sizeof(xyzrAbs), xyzrpath);
+    if (strchr(nanoBin, '/') != NULL) {
+      makeAbsolutePath(nanoBinPath, sizeof(nanoBinPath), nanoBin);
+    } else {
+      nwritten = snprintf(nanoBinPath, sizeof(nanoBinPath), "%s", nanoBin);
+      if (nwritten < 0 || (size_t)nwritten >= sizeof(nanoBinPath)) {
+        fprintf(stderr, "Error: NanoShaper executable path is too long\n");
+        cleanupNanoTempDir(tmpDir);
+        exit(1);
+      }
+    }
+
+    wfp = fopen(prmPath, "w");
+    if (wfp == NULL) {
+      fprintf(stderr, "Error: cannot write NanoShaper configuration '%s'\n", prmPath);
+      cleanupNanoTempDir(tmpDir);
+      exit(1);
+    }
     fprintf(wfp, "Grid_scale = %s\n", meshParam);
     fprintf(wfp, "Grid_perfil = 90.0\n");
-    {
-      char xyzrpath[256];
-      buildPath(xyzrpath, sizeof(xyzrpath), fpath, panelfile, ".xyzr");
-      fprintf(wfp, "XYZR_FileName = %s\n", xyzrpath);
-    }
+    fprintf(wfp, "XYZR_FileName = %s\n", xyzrAbs);
     fprintf(wfp, "Build_epsilon_maps = false\n");
     fprintf(wfp, "Build_status_map = false\n");
     fprintf(wfp, "Save_Mesh_MSMS_Format = true\n");
@@ -260,38 +391,40 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
     fprintf(wfp, "Save_PovRay = false\n");
     fclose(wfp);
 
-    nwritten = snprintf(fname, sizeof(fname), "%s surfaceConfiguration.prm >> nsout.txt", nanoBin);
-    if (nwritten < 0 || (size_t)nwritten >= sizeof(fname)) {
+    shellQuote(quotedTmpDir, sizeof(quotedTmpDir), tmpDir);
+    shellQuote(quotedNanoBin, sizeof(quotedNanoBin), nanoBinPath);
+    nwritten = snprintf(command, sizeof(command), "cd %s && %s surfaceConfiguration.prm >> nsout.txt",
+                        quotedTmpDir, quotedNanoBin);
+    if (nwritten < 0 || (size_t)nwritten >= sizeof(command)) {
       fprintf(stderr, "Error: NanoShaper command is too long for buffer\n");
+      cleanupNanoTempDir(tmpDir);
       exit(1);
     }
-    ierr = system(fname);
+    ierr = system(command);
     if (ierr != 0) {
       fprintf(stderr, "Error: NanoShaper failed while processing '%s' using executable '%s'\n",
               panelfile, nanoBin);
-      remove("surfaceConfiguration.prm");
-      remove("nsout.txt");
-      remove("stderror.txt");
-      remove("triangleAreas.txt");
-      remove("exposed.xyz");
-      remove("exposedIndices.txt");
-      remove("triangulatedSurf.face");
-      remove("triangulatedSurf.vert");
+      cleanupNanoTempDir(tmpDir);
       removePanelArtifacts(fpath, panelfile);
       exit(1);
     }
-    remove("nsout.txt");
 
     buildPath(fname, sizeof(fname), fpath, panelfile, ".face");
-    rename("triangulatedSurf.face", fname);
+    if (rename(faceTmp, fname) != 0) {
+      fprintf(stderr, "Error: cannot move NanoShaper face output to '%s'\n", fname);
+      cleanupNanoTempDir(tmpDir);
+      removePanelArtifacts(fpath, panelfile);
+      exit(1);
+    }
     buildPath(fname, sizeof(fname), fpath, panelfile, ".vert");
-    rename("triangulatedSurf.vert", fname);
+    if (rename(vertTmp, fname) != 0) {
+      fprintf(stderr, "Error: cannot move NanoShaper vertex output to '%s'\n", fname);
+      cleanupNanoTempDir(tmpDir);
+      removePanelArtifacts(fpath, panelfile);
+      exit(1);
+    }
 
-    remove("stderror.txt");
-    remove("surfaceConfiguration.prm");
-    remove("triangleAreas.txt");
-    remove("exposed.xyz");
-    remove("exposedIndices.txt");
+    cleanupNanoTempDir(tmpDir);
   } else {
     fprintf(stderr, "Error: unsupported mesh mode %d (use 1 for MSMS or 2 for NanoShaper)\n",
             mesh_flag);
