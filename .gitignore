@@ -1,5 +1,7 @@
 build/
 build-*/
+results/*
+!results/README.md
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -17,6 +19,10 @@ test_proteins/*.xyzr
 test_proteins/*.vert
 test_proteins/*.face
 test_proteins/H1N1.pqr
+test_proteins/H1N1_atoms.pqr
+test_proteins/ZIKV_6CO8_zenodo.pqr
+TABI-PB/examples/pqr.zip
+TABI-PB/examples/zenodo_4568768/
 bimpb_cuda/
 .codex
 .omx/

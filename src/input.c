@@ -37,21 +37,56 @@ static void buildPath(char *fname, size_t fnameSize, const char *fpath, const ch
 
 static int parsePqrAtomLine(const char *line, double *x, double *y, double *z,
                             double *charge, double *radius, int *isMalformedAtomLine) {
-  char rec[16], a2[32], a3[32], a4[32], a5[32];
-  int nread;
+  char copy[512];
+  char *tokens[32];
+  char *tok;
+  int ntok = 0;
+  char *endptr;
 
   *isMalformedAtomLine = 0;
-  nread = sscanf(line, "%15s %31s %31s %31s %31s %lf %lf %lf %lf %lf",
-                 rec, a2, a3, a4, a5, x, y, z, charge, radius);
-  if (nread == EOF || nread <= 0) {
+  snprintf(copy, sizeof(copy), "%s", line);
+
+  tok = strtok(copy, " \t\r\n");
+  while (tok != NULL && ntok < (int)(sizeof(tokens) / sizeof(tokens[0]))) {
+    tokens[ntok++] = tok;
+    tok = strtok(NULL, " \t\r\n");
+  }
+
+  if (ntok <= 0) {
     return 0;
   }
 
-  if (strcmp(rec, "ATOM") != 0 && strcmp(rec, "HETATM") != 0) {
+  if (strcmp(tokens[0], "ATOM") != 0 && strcmp(tokens[0], "HETATM") != 0) {
     return 0;
   }
 
-  if (nread != 10) {
+  if (ntok < 10) {
+    *isMalformedAtomLine = 1;
+    return 0;
+  }
+
+  *radius = strtod(tokens[ntok - 1], &endptr);
+  if (*endptr != '\0') {
+    *isMalformedAtomLine = 1;
+    return 0;
+  }
+  *charge = strtod(tokens[ntok - 2], &endptr);
+  if (*endptr != '\0') {
+    *isMalformedAtomLine = 1;
+    return 0;
+  }
+  *z = strtod(tokens[ntok - 3], &endptr);
+  if (*endptr != '\0') {
+    *isMalformedAtomLine = 1;
+    return 0;
+  }
+  *y = strtod(tokens[ntok - 4], &endptr);
+  if (*endptr != '\0') {
+    *isMalformedAtomLine = 1;
+    return 0;
+  }
+  *x = strtod(tokens[ntok - 5], &endptr);
+  if (*endptr != '\0') {
     *isMalformedAtomLine = 1;
     return 0;
   }
@@ -238,12 +273,13 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   int **extr_v, **extr_f, *nvert;
   double dist_local, area_local, cpuf;
   int nspt, natm, nface;
-  int malformedAtomLines, skippedZeroRadius, parsedAtom, filledAtoms;
+  int malformedAtomLines, zeroRadiusAtoms, parsedAtom, filledAtoms, meshAtoms;
 
   double *nrm, len;
 
   /* read in vertices */
   sys->nChar = 0;
+  meshAtoms = 0;
   sprintf(fpath,"test_proteins/");
   buildPath(fname, sizeof(fname), fpath, panelfile, ".pqr");
   fp=fopen(fname,"r");
@@ -256,7 +292,7 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   buildPath(fname, sizeof(fname), fpath, panelfile, ".xyzr");
   wfp=fopen(fname,"w");
   malformedAtomLines = 0;
-  skippedZeroRadius = 0;
+  zeroRadiusAtoms = 0;
   while (fgets(line, sizeof(line), fp) != NULL) {
     int malformedThisLine = 0;
     parsedAtom = parsePqrAtomLine(line, &a1, &a2, &a3, &b1, &b2, &malformedThisLine);
@@ -268,20 +304,23 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
       continue;
     }
     if (b2 <= 0.0) {
-      skippedZeroRadius++;
-      continue;
+      zeroRadiusAtoms++;
+    } else {
+      fprintf(wfp,"%f %f %f %f\n",a1,a2,a3,b2);
+      meshAtoms++;
     }
-    fprintf(wfp,"%f %f %f %f\n",a1,a2,a3,b2);
     sys->nChar++;
   }
-  if (skippedZeroRadius > 0) {
-    fprintf(stderr, "Warning: skipped %d zero-radius atoms from '%s'\n", skippedZeroRadius, panelfile);
+  if (zeroRadiusAtoms > 0) {
+    fprintf(stderr, "Info: kept %d zero-radius atoms as charges and excluded them from mesh for '%s'\n",
+            zeroRadiusAtoms, panelfile);
   }
   if (malformedAtomLines > 0) {
     fprintf(stderr, "Warning: skipped %d malformed ATOM/HETATM lines from '%s'\n", malformedAtomLines, panelfile);
   }
-  printf("Mesh input: panel=%s atoms=%d mode=%s param=%s\n",
+  printf("Mesh input: panel=%s mesh_atoms=%d charge_atoms=%d mode=%s param=%s\n",
          panelfile,
+         meshAtoms,
          sys->nChar,
          (mesh_flag == 1) ? "msms" : ((mesh_flag == 2) ? "nanoshaper" : "unknown"),
          meshParam);
@@ -290,8 +329,12 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   fclose(fp);
   fclose(wfp);
 
-  if (sys->nChar <= 0) {
+  if (meshAtoms <= 0) {
     fprintf(stderr, "Error: no positive-radius ATOM/HETATM records were parsed from '%s'\n", panelfile);
+    exit(1);
+  }
+  if (sys->nChar <= 0) {
+    fprintf(stderr, "Error: no ATOM/HETATM charge records were parsed from '%s'\n", panelfile);
     exit(1);
   }
 
@@ -303,7 +346,7 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   while (fgets(line, sizeof(line), fp) != NULL && filledAtoms < sys->nChar) {
     int malformedThisLine = 0;
     parsedAtom = parsePqrAtomLine(line, &a1, &a2, &a3, &b1, &b2, &malformedThisLine);
-    if (!parsedAtom || malformedThisLine || b2 <= 0.0) {
+    if (!parsedAtom || malformedThisLine) {
       continue;
     }
     sys->pos[3*filledAtoms]=a1;
@@ -335,9 +378,12 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
       }
     }
     //printf("%s\n",fname);
-    ierr=system(fname);
-    sprintf(fname,"rm msms.output");
-    //ierr=system(fname);
+    ierr = system(fname);
+    if (ierr != 0) {
+      fprintf(stderr, "Error: msms failed while processing '%s'\n", panelfile);
+      removePanelArtifacts(fpath, panelfile);
+      exit(1);
+    }
   } else if ( mesh_flag == 2 ) {
     const char *nanoBin = getNanoShaperBin();
     int nwritten;

@@ -21,6 +21,8 @@
 #include "direct_backend.h"
 #include "gpu_backend.h"
 
+#define DEFAULT_MAX_DIRECT_RHS_PAIRS 5000000000ULL
+
 /* global variables */
 int orderMom=0;
 double kappa, epsilon, epsilon1=1.0, epsilon2=80.0;
@@ -90,6 +92,51 @@ static int missing_external_thread_env(void) {
     }
   }
   return 0;
+}
+
+static unsigned long long getMaxDirectRhsPairs(void) {
+  const char *env = getenv("FABIPB_MAX_DIRECT_RHS_PAIRS");
+  char *endptr = NULL;
+  unsigned long long value;
+
+  if (env == NULL || env[0] == '\0') {
+    return DEFAULT_MAX_DIRECT_RHS_PAIRS;
+  }
+
+  errno = 0;
+  value = strtoull(env, &endptr, 10);
+  if (errno != 0 || endptr == env || *endptr != '\0') {
+    fprintf(stderr, "Warning: ignoring invalid FABIPB_MAX_DIRECT_RHS_PAIRS='%s'\n", env);
+    return DEFAULT_MAX_DIRECT_RHS_PAIRS;
+  }
+
+  return value;
+}
+
+static int allowLargeDirectRhs(void) {
+  const char *env = getenv("FABIPB_ALLOW_LARGE_DIRECT_RHS");
+  return env != NULL && strcmp(env, "1") == 0;
+}
+
+static unsigned long long countDirectRhsPairs(int nPnls, int nChar) {
+  return (unsigned long long)nPnls * (unsigned long long)nChar;
+}
+
+static void checkDirectRhsLimit(int nPnls, int nChar) {
+  unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
+  unsigned long long maxDirectRhsPairs = getMaxDirectRhsPairs();
+
+  if (rhsPairs > maxDirectRhsPairs && !allowLargeDirectRhs()) {
+    fprintf(stderr,
+            "Error: direct setupRHS would require %llu panel-charge interactions "
+            "(panels=%d charges=%d), above FABIPB_MAX_DIRECT_RHS_PAIRS=%llu.\n",
+            rhsPairs, nPnls, nChar, maxDirectRhsPairs);
+    fprintf(stderr,
+            "This direct RHS path is not practical for large virus-scale meshes. "
+            "Use a coarser mesh, implement an accelerated RHS path, or set "
+            "FABIPB_ALLOW_LARGE_DIRECT_RHS=1 only for an intentional long run.\n");
+    exit(1);
+  }
 }
 
 static void ensure_startup_thread_env(int nargs, char *argv[]) {
@@ -328,6 +375,9 @@ static void print_usage(const char *prog) {
   printf("Development/debug options:\n");
   printf("  -c=1      compare one CPU/GPU applyFMM call before GMRES\n");
   printf("  -C=1      compare one original/cached preconditioner apply before GMRES\n");
+  printf("Environment guards:\n");
+  printf("  FABIPB_MAX_DIRECT_RHS_PAIRS=<n>  cap direct setupRHS work\n");
+  printf("  FABIPB_ALLOW_LARGE_DIRECT_RHS=1  bypass the direct setupRHS cap\n");
   printf("  -h        show this help\n");
 }
 /*
@@ -336,11 +386,20 @@ static void print_usage(const char *prog) {
 void setupRHS(ssystem *sys, double *sgm) {
   int i, j;
   int nPnls = sys->nPnls, nChar = sys->nChar, qOrder=sys->maxQuadOrder;
+  unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
+  unsigned long long maxDirectRhsPairs = getMaxDirectRhsPairs();
   double *intgr, fac;
   panel *pnl;
   static int warnedGpuRHS = 0;
 
   fac = fourPiI/epsilon1;
+
+  checkDirectRhsLimit(nPnls, nChar);
+
+  if (sys->benchmarkMode > 0) {
+    printf("setupRHS direct pairs: panels=%d charges=%d pairs=%llu limit=%llu\n",
+           nPnls, nChar, rhsPairs, maxDirectRhsPairs);
+  }
 
   if (sys->gpuMode > 0 && gpuSetupRHS(sys, qOrder, fac, sgm)) {
     return;
@@ -576,6 +635,7 @@ int main(int nargs, char *argv[]){
     printf("Mesh-only mode: stopping after mesh generation.\n");
     return 0;
   }
+  checkDirectRhsLimit(nPnls, sys->nChar);
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
 
