@@ -66,12 +66,14 @@ void mkIndex(int order) {
  * Taylor coefficients using the trapezoidal rule and FFTs
  */
 void initExpan(ssystem *sys) {
-  int order, nMoments;
+  int order, derivOrder, nMoments, nDerivatives;
   int p, k, n, k1, k2, k3;
   int sgn=1;
 
   order = sys->maxOrder;
+  derivOrder = order + 1;
   nMoments = sys->nMom[order];
+  nDerivatives = sys->nMom[derivOrder];
   /*
    * fact[i] = i!                    factorial
    * ifact[i] = 1/fact[i]
@@ -81,16 +83,16 @@ void initExpan(ssystem *sys) {
    */
   CALLOC(fact, order+4, double);
   CALLOC(ifact, order+4, double);
-  CALLOC(fact3, nMoments, double);
-  CALLOC(ifact3, nMoments, double);
-  CALLOC(sgn3, nMoments, int);
+  CALLOC(fact3, nDerivatives, double);
+  CALLOC(ifact3, nDerivatives, double);
+  CALLOC(sgn3, nDerivatives, int);
 
   for ( fact[0]=ifact[0]=1.0, k=1; k<=order+3; k++ ) {
     fact[k] = fact[k-1]*k;
     ifact[k] = 1.0/fact[k];
   }
 
-  for ( k=n=0; n<=order; n++, sgn*=-1 ) {
+  for ( k=n=0; n<=derivOrder; n++, sgn*=-1 ) {
     for ( k1=0; k1<=n; k1++ ) {
       for ( k2=0; k2<=n-k1; k2++, k++ ) {
         k3=n-k1-k2;
@@ -101,14 +103,19 @@ void initExpan(ssystem *sys) {
     }
   }
 
-  mkIndex(order);
+  mkIndex(derivOrder);
 
-  CALLOC(Gvals0, order+1, double);
-  CALLOC(dG0, order+1, double*);
-  CALLOC(Gvalsk, order+1, double);
-  CALLOC(dGk, order+1, double*);
-  for ( k=0; k<=order; k++ ) {
-    p = order-k;
+  /*
+   * RHS normal derivatives differentiate a charge multipole expansion
+   * once at the target. Keep one derivative order beyond the largest
+   * moment order so the top-order moment is not silently omitted.
+   */
+  CALLOC(Gvals0, derivOrder+1, double);
+  CALLOC(dG0, derivOrder+1, double*);
+  CALLOC(Gvalsk, derivOrder+1, double);
+  CALLOC(dGk, derivOrder+1, double*);
+  for ( k=0; k<=derivOrder; k++ ) {
+    p = derivOrder-k;
     CALLOC(dG0[k], sys->nMom[p], double);
     CALLOC(dGk[k], sys->nMom[p], double);
   }

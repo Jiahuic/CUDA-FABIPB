@@ -32,7 +32,7 @@ fi
 mesh_control_init
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/benchmark_matrix/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/benchmark_matrix/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 raw_csv="$OUT_DIR/results.csv"

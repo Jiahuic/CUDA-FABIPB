@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
   echo "Usage: $0 <mesh_calibration.csv> <msms|nanoshaper> <target_kept_panels> [panel]" >&2
-  echo "Example: $0 build/.../mesh_calibration.csv msms 5000 test_proteins/1ajj" >&2
+  echo "Example: $0 results/mesh_calibration/.../mesh_calibration.csv msms 5000 test_proteins/1ajj" >&2
   exit 2
 fi
 

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <math.h>
 #include "gkGlobal.h"
 #include "gk.h"
@@ -12,6 +13,8 @@ void dgemv_(char *tr, int *m, int *n, double *alpha, double *A, int *lda,
 void setupDerivs(int order, double *x );
 double *panelPotential(int qOrder, double *r, panel *pnl);
 void transM2M(ssystem *sys, cube *cbIn, cube *cbOut);
+void kernelRHS(double *x, double *y);
+int rhsChargeExpansionOrder(ssystem *sys, int level);
 
 extern double **dG0;     /* workspace for setupDerivs */
 extern double **dGk;     /* workspace for setupDerivs */
@@ -21,12 +24,41 @@ extern void (*kernel)();
 extern double **Q2M0, **Q2M1;   /* moments */
 extern double *ifact3;
 extern int *sgn3;
+extern int ***idx3;
+extern double fourPiI;
 
-double partcluster( ssystem *sys, double *G0, double *Gk, cube *cb ) {
+double rhsTreeTheta(void) {
+  static int initialized = 0;
+  static double theta = 0.2;
+
+  if (!initialized) {
+    const char *env = getenv("FABIPB_RHS_TREE_THETA");
+    initialized = 1;
+    if (env != NULL) {
+      char *endptr = NULL;
+      double value;
+
+      errno = 0;
+      value = strtod(env, &endptr);
+      if (errno == 0 && endptr != env && *endptr == '\0' &&
+          value > 0.0 && value <= 1.0) {
+        theta = value;
+      } else {
+        fprintf(stderr,
+                "Warning: ignoring invalid FABIPB_RHS_TREE_THETA='%s'; using 0.2\n",
+                env);
+      }
+    }
+  }
+  return theta;
+}
+
+static void partclusterComponents(ssystem *sys, double *G0, double *Gk,
+                                  cube *cb, double *pot0, double *pot1) {
   int i, k1, k2, k3, k, j;
   int order = sys->ordM2L[cb->level];
   int nMom  = sys->nMom[order];
-  double tmp, tmp1, tmp2, pot;
+  double tmp, tmp1, tmp2;
   double *mom_pot, *mom_dpdn, *lec_k1, *lec_k2;
 
   mom_pot = cb->mom_pot; mom_dpdn = cb->mom_dpdn;
@@ -36,9 +68,14 @@ double partcluster( ssystem *sys, double *G0, double *Gk, cube *cb ) {
     tmp2 += tmp*mom_pot[i] *(epsilon*Gk[i]-G0[i]);
     //printf("%f %f %f %e %e\n",ifact3[i],mom_dpdn[i],mom_pot[i],G0[i],Gk[i]);
   }
-  pot = tmp1+tmp2;
+  *pot0 = tmp2;
+  *pot1 = tmp1;
+}
 
-  return pot;
+double partcluster( ssystem *sys, double *G0, double *Gk, cube *cb ) {
+  double pot0, pot1;
+  partclusterComponents(sys, G0, Gk, cb, &pot0, &pot1);
+  return pot0 + pot1;
 }
 
 double Treecode( ssystem *sys, cube *cb, double *pos, double *sgm ) {
@@ -94,25 +131,50 @@ double Treecode( ssystem *sys, cube *cb, double *pos, double *sgm ) {
   }
 }
 
-/*
- * this subroutine apply the particle-cluster interaction
- * work on source term and solvation energy
- * input should specify the kernels (can't apply it on RHS)
-*/
-//void applyTreecode( ssystem *sys, double *sgm, double *pot, void (*kernelType)() ) {
-void applyTreecode( ssystem *sys, double *sgm, double *pot ) {
-  cube *cb, *Topcb=sys->cubeList[0];
-  int depth=sys->depth, height=sys->height, nPnls=sys->nPnls;
-  int nKid, nKid1, iNbr, iPnl, nNbrs, idx, nMom, order;
-  int i, k, lev, n, n1, inc = 1;
-  double r[3], *self;
-  double *x, *y, *k1, *k2;
+static void TreecodeComponents(ssystem *sys, cube *cb, double *pos,
+                               double *sgm, double *pot0, double *pot1) {
+  int order = sys->ordM2L[cb->level];
+  int i, k;
+  double theta = 0.2;
+  double dist, r[3], *intgr;
+  panel *pnl;
 
-  /* zero out mom's and lec's */
-  for ( lev=depth; lev>=height; lev-- ) {
-    nMom  = sys->nMom[sys->ordMom[lev]];
-    for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
-      for ( k=0; k<nMom;  k++ ) {
+  for (k=0; k<3; k++) r[k] = pos[k]-cb->x[k];
+  dist = sqrt(SQR(r[0])+SQR(r[1])+SQR(r[2]));
+
+  if (cb->eRad < theta*dist && cb->level >= sys->height) {
+    double cluster0, cluster1;
+    setupDerivs(order, r);
+    partclusterComponents(sys, dG0[0], dGk[0], cb, &cluster0, &cluster1);
+    *pot0 += cluster0;
+    *pot1 += cluster1;
+    return;
+  }
+
+  if (cb->level == sys->depth) {
+    for (i=0, pnl=cb->pnls; i<cb->nPnls; i++, pnl=pnl->nextC) {
+      intgr = panelPotential(sys->maxQuadOrder, pos, pnl);
+      *pot0 += intgr[1]*sgm[pnl->idx];
+      *pot1 += intgr[0]*sgm[pnl->idx+sys->nPnls];
+    }
+    return;
+  }
+
+  for (i=0; i<cb->nKids; i++) {
+    TreecodeComponents(sys, cb->kids[i], pos, sgm, pot0, pot1);
+  }
+}
+
+static void buildTreecodeMoments(ssystem *sys, double *sgm) {
+  cube *cb;
+  int depth=sys->depth, height=sys->height, nPnls=sys->nPnls;
+  int nKid, idx, nMom, lev, k, n, inc=1;
+  double *x, *y;
+
+  for (lev=depth; lev>=height; lev--) {
+    nMom = sys->nMom[sys->ordMom[lev]];
+    for (cb=sys->cubeList[lev]; cb != NULL; cb=cb->next) {
+      for (k=0; k<nMom; k++) {
         cb->mom_pot[k] = 0.;
         cb->mom_dpdn[k] = 0.;
       }
@@ -120,7 +182,7 @@ void applyTreecode( ssystem *sys, double *sgm, double *pot ) {
   }
 
   nMom = sys->nMom[sys->ordMom[depth]];
-  for ( idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++ ) {
+  for (idx=0, cb=sys->cubeList[depth]; cb != NULL; cb=cb->next, idx++) {
     x = &(sgm[cb->pnls->idx]);
     n = cb->nPnls;
     y = cb->mom_pot;
@@ -129,15 +191,156 @@ void applyTreecode( ssystem *sys, double *sgm, double *pot ) {
     y = cb->mom_dpdn;
     dgemv_(&nChr, &nMom, &n, &one, Q2M0[idx], &nMom, x, &inc, &one, y, &inc);
   }
-  for ( lev=depth-1; lev>=height; lev-- ) {
-    for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
-      for ( nKid=0; nKid<cb->nKids; nKid++ ) {
+  for (lev=depth-1; lev>=height; lev--) {
+    for (cb=sys->cubeList[lev]; cb != NULL; cb=cb->next) {
+      for (nKid=0; nKid<cb->nKids; nKid++) {
         transM2M(sys, cb->kids[nKid], cb);
       }
     }
   }
-  for ( *pot = 0.,i=0; i<sys->nChar; i++ ) {
+}
+
+/*
+ * this subroutine apply the particle-cluster interaction
+ * work on source term and solvation energy
+ * input should specify the kernels (can't apply it on RHS)
+*/
+//void applyTreecode( ssystem *sys, double *sgm, double *pot, void (*kernelType)() ) {
+void applyTreecode( ssystem *sys, double *sgm, double *pot ) {
+  cube *Topcb=sys->cubeList[0];
+  int i;
+
+  buildTreecodeMoments(sys, sgm);
+  for (*pot=0., i=0; i<sys->nChar; i++) {
     *pot += sys->chr[i]*Treecode(sys, Topcb, &sys->pos[3*i], sgm);
   }
-
 }
+
+void applyTreecodeComponents(ssystem *sys, double *sgm,
+                             double *pot0, double *pot1) {
+  cube *Topcb=sys->cubeList[0];
+  int i;
+
+  buildTreecodeMoments(sys, sgm);
+  *pot0 = 0.;
+  *pot1 = 0.;
+  for (i=0; i<sys->nChar; i++) {
+    double chargePot0 = 0., chargePot1 = 0.;
+    TreecodeComponents(sys, Topcb, &sys->pos[3*i], sgm,
+                       &chargePot0, &chargePot1);
+    *pot0 += sys->chr[i]*chargePot0;
+    *pot1 += sys->chr[i]*chargePot1;
+  }
+}
+
+/*
+ * evaluates a charge cluster's multipole expansion (built by
+ * computeChgMoments() in chargeTree.c) at a target panel quadrature
+ * point, producing the same two RHS quantities as kernelRHS(): the
+ * potential and its derivative in the panel's own normal direction.
+ * Caller must have already called setupDerivs(order, r) for the
+ * relative vector r = quadPt - chgCb->x.
+ *
+ * kernelDC0() (used by setupDerivs -> dG0) bakes fourPiI into G[0],
+ * while kernelRHS() (used by the near-field direct sum below) does
+ * not; dividing by fourPiI here keeps both branches on the same
+ * scale, since setupRHS applies fourPiI/epsilon1 once at the end.
+ */
+static void chgClusterEval(ssystem *sys, cube *chgCb, panel *pnlX, double *y) {
+  int order = rhsChargeExpansionOrder(sys, chgCb->level);
+  int nMom = sys->nMom[order];
+  double *mom = chgCb->mom_chr;
+  double *nrm = pnlX->normal;
+  double y0 = 0.0, y1 = 0.0;
+  int i, i1, i2, i3, n;
+
+  ASSERT(chgCb->level >= 0 && chgCb->level <= sys->chgDepth);
+  ASSERT(order >= 0 && order <= sys->maxOrder);
+  ASSERT(nMom > 0 && nMom < 1000000);
+  ASSERT(mom != NULL);
+
+  /*
+   * y0 = Phi(target) = sum_alpha sgn3[alpha]*mom_chr[alpha]*D^alpha_r G(r),
+   * the standard multipole-to-local evaluation (mirrors partcluster()'s
+   * combination of mom_pot/mom_dpdn with G0/Gk above, minus the
+   * screened-Coulomb term since RHS charges are pure point monopoles).
+   *
+   * y1 = d/dn_target Phi(target) = n . grad_target Phi(target). Since
+   * D^alpha_r G is already a derivative w.r.t. r = target - center,
+   * grad_target D^alpha_r G = D^(alpha+e_k)_r G for each axis k -- one
+   * order higher in dG0, NOT a calcOneNoment-style reweighting of the
+   * moments (that function instead builds a *source*'s own dipole
+   * moments from its monopole moments via its own normal, which is a
+   * different operation from a target-side directional derivative of
+   * the evaluated field).
+   */
+  for (i = n = 0; n <= order; n++) {
+    for (i1 = 0; i1 <= n; i1++) {
+      for (i2 = 0; i2 <= n-i1; i2++, i++) {
+        double dnDeriv;
+        i3 = n-i1-i2;
+        y0 += sgn3[i]*mom[i]*dG0[0][i];
+        dnDeriv = nrm[0]*dG0[0][idx3[i1+1][i2][i3]]
+                + nrm[1]*dG0[0][idx3[i1][i2+1][i3]]
+                + nrm[2]*dG0[0][idx3[i1][i2][i3+1]];
+        y1 += sgn3[i]*mom[i]*dnDeriv;
+      }
+    }
+  }
+  y[0] = y0/fourPiI;
+  y[1] = y1/fourPiI;
+} /* chgClusterEval */
+
+/*
+ * particle(target quad point)-cluster(charge tree) walk: the mirror
+ * image of Treecode() above, which walks the panel tree per charge
+ * to get the solvation energy. Here we walk the charge tree
+ * (built by buildChargeTree()/computeChgMoments() in chargeTree.c)
+ * per panel quadrature point to accumulate the RHS contribution of
+ * every charge, near or far, into y[0] (potential) and y[1] (its
+ * derivative in the panel's normal direction). y must be zeroed by
+ * the caller before the top-level call.
+ */
+void rhsTreeWalk(ssystem *sys, cube *chgCb, double *quadPt, panel *pnlX, double *y) {
+  /*
+   * A particle(single target point)-cluster evaluation needs a
+   * tighter admissibility ratio than panel-panel M2L: at
+   * sys->maxSepRatio (0.8, tuned for applyFMM()'s panel-cluster to
+   * panel-cluster interactions), a debug compare against the direct
+   * RHS loop (FABIPB_DEBUG_COMPARE_RHS=1) showed unacceptable relative
+   * error at the FMM separation ratio. With the charge tree's minimum
+   * fourth-order expansion, 0.2 keeps both RHS components below 0.1%
+   * relative L2 error on the scale-1 1a63 reference while preserving
+   * far-cluster acceptance for virus-scale inputs.
+   */
+  double theta = rhsTreeTheta();
+  double dist, r[3], yFar[2];
+  int k, i;
+
+  for (k = 0; k < 3; k++) r[k] = quadPt[k]-chgCb->x[k];
+  dist = sqrt(SQR(r[0])+SQR(r[1])+SQR(r[2]));
+
+  if (chgCb->eRad < theta*dist && chgCb->level >= sys->height) {
+    setupDerivs(rhsChargeExpansionOrder(sys, chgCb->level) + 1, r);
+    chgClusterEval(sys, chgCb, pnlX, yFar);
+    y[0] += yFar[0];
+    y[1] += yFar[1];
+    return;
+  }
+
+  if (chgCb->level == sys->chgDepth) {
+    for (i = 0; i < chgCb->nChgs; i++) {
+      int j = chgCb->chgIdx[i];
+      double x[3], fcn[2];
+      for (k = 0; k < 3; k++) x[k] = quadPt[k]-sys->pos[3*j+k];
+      kernelRHS(x, fcn);
+      y[0] += sys->chr[j]*fcn[0];
+      y[1] += sys->chr[j]*fcn[1];
+    }
+    return;
+  }
+
+  for (i = 0; i < chgCb->nKids; i++) {
+    rhsTreeWalk(sys, chgCb->kids[i], quadPt, pnlX, y);
+  }
+} /* rhsTreeWalk */

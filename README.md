@@ -6,8 +6,10 @@ Finite-memory fast multipole solver for the Poisson-Boltzmann equation using a G
 
 - `src/`: solver source files
 - `include/`: shared headers
-- `build/`: generated object files
+- `build/`: generated object files and the executable
+- `results/`: generated benchmark, comparison, and calibration output
 - `test_proteins/`: sample input cases
+- `scripts/`: build, benchmark, and comparison helpers
 - `docs/`: project documentation
 
 ## Dependencies
@@ -24,10 +26,8 @@ Install notes are in [`docs/dependencies.md`](/Users/jiahuic/Garage/electrostati
 
 ## Build
 
-Recommended build layout:
-
-- `build/`: default executable, with CUDA enabled automatically when available
-- `build-prof/`: optional profiling build
+Use `build/` as the single local build tree. Reconfigure that directory when
+switching build types instead of keeping multiple persistent build directories.
 
 Default configure:
 
@@ -50,8 +50,8 @@ cmake -S . -B build -DFMM_PB_ENABLE_CUDA=OFF
 Optional profiling configure:
 
 ```sh
-cmake -S . -B build-prof -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build-prof
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
 ```
 
 For cross-machine performance comparisons, use a consistent benchmark setup:
@@ -260,8 +260,8 @@ This produces:
 To estimate a mesher setting for a target kept-panel count:
 
 ```sh
-./scripts/fit_mesh_target.sh build/.../mesh_calibration.csv msms 5000 test_proteins/1ajj
-./scripts/fit_mesh_target.sh build/.../mesh_calibration.csv nanoshaper 5000 test_proteins/1ajj
+./scripts/fit_mesh_target.sh results/mesh_calibration/.../mesh_calibration.csv msms 5000 test_proteins/1ajj
+./scripts/fit_mesh_target.sh results/mesh_calibration/.../mesh_calibration.csv nanoshaper 5000 test_proteins/1ajj
 ```
 
 Or ask the calibration sweep to emit fitted recommendations directly:

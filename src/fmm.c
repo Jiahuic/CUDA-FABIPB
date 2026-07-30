@@ -41,6 +41,24 @@ double paramEllip( panel *pnl, double x, double y, double *r, double *nrm );
 void dumpStats(ssystem *sys);
 int nrCommonVtx( panel *p, panel *q, int *idxX, int *idxY );
 
+static const char *skipSelfPanelMode(void) {
+  const char *env = getenv("FABIPB_SKIP_SELF_PANEL");
+  return (env != NULL) ? env : "";
+}
+
+static int skipSelfCoeff(int coeffIdx) {
+  const char *mode = skipSelfPanelMode();
+
+  if (strcmp(mode, "1") == 0 || strcmp(mode, "all") == 0) {
+    return 1;
+  }
+  if (strcmp(mode, "k0") == 0 && coeffIdx == 0) { return 1; }
+  if (strcmp(mode, "k1") == 0 && coeffIdx == 1) { return 1; }
+  if (strcmp(mode, "k2") == 0 && coeffIdx == 2) { return 1; }
+  if (strcmp(mode, "k3") == 0 && coeffIdx == 3) { return 1; }
+  return 0;
+}
+
 static double wall_seconds_local(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -338,8 +356,15 @@ static void applyNearfield1CPU(ssystem *sys, double *alpha, double *sgm, double 
         double x_dpdn = sgm[srcPanelIdx + nPnls];
 
         KER = panelIA0(pnlX, pnlY);
-        y_pot[0] += (KER[0] * x_dpdn + KER[1] * x_pot) * (*alpha);
-        y_dpdn[0] += (KER[2] * x_dpdn + KER[3] * x_pot) * (*alpha);
+        if (srcPanelIdx == dstPanelIdx) {
+          y_pot[0] += ((skipSelfCoeff(0) ? 0.0 : KER[0]) * x_dpdn +
+                       (skipSelfCoeff(1) ? 0.0 : KER[1]) * x_pot) * (*alpha);
+          y_dpdn[0] += ((skipSelfCoeff(2) ? 0.0 : KER[2]) * x_dpdn +
+                        (skipSelfCoeff(3) ? 0.0 : KER[3]) * x_pot) * (*alpha);
+        } else {
+          y_pot[0] += (KER[0] * x_dpdn + KER[1] * x_pot) * (*alpha);
+          y_dpdn[0] += (KER[2] * x_dpdn + KER[3] * x_pot) * (*alpha);
+        }
       }
     }
   }

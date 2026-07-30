@@ -21,7 +21,7 @@ fi
 mesh_control_init
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/nearfield_build_logs/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/nearfield_build_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 prep_log="$OUT_DIR/mesh_control.txt"

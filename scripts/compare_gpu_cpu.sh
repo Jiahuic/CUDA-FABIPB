@@ -26,7 +26,7 @@ fi
 mesh_control_init
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/compare_logs/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/gpu_cpu_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 cpu_log="$OUT_DIR/cpu.log"

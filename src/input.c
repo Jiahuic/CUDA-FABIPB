@@ -128,6 +128,19 @@ static void removePanelArtifacts(const char *fpath, const char *panelfile) {
   remove(fname);
 }
 
+static int reuseMeshRequested(void) {
+  const char *env = getenv("FABIPB_REUSE_MESH");
+  return env != NULL && strcmp(env, "1") == 0;
+}
+
+static int panelArtifactsAvailable(const char *fpath, const char *panelfile) {
+  char facePath[256], vertPath[256];
+
+  buildPath(facePath, sizeof(facePath), fpath, panelfile, ".face");
+  buildPath(vertPath, sizeof(vertPath), fpath, panelfile, ".vert");
+  return access(facePath, R_OK) == 0 && access(vertPath, R_OK) == 0;
+}
+
 static void joinPath(char *out, size_t outSize, const char *dir, const char *name) {
   int nwritten = snprintf(out, outSize, "%s/%s", dir, name);
   if (nwritten < 0 || (size_t)nwritten >= outSize) {
@@ -253,6 +266,39 @@ double triangle_area(double v[3][3]){
   return(t_area);
 }
 
+static int useGeometricPanelNormals(void) {
+  const char *env = getenv("FABIPB_PANEL_NORMAL");
+  return env != NULL &&
+         (strcmp(env, "geometric") == 0 || strcmp(env, "face") == 0);
+}
+
+static int debugPanelNormalStats(void) {
+  const char *env = getenv("FABIPB_DEBUG_PANEL_NORMALS");
+  return env != NULL && strcmp(env, "1") == 0;
+}
+
+static int computeGeometricNormal(const double *v0, const double *v1,
+                                  const double *v2, double *normal) {
+  double e1[3], e2[3], len;
+  int k;
+
+  for (k = 0; k < 3; k++) {
+    e1[k] = v1[k] - v0[k];
+    e2[k] = v2[k] - v0[k];
+  }
+  normal[0] = e1[1]*e2[2] - e1[2]*e2[1];
+  normal[1] = e1[2]*e2[0] - e1[0]*e2[2];
+  normal[2] = e1[0]*e2[1] - e1[1]*e2[0];
+  len = sqrt(SQR(normal[0]) + SQR(normal[1]) + SQR(normal[2]));
+  if (len <= 0.0) {
+    return 0;
+  }
+  for (k = 0; k < 3; k++) {
+    normal[k] /= len;
+  }
+  return 1;
+}
+
 /*
  * loadpanel returns a list of panel structs derived from passed data:
  * shape, vertices, and type.
@@ -274,13 +320,32 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   double dist_local, area_local, cpuf;
   int nspt, natm, nface;
   int malformedAtomLines, zeroRadiusAtoms, parsedAtom, filledAtoms, meshAtoms;
+  int reuseMesh;
 
   double *nrm, len;
+  int useGeomNormals = useGeometricPanelNormals();
+  int normalStats = debugPanelNormalStats();
+  double normalDotMin = 1.0, normalDotSum = 0.0;
+  int normalDotCount = 0, normalFlipped = 0;
+  int normalDotLt50 = 0, normalDotLt70 = 0, normalDotLt90 = 0, normalDotLt99 = 0;
+  double normalAreaLt50 = 0.0, normalAreaLt70 = 0.0, normalAreaLt90 = 0.0, normalAreaLt99 = 0.0;
+  double worstDot[8], worstArea[8], worstCentroid[8][3];
+  int worstPanel[8];
+
+  for (i = 0; i < 8; i++) {
+    worstDot[i] = 2.0;
+    worstArea[i] = 0.0;
+    worstPanel[i] = -1;
+    for (j = 0; j < 3; j++) {
+      worstCentroid[i][j] = 0.0;
+    }
+  }
 
   /* read in vertices */
   sys->nChar = 0;
   meshAtoms = 0;
   sprintf(fpath,"test_proteins/");
+  reuseMesh = reuseMeshRequested();
   buildPath(fname, sizeof(fname), fpath, panelfile, ".pqr");
   fp=fopen(fname,"r");
   if (fp == NULL) {
@@ -305,14 +370,13 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
     }
     if (b2 <= 0.0) {
       zeroRadiusAtoms++;
-    } else {
-      fprintf(wfp,"%f %f %f %f\n",a1,a2,a3,b2);
-      meshAtoms++;
     }
+    fprintf(wfp,"%f %f %f %f\n",a1,a2,a3,b2);
+    meshAtoms++;
     sys->nChar++;
   }
   if (zeroRadiusAtoms > 0) {
-    fprintf(stderr, "Info: kept %d zero-radius atoms as charges and excluded them from mesh for '%s'\n",
+    fprintf(stderr, "Info: kept %d zero-radius atoms as charges and included them in xyzr for '%s'\n",
             zeroRadiusAtoms, panelfile);
   }
   if (malformedAtomLines > 0) {
@@ -330,7 +394,7 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   fclose(wfp);
 
   if (meshAtoms <= 0) {
-    fprintf(stderr, "Error: no positive-radius ATOM/HETATM records were parsed from '%s'\n", panelfile);
+    fprintf(stderr, "Error: no ATOM/HETATM records were parsed from '%s'\n", panelfile);
     exit(1);
   }
   if (sys->nChar <= 0) {
@@ -362,7 +426,9 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
     exit(1);
   }
 
-  if ( mesh_flag == 1 ) {
+  if (reuseMesh && panelArtifactsAvailable(fpath, panelfile)) {
+    printf("Mesh reuse: using existing .face/.vert artifacts for '%s'\n", panelfile);
+  } else if ( mesh_flag == 1 ) {
   /* run msms */
     {
       char xyzrpath[256], ofbase[256];
@@ -620,11 +686,85 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
       }
 
       nrm = pnl->normal;
-      nrm[0] = pnl->nrm[0][0]/2. + (pnl->nrm[1][0] + pnl->nrm[2][0])/4.;
-      nrm[1] = pnl->nrm[0][1]/2. + (pnl->nrm[1][1] + pnl->nrm[2][1])/4.;
-      nrm[2] = pnl->nrm[0][2]/2. + (pnl->nrm[1][2] + pnl->nrm[2][2])/4.;
-      len = sqrt(SQR(nrm[0]) + SQR(nrm[1]) + SQR(nrm[2]));
-      for ( j=0; j<3; j++ ) nrm[j] /= len;
+      if (normalStats) {
+        double vertexNormal[3], geomNormal[3], dot;
+        vertexNormal[0] = pnl->nrm[0][0]/2. + (pnl->nrm[1][0] + pnl->nrm[2][0])/4.;
+        vertexNormal[1] = pnl->nrm[0][1]/2. + (pnl->nrm[1][1] + pnl->nrm[2][1])/4.;
+        vertexNormal[2] = pnl->nrm[0][2]/2. + (pnl->nrm[1][2] + pnl->nrm[2][2])/4.;
+        len = sqrt(SQR(vertexNormal[0]) + SQR(vertexNormal[1]) + SQR(vertexNormal[2]));
+        if (len > 0.0) {
+          for (j = 0; j < 3; j++) vertexNormal[j] /= len;
+        }
+        if (computeGeometricNormal(pnl->vtx[0], pnl->vtx[1], pnl->vtx[2], geomNormal)) {
+          dot = geomNormal[0]*vertexNormal[0] + geomNormal[1]*vertexNormal[1] + geomNormal[2]*vertexNormal[2];
+          if (dot < 0.0) dot = -dot;
+          if (dot < normalDotMin) normalDotMin = dot;
+          normalDotSum += dot;
+          normalDotCount++;
+          if (dot < 0.50) {
+            normalDotLt50++;
+            normalAreaLt50 += area_local;
+          }
+          if (dot < 0.70) {
+            normalDotLt70++;
+            normalAreaLt70 += area_local;
+          }
+          if (dot < 0.90) {
+            normalDotLt90++;
+            normalAreaLt90 += area_local;
+          }
+          if (dot < 0.99) {
+            normalDotLt99++;
+            normalAreaLt99 += area_local;
+          }
+          for (k = 0; k < 8; k++) {
+            if (dot < worstDot[k]) {
+              int m;
+              for (m = 7; m > k; m--) {
+                worstDot[m] = worstDot[m-1];
+                worstArea[m] = worstArea[m-1];
+                worstPanel[m] = worstPanel[m-1];
+                worstCentroid[m][0] = worstCentroid[m-1][0];
+                worstCentroid[m][1] = worstCentroid[m-1][1];
+                worstCentroid[m][2] = worstCentroid[m-1][2];
+              }
+              worstDot[k] = dot;
+              worstArea[k] = area_local;
+              worstPanel[k] = *numSing;
+              worstCentroid[k][0] = xx[0];
+              worstCentroid[k][1] = xx[1];
+              worstCentroid[k][2] = xx[2];
+              break;
+            }
+          }
+        }
+      }
+      if (useGeomNormals) {
+        double vertexNormal[3], geomNormal[3], dot;
+        vertexNormal[0] = pnl->nrm[0][0]/2. + (pnl->nrm[1][0] + pnl->nrm[2][0])/4.;
+        vertexNormal[1] = pnl->nrm[0][1]/2. + (pnl->nrm[1][1] + pnl->nrm[2][1])/4.;
+        vertexNormal[2] = pnl->nrm[0][2]/2. + (pnl->nrm[1][2] + pnl->nrm[2][2])/4.;
+        len = sqrt(SQR(vertexNormal[0]) + SQR(vertexNormal[1]) + SQR(vertexNormal[2]));
+        if (len > 0.0) {
+          for (j = 0; j < 3; j++) vertexNormal[j] /= len;
+        }
+        if (!computeGeometricNormal(pnl->vtx[0], pnl->vtx[1], pnl->vtx[2], geomNormal)) {
+          for (j = 0; j < 3; j++) geomNormal[j] = vertexNormal[j];
+        }
+        dot = geomNormal[0]*vertexNormal[0] + geomNormal[1]*vertexNormal[1] + geomNormal[2]*vertexNormal[2];
+        if (dot < 0.0) {
+          for (j = 0; j < 3; j++) geomNormal[j] = -geomNormal[j];
+          dot = -dot;
+          normalFlipped++;
+        }
+        for (j = 0; j < 3; j++) nrm[j] = geomNormal[j];
+      } else {
+        nrm[0] = pnl->nrm[0][0]/2. + (pnl->nrm[1][0] + pnl->nrm[2][0])/4.;
+        nrm[1] = pnl->nrm[0][1]/2. + (pnl->nrm[1][1] + pnl->nrm[2][1])/4.;
+        nrm[2] = pnl->nrm[0][2]/2. + (pnl->nrm[1][2] + pnl->nrm[2][2])/4.;
+        len = sqrt(SQR(nrm[0]) + SQR(nrm[1]) + SQR(nrm[2]));
+        for ( j=0; j<3; j++ ) nrm[j] /= len;
+      }
 
       pnl->shape = 3;
       pnl->nSurf = *numSing;
@@ -634,9 +774,31 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   }
 
   printf("Mesh filtered panels: kept=%d area=%f\n", *numSing, s_area);
+  if (useGeomNormals || normalStats) {
+    printf("Panel normal convention: %s\n",
+           useGeomNormals ? "geometric-face aligned to vertex-normal orientation" :
+                            "weighted vertex normals");
+  }
+  if (normalStats && normalDotCount > 0) {
+    printf("Panel normal diagnostic: geom-vs-vertex dot min=%e mean=%e flipped=%d count=%d\n",
+           normalDotMin, normalDotSum/(double)normalDotCount, normalFlipped, normalDotCount);
+    printf("Panel normal diagnostic thresholds: dot<0.50 count=%d area=%e dot<0.70 count=%d area=%e dot<0.90 count=%d area=%e dot<0.99 count=%d area=%e\n",
+           normalDotLt50, normalAreaLt50,
+           normalDotLt70, normalAreaLt70,
+           normalDotLt90, normalAreaLt90,
+           normalDotLt99, normalAreaLt99);
+    printf("Panel normal diagnostic worst panels:\n");
+    for (i = 0; i < 8 && worstPanel[i] >= 0; i++) {
+      printf("  rank=%d panel=%d dot=%e area=%e centroid=(%e,%e,%e)\n",
+             i, worstPanel[i], worstDot[i], worstArea[i],
+             worstCentroid[i][0], worstCentroid[i][1], worstCentroid[i][2]);
+    }
+  }
   //printf("%d ugly faces are deleted\n", nface-*numSing);
 
-  removePanelArtifacts(fpath, panelfile);
+  if (!reuseMesh) {
+    removePanelArtifacts(fpath, panelfile);
+  }
 
   for (i=0;i<3;i++){
     free(sptpos[i]);

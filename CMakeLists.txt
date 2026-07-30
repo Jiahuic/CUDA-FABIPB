@@ -34,6 +34,7 @@ set(FMM_PB_SOURCES
   src/precond_fmm.c
   src/gmres.c
   src/treecode.c
+  src/chargeTree.c
   src/direct_backend.c
 )
 
@@ -57,7 +58,10 @@ target_include_directories(fabipb
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper-master/build/NanoShaper")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper/build/NanoShaper")
+  target_compile_definitions(fabipb PRIVATE
+    FMM_PB_DEFAULT_NANOSHAPER_BIN="${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper/build/NanoShaper")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper-master/build/NanoShaper")
   target_compile_definitions(fabipb PRIVATE
     FMM_PB_DEFAULT_NANOSHAPER_BIN="${CMAKE_CURRENT_SOURCE_DIR}/nanoshaper-master/build/NanoShaper")
 endif()

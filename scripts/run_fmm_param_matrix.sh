@@ -71,7 +71,7 @@ order_case_values() {
 }
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/fmm_param_matrix/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/fmm_param_matrix/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 raw_repeats_csv="$OUT_DIR/results_raw.csv"

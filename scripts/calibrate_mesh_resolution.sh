@@ -3,7 +3,7 @@ set -eu
 
 BUILD_DIR="${BUILD_DIR:-build}"
 RESOLUTIONS="${RESOLUTIONS:-0.50 0.75 1.00 1.25 1.50 2.00}"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/mesh_calibration}"
+OUT_DIR="${OUT_DIR:-results/mesh_calibration}"
 TARGET_KEPT_PANELS="${TARGET_KEPT_PANELS:-}"
 TARGET_REFINE_FACTORS="${TARGET_REFINE_FACTORS:-0.90 1.00 1.10}"
 TARGET_TOLERANCE="${TARGET_TOLERANCE:-100}"
@@ -12,7 +12,7 @@ TARGET_MAX_ITERS="${TARGET_MAX_ITERS:-4}"
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 <panel-base-or-pqr-path> [extra fabipb args...]" >&2
   echo "Example: $0 test_proteins/1ajj" >&2
-  echo "Env: RESOLUTIONS='0.5 0.75 1.0 1.25 1.5 2.0' BUILD_DIR=build OUT_DIR=build/mesh_calibration TARGET_KEPT_PANELS=5000" >&2
+  echo "Env: RESOLUTIONS='0.5 0.75 1.0 1.25 1.5 2.0' BUILD_DIR=build OUT_DIR=results/mesh_calibration TARGET_KEPT_PANELS=5000" >&2
   exit 2
 fi
 

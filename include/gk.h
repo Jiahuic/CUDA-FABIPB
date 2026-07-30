@@ -52,6 +52,9 @@ struct cube {               /* cube, actually a cluster of panels */
   double eBoxUp[3];         /* upper corner of the enclosing box */
   double eRad;              /* half-diameter of enclosing box */
   struct cube *next;        /* Ptr to next nonempty cube with panels */
+  double *mom_chr;          /* multipole moments of enclosed charges (charge-tree only) */
+  int *chgIdx;              /* indices into sys->pos/sys->chr for this leaf (charge-tree only) */
+  int nChgs;                /* number of charges in/under this cube (charge-tree only) */
 };
 typedef struct cube cube;
 
@@ -105,6 +108,8 @@ struct ssystem {
   panel *pnlLst;            /* linked list of panels (Contiguous wn cubes) */
   panel *pnlOLst;           /* linked list of original order panels */
   cube **cubeList;          /* heads of lists of cubes for each level */
+  int chgDepth;             /* depth of the charge-only tree (v1: equals depth) */
+  cube **chgCubeList;       /* heads of per-level charge-tree cube lists */
 };
 typedef struct ssystem ssystem;
 

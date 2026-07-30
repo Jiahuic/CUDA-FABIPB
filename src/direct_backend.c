@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 extern double *panelIA0(panel *pnlX, panel *pnlY);
@@ -24,6 +25,24 @@ typedef struct {
 } CpuDirectCache;
 
 static CpuDirectCache gCpuDirect = {0};
+
+static const char *skipSelfPanelMode(void) {
+  const char *env = getenv("FABIPB_SKIP_SELF_PANEL");
+  return (env != NULL) ? env : "";
+}
+
+static int skipSelfCoeff(int coeffIdx) {
+  const char *mode = skipSelfPanelMode();
+
+  if (strcmp(mode, "1") == 0 || strcmp(mode, "all") == 0) {
+    return 1;
+  }
+  if (strcmp(mode, "k0") == 0 && coeffIdx == 0) { return 1; }
+  if (strcmp(mode, "k1") == 0 && coeffIdx == 1) { return 1; }
+  if (strcmp(mode, "k2") == 0 && coeffIdx == 2) { return 1; }
+  if (strcmp(mode, "k3") == 0 && coeffIdx == 3) { return 1; }
+  return 0;
+}
 
 typedef struct {
   const ssystem *sys;
@@ -63,13 +82,14 @@ static void *cpuDirectBuildWorker(void *arg) {
     long long base = (long long)i * (long long)task->sys->nPnls;
     for (j = 0; j < task->sys->nPnls; j++) {
       panel *pnlY = task->sys->panelByIdx[j];
-      double *KER = panelIA0(pnlX, pnlY);
       long long idx = base + (long long)j;
+      double *KER;
 
-      gCpuDirect.k0[idx] = KER[0];
-      gCpuDirect.k1[idx] = KER[1];
-      gCpuDirect.k2[idx] = KER[2];
-      gCpuDirect.k3[idx] = KER[3];
+      KER = panelIA0(pnlX, pnlY);
+      gCpuDirect.k0[idx] = (i == j && skipSelfCoeff(0)) ? 0.0 : KER[0];
+      gCpuDirect.k1[idx] = (i == j && skipSelfCoeff(1)) ? 0.0 : KER[1];
+      gCpuDirect.k2[idx] = (i == j && skipSelfCoeff(2)) ? 0.0 : KER[2];
+      gCpuDirect.k3[idx] = (i == j && skipSelfCoeff(3)) ? 0.0 : KER[3];
     }
   }
   return NULL;
@@ -162,6 +182,10 @@ static int buildCpuDirectTables(const ssystem *sys) {
     printf("CPU direct cache: panel-pairs=%lld host-coeff=%.3f GB\n",
            nInteractions,
            (double)totalCoeffBytes / (1024.0 * 1024.0 * 1024.0));
+    if (skipSelfPanelMode()[0] != '\0') {
+      printf("CPU direct cache: FABIPB_SKIP_SELF_PANEL=%s, selected self-panel coefficients zeroed\n",
+             skipSelfPanelMode());
+    }
   }
   return 1;
 }

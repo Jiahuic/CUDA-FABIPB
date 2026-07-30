@@ -22,7 +22,7 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
 fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/openblas_compare/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/openblas_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 run_case() {

@@ -19,5 +19,5 @@ output=$(
 
 printf '%s\n' "$output"
 
-printf '%s\n' "$output" | grep -q "mesh_atoms=2065 charge_atoms=2066"
-printf '%s\n' "$output" | grep -q "kept 1 zero-radius atoms as charges"
+printf '%s\n' "$output" | grep -q "mesh_atoms=2066 charge_atoms=2066"
+printf '%s\n' "$output" | grep -q "kept 1 zero-radius atoms as charges and included them in xyzr"

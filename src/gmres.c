@@ -335,7 +335,8 @@ int gmres(int n, double *b, double *x, int restrt, double *work, int ldw,
         }
 
         aa = wall_seconds();
-        gmres_update(restrt, n, x, h, ldh, &work[y_col * ldw], &work[s_col * ldw],
+        /* maxit can stop a partial restart cycle, so only i columns are valid. */
+        gmres_update(i, n, x, h, ldh, &work[y_col * ldw], &work[s_col * ldw],
                      &work[v_col * ldw], ldw);
         gmresUpdateTime += wall_seconds() - aa;
 
