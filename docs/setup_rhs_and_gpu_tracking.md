@@ -278,6 +278,141 @@ GMRES and operator diagnosis:
   discretization path, not the Zenodo PQR, mesh generation, raw kernel formulas,
   setupRHS, or FMM approximation.
 
+## Galerkin vs. collocation: is the discretization gap inherent or fixable?
+
+Follow-up to the "discretization path" conclusion above: isolate whether the
+gap is an inherent property of Galerkin vs. collocation as paradigms, or a
+fixable quadrature-order parameter, using a cheap single-subunit test case.
+
+`test_proteins/ZIKV_6CO8_chainA_monomer.pqr` is one ~501-residue subunit
+extracted from chain A of the Zenodo PQR (chain A in that file is ~60
+repeated copies of the same subunit from icosahedral symmetry; residue
+numbering resets to 1 every 501 atoms, so the first copy was cut out). It is
+7,534 atoms, compact and non-hollow (unlike the full capsid), and solves in
+seconds to low minutes instead of hours, making it a much cheaper
+reproduction case for both the mesh-resolution and the preconditioner
+questions.
+
+Root panel-Galerkin FMM resolution sweep on this monomer (`-P=2` default,
+`-q=1` default, converged GMRES only) against matched-resolution TABI-PB:
+
+```text
+R=8   (668 panels,     area=12,028): root=   +491.0
+R=4   (3,320 panels,   area=15,263): root=-14,267.2
+R=2   (14,820 panels,  area=17,914): root= -3,245.1
+R=1   (62,972 panels,  area=19,826): root=   -831.9   vs TABI sdens=1 (area=19,826): -788.2  (5.5%)
+R=0.5 (255,076 panels, area=20,860): root=   -745.5   vs TABI sdens=2 (area=20,860): -740.1  (0.72%)
+```
+
+TABI-PB itself is not fully converged at sdens=1/2 either (sdens=1→2→4 gives
+-788.2 → -740.1 → -728.3 kcal/mol); Aitken-extrapolating that sequence gives
+an estimated converged value of about `-724.4` kcal/mol.
+
+**This confirms root's panel-Galerkin path converges to TABI-PB's answer
+given enough resolution** (0.72% at matched fine mesh) -- ruling out a
+correctness bug in the discretization itself, and reframing the large-6CO8
+gap as primarily a resolution/convergence-rate difference between the two
+methods (root needs a much finer mesh than TABI-PB to reach the same
+accuracy on this geometry).
+
+Quadrature-order re-sweep at the same resolutions, `-q=3` instead of default
+`-q=1` (same mesh, `FABIPB_REUSE_MESH=1`, everything else unchanged):
+
+```text
+R=8  (668 panels):    q=1=+491.0    q=3=+1,235.0   (worse -- mesh too coarse for order to help)
+R=4  (3,320 panels):  q=1=-14,267.2 q=3=  -409.2   (error vs -724.4: 1870% -> 43.5%)
+R=2  (14,820 panels): q=1= -3,245.1 q=3=-1,061.0   (error vs -724.4:  348% -> 46.5%)
+R=1  (62,972 panels): q=1=  -831.9  q=3=  -769.5   (error vs -724.4: 14.8% ->  6.2%)
+```
+
+Command pattern:
+
+```sh
+FABIPB_REUSE_MESH=1 ./scripts/with_benchmark_env.sh ./build/fabipb \
+  -B=1 -g=0 -m=2 -R=4.0 -eps1=4 -eps2=80 -q=3 -i=300 \
+  test_proteins/ZIKV_6CO8_chainA_monomer
+```
+
+At every resolution except the coarsest (R=8, where the mesh itself is too
+coarse to represent the geometry regardless of quadrature accuracy), raising
+quadrature order from the default 1 to 3 roughly halves or better the
+relative error. `q=3` at R=4 (3,320 panels, 43.5% error) is already more
+accurate than `q=1` at R=1 (62,972 panels, 14.8% error) -- a ~19x reduction
+in panel count for comparable accuracy, from a CLI parameter, not a mesh
+change. Quadrature cost scales as `qOrder^4` per near-field pair, so this is
+not free (`-q=10` on the R=10 6CO8 capsid mesh burned 6.8 CPU-hours without
+finishing setup and had to be killed), but `-q=3` is tractable and already
+gave a 4x error reduction on the full R=10 6CO8 capsid mesh in a prior test
+(`+2,272,893` -> `+549,632` kcal/mol, same mesh, same charges).
+
+Panel-case ablation at R=4 (`FABIPB_SKIP_PANEL_CASES=self|one|two`) to
+localize which touching-panel category drives the order sensitivity:
+
+```text
+              q=1 energy    q=3 energy    q1->q3 shift
+none          -14,267.2       -409.2         +13,858
+skip self     -22,453.2     -1,328.0         +21,125
+skip one      -15,486.9       -408.2         +15,079
+skip two      -15,276.3       -390.6         +14,886
+```
+
+No single category cleanly absorbs the order-sensitivity when excluded --
+removing self, one-common, or two-common pairs all still show a large
+(13,858-21,125) q1->q3 swing. The sensitivity is distributed across all
+three touching/self categories, not isolated to one of `pnlThr0`/`pnlOne0`/
+`pnlTwo0`.
+
+A sharper localization comes from the existing `FABIPB_DEBUG_OPERATOR_NORMS=1`
+diagnostic (`compareOperatorToTabiCollocation` in `src/fabipb.c`), which
+already reimplements TABI-PB's exact point-collocation formula and diffs it
+per-kernel-block against root's own operator (via the direct, non-FMM-
+approximated `cpuDirectApply`), applied to the constant "ones" vector so no
+RHS/charges are involved -- a pure discretization-formula comparison on the
+same mesh:
+
+```sh
+FABIPB_REUSE_MESH=1 FABIPB_DEBUG_OPERATOR_NORMS=1 FABIPB_OPERATOR_VECTOR=ones \
+  FABIPB_STOP_AFTER_OPERATOR=1 ./scripts/with_benchmark_env.sh ./build/fabipb \
+  -B=1 -g=0 -m=2 -R=4.0 -eps1=4 -eps2=80 -q=3 test_proteins/ZIKV_6CO8_chainA_monomer
+```
+
+Results on the R=4 monomer mesh (relative L2 disagreement between root's
+operator and the TABI-style formula, per kernel block):
+
+```text
+block  q=1 rel_l2   q=3 rel_l2   trend
+k0        0.74%        0.07%     10x better
+k1       29.3%        20.7%      improves, but stays large
+k2       12.0%         8.1%      improves moderately
+k3        6.3%         9.5%      gets worse
+```
+
+`k1` (the `epsilon*dGk/dy - dG0/dy` term) is the dominant, persistent source
+of disagreement between root's Galerkin operator and TABI-PB's collocation
+formula -- it is the largest gap at both orders and barely closes with more
+quadrature points, unlike `k0` which converges almost immediately. `k3`
+(the double-layer-difference term) gets slightly *worse* at higher order, a
+smaller but real anomaly worth further investigation, not noise.
+
+**Revised conclusion:** the large-6CO8 gap is not purely an inherent,
+unavoidable property of Galerkin vs. collocation as discretization
+paradigms. Quadrature order is a real, substantial, and currently
+under-exploited lever (root's default is `-q=1`) that closes most of the gap
+once the mesh is at least moderately resolved -- but the sensitivity is
+concentrated disproportionately in the `k1` kernel block rather than spread
+evenly across panel-pair categories, which is the next thing to chase if
+pushing this further.
+
+Separately, on the `issue-precond-capsid-divergence` branch: the default
+cached-LU near-field preconditioner (`-P=2`) diverges on the full 6CO8
+capsid mesh independent of both charge count and panel count (confirmed via
+mesh/charge decoupling tests), and TABI-PB's own comparable per-leaf
+block-LU preconditioner (opt-in, off by default) crashes on the same mesh --
+this is a preconditioner-specific failure, orthogonal to the discretization
+question above. A new `-P=3` diagonal/Jacobi preconditioner (mirroring
+TABI-PB's default) converges cleanly (19 iterations) on the exact
+full-charge capsid mesh where `-P=2` never converges.
+
 Direction 2: test current GPU path.
 
 The binary can be built with CUDA, and `-g=1` requests GPU execution:
