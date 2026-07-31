@@ -69,6 +69,7 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot);
 int PtVfmm(double *pot, double *sgm);
 int PtVfmmCached(double *pot, double *sgm);
 int PtVfmmCachedLU(double *pot, double *sgm);
+int PtVfmmDiagonal(double *pot, double *sgm);
 int PtVmain(double *pot, double *sgm);
 
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
@@ -398,7 +399,7 @@ static void print_usage(const char *prog) {
   printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");
   printf("  -Q=0|1    CPU-default or GPU-debug Q2M path (default: 0)\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
-  printf("  -P=-1|0|1|2  disabled, original, cached-block, or cached-LU preconditioner (default: 2)\n");
+  printf("  -P=-1|0|1|2|3  disabled, original, cached-block, cached-LU, or diagonal/Jacobi preconditioner (default: 2)\n");
   printf("  -t=<lev>  tree depth\n");
   printf("  -H=<lev>  coarsest active FMM level (default: 2)\n");
   printf("  -q=<ord>  panel quadrature order\n");
@@ -428,6 +429,10 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_STOP_AFTER_PANEL_ALL_TYPES=1  stop after all-types panel diagnostic\n");
   printf("  FABIPB_DEBUG_PANEL_ONE_COMMON=1  legacy alias for FABIPB_DEBUG_PANEL_ALL_TYPES\n");
   printf("  FABIPB_STOP_AFTER_PANEL_ONE_COMMON=1  legacy stop alias for all-types panel diagnostic\n");
+  printf("  FABIPB_DEBUG_DUMP_DENSE_SYSTEM=1  dump dense panelIA0-built system matrix + leaf-cube ids\n");
+  printf("  FABIPB_DEBUG_DUMP_DENSE_SYSTEM_MAX=<n>  cap panels for dense dump (default 6000)\n");
+  printf("  FABIPB_DENSE_DUMP_PATH=<prefix>  output path prefix for dense dump (default dense_system)\n");
+  printf("  FABIPB_STOP_AFTER_DENSE_DUMP=1  stop after dense system dump\n");
   printf("  FABIPB_DEBUG_TABI_NODEPATCH=1  run TABI-style nodepatch collocation diagnostic\n");
   printf("  FABIPB_TABI_NODEPATCH_MAX_VERTS=<n>  cap dense nodepatch diagnostic solve\n");
   printf("  FABIPB_TABI_NODEPATCH_SAMPLE_VERTS=<n>  sample vertices before dense nodepatch checks\n");
@@ -1226,6 +1231,116 @@ static void reportPanelAllTypesDiagnostics(ssystem *sys) {
              maxAbs[slot][0], maxAbs[slot][1], maxAbs[slot][2], maxAbs[slot][3]);
     }
   }
+}
+
+static int debugDumpDenseSystem(void) {
+  const char *env = getenv("FABIPB_DEBUG_DUMP_DENSE_SYSTEM");
+  return env != NULL && strcmp(env, "1") == 0;
+}
+
+static int denseDumpMaxPanels(void) {
+  const char *env = getenv("FABIPB_DEBUG_DUMP_DENSE_SYSTEM_MAX");
+  int val;
+
+  if (env == NULL) {
+    return 6000;
+  }
+  val = atoi(env);
+  return (val > 0) ? val : 6000;
+}
+
+/*
+ * Dumps the dense panel-Galerkin system matrix A (built via the same
+ * panelIA0() calls used everywhere else in the code, with no FMM
+ * far-field approximation) plus each panel's leaf-cube assignment at
+ * the preconditioner's tree level. This lets an external tool build
+ * both A and the local block-diagonal preconditioner M (M is exactly
+ * A restricted to same-leaf-cube panel pairs, per precond_fmm.c's own
+ * construction) and directly compare their conditioning, instead of
+ * inferring it from GMRES's convergence behavior alone.
+ */
+static void dumpDenseSystemForAnalysis(ssystem *sys) {
+  int nPnls = sys->nPnls;
+  int Msize = 2 * nPnls;
+  int maxPanels = denseDumpMaxPanels();
+  int nlevel = sys->depth - 1;
+  double scale1, scale2;
+  double *A;
+  int *cubeId;
+  int idx, i, j;
+  cube *cb;
+  const char *pathPrefix = getenv("FABIPB_DENSE_DUMP_PATH");
+  char pathA[512], pathCube[512], pathMeta[512];
+  FILE *fp;
+
+  if (pathPrefix == NULL) {
+    pathPrefix = "dense_system";
+  }
+
+  if (nPnls > maxPanels) {
+    printf("Dense system dump skipped: nPnls=%d exceeds FABIPB_DEBUG_DUMP_DENSE_SYSTEM_MAX=%d\n",
+           nPnls, maxPanels);
+    return;
+  }
+
+  buildPanelIndexDirect(sys);
+  kernel = kernelKER4;
+  scale1 = (1.0 + epsilon) / 2.0;
+  scale2 = (1.0 + 1.0 / epsilon) / 2.0;
+
+  CALLOC(A, (size_t)Msize * (size_t)Msize, double);
+  CALLOC(cubeId, nPnls, int);
+  for (i = 0; i < nPnls; i++) {
+    cubeId[i] = -1;
+  }
+
+  for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
+    panel *pnlC = cb->pnls;
+    int k;
+    for (k = 0; k < cb->nPnls; k++, pnlC = pnlC->nextC) {
+      cubeId[pnlC->idx] = idx;
+    }
+  }
+
+  for (i = 0; i < nPnls; i++) {
+    panel *pnlX = sys->panelByIdx[i];
+    for (j = 0; j < nPnls; j++) {
+      panel *pnlY = sys->panelByIdx[j];
+      double *KER = panelIA0(pnlX, pnlY);
+      A[i * Msize + j]                   = -KER[1];
+      A[i * Msize + j + nPnls]           = -KER[0];
+      A[(i + nPnls) * Msize + j]         = -KER[3];
+      A[(i + nPnls) * Msize + j + nPnls] = -KER[2];
+    }
+    A[i * Msize + i]                     += scale1 * pnlX->area;
+    A[(i + nPnls) * Msize + i + nPnls]   += scale2 * pnlX->area;
+  }
+
+  snprintf(pathA, sizeof(pathA), "%s_A.bin", pathPrefix);
+  snprintf(pathCube, sizeof(pathCube), "%s_cubeid.bin", pathPrefix);
+  snprintf(pathMeta, sizeof(pathMeta), "%s_meta.txt", pathPrefix);
+
+  fp = fopen(pathA, "wb");
+  ASSERT(fp != NULL);
+  fwrite(A, sizeof(double), (size_t)Msize * (size_t)Msize, fp);
+  fclose(fp);
+
+  fp = fopen(pathCube, "wb");
+  ASSERT(fp != NULL);
+  fwrite(cubeId, sizeof(int), (size_t)nPnls, fp);
+  fclose(fp);
+
+  fp = fopen(pathMeta, "w");
+  ASSERT(fp != NULL);
+  fprintf(fp, "nPnls=%d\nMsize=%d\nnlevel=%d\nscale1=%.17g\nscale2=%.17g\n",
+          nPnls, Msize, nlevel, scale1, scale2);
+  fclose(fp);
+
+  printf("Dense system dump: nPnls=%d Msize=%d nlevel=%d -> %s / %s / %s\n",
+         nPnls, Msize, nlevel, pathA, pathCube, pathMeta);
+
+  free(A);
+  free(cubeId);
 }
 
 typedef struct {
@@ -2498,7 +2613,7 @@ int main(int nargs, char *argv[]){
       printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
       printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
     }
-    printf("Preconditioner mode=%d (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU)\n", sys->precondCacheMode);
+    printf("Preconditioner mode=%d (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n", sys->precondCacheMode);
     if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
       printf("Debug compare flags: apply=%d precond=%d\n",
              sys->debugCompareApply, sys->debugComparePrecond);
@@ -2543,6 +2658,16 @@ int main(int nargs, char *argv[]){
     reportPanelCaseDistribution(sys);
     if (getenv("FABIPB_STOP_AFTER_PANEL_CASES") != NULL) {
       printf("FABIPB_STOP_AFTER_PANEL_CASES set: stopping after panel case diagnostic.\n");
+      printf("Stage times (s): loadPanel=%f gkInit=%f setupFMM=%f\n",
+             loadPanel_t, gkInit_t, setupFMM_t_local);
+      return 0;
+    }
+  }
+
+  if (debugDumpDenseSystem()) {
+    dumpDenseSystemForAnalysis(sys);
+    if (getenv("FABIPB_STOP_AFTER_DENSE_DUMP") != NULL) {
+      printf("FABIPB_STOP_AFTER_DENSE_DUMP set: stopping after dense system dump.\n");
       printf("Stage times (s): loadPanel=%f gkInit=%f setupFMM=%f\n",
              loadPanel_t, gkInit_t, setupFMM_t_local);
       return 0;
@@ -2728,6 +2853,9 @@ int PtVmain(double *pot, double *sgm) {
       pot[i] = sgm[i];
     }
     return 0;
+  }
+  if (sys->precondCacheMode == 3) {
+    return PtVfmmDiagonal(pot, sgm);
   }
   if (sys->precondCacheMode > 1) {
     return PtVfmmCachedLU(pot, sgm);

@@ -566,7 +566,8 @@ void setupPreconditioning(ssystem *sys) {
   CALLOC_FULL(matrixA, maxnPnls * maxnPnls, double, OFF, ASOLVER);
   CALLOC_FULL(ipiv, maxnPnls, int, OFF, ASOLVER);
   CALLOC_FULL(rhs, maxnPnls, double, OFF, ASOLVER);
-  if (sys->precondCacheMode > 0 || sys->debugComparePrecond > 0) {
+  if ((sys->precondCacheMode > 0 && sys->precondCacheMode != 3) ||
+      sys->debugComparePrecond > 0) {
     cube **precondCubes;
     int nThreads;
     CALLOC_FULL(pcBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
@@ -629,6 +630,30 @@ void setupPreconditioning(ssystem *sys) {
   }
 }
 
+
+/*
+ * Pure diagonal (Jacobi) preconditioner: divides each unknown by its own
+ * diagonal system entry (scale1*area for the potential block, scale2*area
+ * for the normal-derivative block -- see the identical scale1*pnl->area /
+ * scale2*pnl->area terms added in MtVmain), with zero inter-panel coupling.
+ * This mirrors TABI-PB's default `precondition_diagonal` (precondition.cpp),
+ * adapted to root's own Galerkin diagonal, which is area-weighted where
+ * TABI-PB's node-patch collocation diagonal is a bare constant.
+ */
+int PtVfmmDiagonal(double *pot, double *sgm) {
+  int nPnls = sys->nPnls;
+  double scale1 = (1.0 + epsilon) / 2.0;
+  double scale2 = (1.0 + 1.0 / epsilon) / 2.0;
+  panel *pnl;
+  int i;
+
+  for (pnl = sys->pnlLst, i = 0; pnl != NULL; pnl = pnl->nextC, i++) {
+    pot[i] = sgm[i] / (scale1 * pnl->area);
+    pot[nPnls + i] = sgm[nPnls + i] / (scale2 * pnl->area);
+  }
+
+  return 0;
+} /* PtVfmmDiagonal */
 
 /*
  * Preconditioner by using the direct summation matrix
