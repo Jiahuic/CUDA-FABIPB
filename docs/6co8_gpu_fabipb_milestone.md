@@ -125,13 +125,13 @@ all streamed M2L and nearfield chunks for every GMRES matvec.
 Generate and solve a fresh `sdens=1` case in a new directory:
 
 ```sh
-FMM_R=1 FMM_DEPTH=8 FMM_GPU=1 FMM_PRECONDITIONER=3 GMRES_INITIAL=zero GMRES_RESTART=20 GMRES_MAX_ITER=100 GMRES_TOLERANCE=1e-4 FABIPB_RHS_TREE_THETA=0.3 FABIPB_RHS_THREADS=72 FABIPB_GPU_M2L_CHUNK_MIB=512 FABIPB_GPU_NEARFIELD_CHUNK_MIB=512 FABIPB_TIMEOUT=12h LIVE_LOG=1 OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+FMM_R=1 OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
 ```
 
 Generate and solve a fresh `sdens=2` case in a new directory:
 
 ```sh
-FMM_R=0.5 FMM_DEPTH=9 FMM_GPU=1 FMM_PRECONDITIONER=3 GMRES_INITIAL=zero GMRES_RESTART=20 GMRES_MAX_ITER=100 GMRES_TOLERANCE=1e-4 FABIPB_RHS_TREE_THETA=0.3 FABIPB_RHS_THREADS=72 FABIPB_GPU_M2L_CHUNK_MIB=512 FABIPB_GPU_NEARFIELD_CHUNK_MIB=512 FABIPB_TIMEOUT=12h LIVE_LOG=1 OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_R05_depth9_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+FMM_R=0.5 FMM_DEPTH=9 OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_R05_depth9_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
 ```
 
 `OUT_DIR` must be new or empty. `FABIPB_REUSE_MESH=1` trusts existing

@@ -12,10 +12,10 @@ fmm_gpu="${FMM_GPU:-1}"
 fmm_q2m="${FMM_Q2M:-0}"
 fmm_qorder="${FMM_QORDER:-1}"
 fmm_preconditioner="${FMM_PRECONDITIONER:-3}"
-restart="${GMRES_RESTART:-30}"
+restart="${GMRES_RESTART:-20}"
 max_iter="${GMRES_MAX_ITER:-100}"
 tolerance="${GMRES_TOLERANCE:-1e-4}"
-initial="${GMRES_INITIAL:-rhs}"
+initial="${GMRES_INITIAL:-zero}"
 pdie="${PDIE:-4}"
 sdie="${SDIE:-80}"
 stop_after_rhs="${STOP_AFTER_RHS:-0}"
@@ -23,8 +23,10 @@ stop_after_gmres="${STOP_AFTER_GMRES:-0}"
 fabipb_timeout="${FABIPB_TIMEOUT:-}"
 live_log="${LIVE_LOG:-1}"
 rhs_threads="${FABIPB_RHS_THREADS:-${FMM_RHS_THREADS:-$(nproc)}}"
-rhs_tree_theta="${FABIPB_RHS_TREE_THETA:-${FMM_RHS_TREE_THETA:-0.2}}"
+rhs_tree_theta="${FABIPB_RHS_TREE_THETA:-${FMM_RHS_TREE_THETA:-0.3}}"
 rhs_sample_stride="${FABIPB_RHS_SAMPLE_STRIDE:-${RHS_SAMPLE_STRIDE:-1000}}"
+m2l_chunk_mib="${FABIPB_GPU_M2L_CHUNK_MIB:-512}"
+nearfield_chunk_mib="${FABIPB_GPU_NEARFIELD_CHUNK_MIB:-512}"
 
 nanoshaper_bin="${FABIPB_NANOSHAPER_BIN:-}"
 if [[ -z "$nanoshaper_bin" ]]; then
@@ -101,6 +103,8 @@ env_args=(
   FABIPB_RHS_SAMPLE_PATH="$rhs_sample_path"
   FABIPB_RHS_SAMPLE_STRIDE="$rhs_sample_stride"
   FABIPB_GMRES_INITIAL="$initial"
+  FABIPB_GPU_M2L_CHUNK_MIB="$m2l_chunk_mib"
+  FABIPB_GPU_NEARFIELD_CHUNK_MIB="$nearfield_chunk_mib"
 )
 if [[ "$stop_after_rhs" == "1" ]]; then
   env_args+=(FABIPB_STOP_AFTER_RHS=1)

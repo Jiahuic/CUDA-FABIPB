@@ -450,6 +450,7 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_FORCE_TREE_RHS=1   force the tree-accelerated setupRHS path\n");
   printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio (default 0.2)\n");
   printf("  FABIPB_RHS_THREADS=<n> setupRHS tree worker threads (default: online CPUs, max 128)\n");
+  printf("Diagnostics (optional; disabled unless explicitly enabled):\n");
   printf("  FABIPB_RHS_SUMMARY_PATH=<path> write raw and TABI-style RHS summary CSV\n");
   printf("  FABIPB_RHS_SAMPLE_PATH=<path> write sampled RHS rows after setupRHS\n");
   printf("  FABIPB_RHS_SAMPLE_STRIDE=<n> sample every nth RHS row (default: 1000)\n");
