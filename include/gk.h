@@ -113,6 +113,13 @@ struct ssystem {
 };
 typedef struct ssystem ssystem;
 
+typedef struct {
+  int maxOrder;
+  int derivOrder;
+  double *gvals0;
+  double **dg0;
+} RhsTreeWorkspace;
+
 typedef void (*KernelFn)(double *x, double *y);
 typedef void (*KernelDerivFn)(double r, int p, double *G);
 typedef void (*MatVecFn)(ssystem *sys, double *sgm, double *pot);

@@ -26,6 +26,7 @@ extern double *ifact3;
 extern int *sgn3;
 extern int ***idx3;
 extern double fourPiI;
+extern double **tLegA, **wLegA;
 
 double rhsTreeTheta(void) {
   static int initialized = 0;
@@ -51,6 +52,212 @@ double rhsTreeTheta(void) {
     }
   }
   return theta;
+}
+
+void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws) {
+  int k, p;
+
+  if (ws == NULL) {
+    return;
+  }
+  memset(ws, 0, sizeof(*ws));
+  if (sys == NULL) {
+    return;
+  }
+
+  ws->maxOrder = sys->maxOrder;
+  ws->derivOrder = sys->maxOrder + 1;
+  CALLOC(ws->gvals0, ws->derivOrder + 1, double);
+  CALLOC(ws->dg0, ws->derivOrder + 1, double*);
+  for (k = 0; k <= ws->derivOrder; k++) {
+    p = ws->derivOrder - k;
+    CALLOC(ws->dg0[k], sys->nMom[p], double);
+  }
+}
+
+void freeRhsTreeWorkspace(RhsTreeWorkspace *ws) {
+  int k;
+
+  if (ws == NULL) {
+    return;
+  }
+  if (ws->dg0 != NULL) {
+    for (k = 0; k <= ws->derivOrder; k++) {
+      free(ws->dg0[k]);
+    }
+    free(ws->dg0);
+  }
+  free(ws->gvals0);
+  memset(ws, 0, sizeof(*ws));
+}
+
+static void setupCoulombDerivsLocal(ssystem *sys, RhsTreeWorkspace *ws,
+                                    int order, const double *x) {
+  double r, r2;
+  int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2, k;
+
+  ASSERT(sys != NULL && ws != NULL);
+  ASSERT(order >= 0 && order <= ws->derivOrder);
+
+  r = sqrt(SQR(x[0]) + SQR(x[1]) + SQR(x[2]));
+  ws->gvals0[0] = fourPiI / r;
+  r2 = -1.0 / (r * r);
+  for (k = 0; k < order; k++) {
+    ws->gvals0[k + 1] = (2 * k + 1) * r2 * ws->gvals0[k];
+  }
+
+  for (p = 0; p <= order; p++) {
+    ws->dg0[p][0] = ws->gvals0[p];
+  }
+
+  for (p = 0; p < order; p++) {
+    p1 = p + 1;
+    ws->dg0[p][1] = ws->dg0[p1][0] * x[2];
+    ws->dg0[p][2] = ws->dg0[p1][0] * x[1];
+    ws->dg0[p][3] = ws->dg0[p1][0] * x[0];
+  }
+
+  for (iRow = 2; iRow <= order; iRow++) {
+    for (p = 0; p <= order - iRow; p++) {
+      p1 = p + 1;
+      idx = idx3[0][0][iRow];
+      iRow1 = iRow - 1;
+
+      idx1 = idx3[0][0][iRow1];
+      idx2 = idx3[0][0][iRow - 2];
+      ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[2] + ws->dg0[p1][idx2] * iRow1;
+      idx++;
+
+      idx1 = idx3[0][0][iRow1];
+      ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[1];
+      idx++;
+
+      for (i2 = 2; i2 <= iRow; i2++, idx++) {
+        i3 = iRow - i2;
+        idx1 = idx3[0][i2 - 1][i3];
+        idx2 = idx3[0][i2 - 2][i3];
+        ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[1] + ws->dg0[p1][idx2] * (i2 - 1);
+      }
+
+      for (i2 = 0; i2 <= iRow1; i2++, idx++) {
+        i3 = iRow1 - i2;
+        idx1 = idx3[0][i2][i3];
+        ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[0];
+      }
+
+      for (i1 = 2; i1 <= iRow; i1++) {
+        for (i2 = 0; i2 <= iRow - i1; i2++, idx++) {
+          i3 = iRow - i1 - i2;
+          idx1 = idx3[i1 - 1][i2][i3];
+          idx2 = idx3[i1 - 2][i2][i3];
+          ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[0] + ws->dg0[p1][idx2] * (i1 - 1);
+        }
+      }
+    }
+  }
+}
+
+static void chgClusterEvalLocal(ssystem *sys, cube *chgCb, panel *pnlX,
+                                RhsTreeWorkspace *ws, double *y) {
+  int order = rhsChargeExpansionOrder(sys, chgCb->level);
+  int nMom = sys->nMom[order];
+  double *mom = chgCb->mom_chr;
+  double *dg = ws->dg0[0];
+  double *nrm = pnlX->normal;
+  double y0 = 0.0, y1 = 0.0;
+  int i, i1, i2, i3, n;
+
+  ASSERT(chgCb->level >= 0 && chgCb->level <= sys->chgDepth);
+  ASSERT(order >= 0 && order <= sys->maxOrder);
+  ASSERT(nMom > 0 && nMom < 1000000);
+  ASSERT(mom != NULL);
+
+  for (i = n = 0; n <= order; n++) {
+    for (i1 = 0; i1 <= n; i1++) {
+      for (i2 = 0; i2 <= n - i1; i2++, i++) {
+        double dnDeriv;
+        i3 = n - i1 - i2;
+        y0 += sgn3[i] * mom[i] * dg[i];
+        dnDeriv = nrm[0] * dg[idx3[i1 + 1][i2][i3]]
+                + nrm[1] * dg[idx3[i1][i2 + 1][i3]]
+                + nrm[2] * dg[idx3[i1][i2][i3 + 1]];
+        y1 += sgn3[i] * mom[i] * dnDeriv;
+      }
+    }
+  }
+  y[0] = y0 / fourPiI;
+  y[1] = y1 / fourPiI;
+}
+
+static void rhsTreeWalkLocal(ssystem *sys, cube *chgCb, const double *quadPt,
+                             panel *pnlX, RhsTreeWorkspace *ws, double *y) {
+  double theta = rhsTreeTheta();
+  double dist, r[3], yFar[2];
+  int k, i;
+
+  for (k = 0; k < 3; k++) r[k] = quadPt[k] - chgCb->x[k];
+  dist = sqrt(SQR(r[0]) + SQR(r[1]) + SQR(r[2]));
+
+  if (chgCb->eRad < theta * dist && chgCb->level >= sys->height) {
+    setupCoulombDerivsLocal(sys, ws, rhsChargeExpansionOrder(sys, chgCb->level) + 1, r);
+    chgClusterEvalLocal(sys, chgCb, pnlX, ws, yFar);
+    y[0] += yFar[0];
+    y[1] += yFar[1];
+    return;
+  }
+
+  if (chgCb->level == sys->chgDepth) {
+    for (i = 0; i < chgCb->nChgs; i++) {
+      int j = chgCb->chgIdx[i];
+      double x[3], r2, ri, r3i, ip;
+      for (k = 0; k < 3; k++) x[k] = quadPt[k] - sys->pos[3 * j + k];
+      r2 = SQR(x[0]) + SQR(x[1]) + SQR(x[2]);
+      ri = 1.0 / sqrt(r2);
+      r3i = ri / r2;
+      ip = pnlX->normal[0] * x[0] + pnlX->normal[1] * x[1] + pnlX->normal[2] * x[2];
+      y[0] += sys->chr[j] * ri;
+      y[1] += sys->chr[j] * (-ip * r3i);
+    }
+    return;
+  }
+
+  for (i = 0; i < chgCb->nKids; i++) {
+    rhsTreeWalkLocal(sys, chgCb->kids[i], quadPt, pnlX, ws, y);
+  }
+}
+
+void panelRHSTreeWorkspace(ssystem *sys, int qOrder, panel *pnlX, cube *chgRoot,
+                           RhsTreeWorkspace *ws, double out[2]) {
+  int ix, jx, k;
+  double r0[3], r[3], *ax2, *ax0;
+  double *tLeg, *wLeg;
+  double y[2];
+
+  tLeg = tLegA[qOrder];
+  wLeg = wLegA[qOrder];
+  ax2 = pnlX->a[2];
+  ax0 = pnlX->a[0];
+
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k];
+  }
+
+  out[0] = 0.0;
+  out[1] = 0.0;
+  for (ix = 0; ix < qOrder; ix++) {
+    for (jx = 0; jx < qOrder; jx++) {
+      for (k = 0; k < 3; k++) {
+        r[k] = r0[k] + tLeg[ix] * (ax2[k] + tLeg[jx] * ax0[k]);
+      }
+      y[0] = 0.0;
+      y[1] = 0.0;
+      rhsTreeWalkLocal(sys, chgRoot, r, pnlX, ws, y);
+      out[0] += y[0] * tLeg[ix] * wLeg[ix] * wLeg[jx];
+      out[1] += y[1] * tLeg[ix] * wLeg[ix] * wLeg[jx];
+    }
+  }
+  out[0] *= 2.0 * pnlX->area;
+  out[1] *= 2.0 * pnlX->area;
 }
 
 static void partclusterComponents(ssystem *sys, double *G0, double *Gk,

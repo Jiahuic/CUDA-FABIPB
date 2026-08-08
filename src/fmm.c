@@ -384,7 +384,8 @@ void applyNearfield1(ssystem *sys, double *alpha, double *sgm, double *beta, dou
         warnedNoGpuBackend = 1;
       }
     } else if (!warnedGpuApplyFailure) {
-      printf("GPU nearfield path failed at runtime; using CPU fallback.\n");
+      printf("GPU nearfield path failed: %s; using CPU fallback.\n",
+             gpuNearfieldLastError());
       warnedGpuApplyFailure = 1;
     }
   }

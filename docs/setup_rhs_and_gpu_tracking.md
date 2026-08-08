@@ -437,6 +437,42 @@ The current CUDA `setupRHS` implementation is also a direct all-pairs kernel.
 It can measure GPU speedup for small/coarse cases, but the CPU charge-tree path
 is currently the scalable `setupRHS` implementation.
 
+## Fine 6CO8 RHS Acceleration Check
+
+The first-iteration fine-mesh GPU comparison completed with:
+
+```text
+panels:                 10,222,264
+charges:                 1,576,628
+CPU charge-tree RHS:       312.119 s
+first GPU FMM matvec:        41.737 s
+GPU nearfield:               24.689 s
+```
+
+The RHS is therefore the dominant stage. It already uses 72 pthread workers,
+one quadrature point per panel (`qOrd=1`), and a fourth-order charge expansion.
+The remaining work is approximately 10.2 million independent recursive charge
+tree walks. The existing direct CUDA RHS is not appropriate here because the
+full interaction count is 16,116,707,645,792.
+
+A same-mesh `1a63` sweep measured the CPU tree acceptance-ratio tradeoff:
+
+| theta | setupRHS | potential rel-L2 error | normal rel-L2 error |
+|---:|---:|---:|---:|
+| 0.20 | 0.0754 s | 6.47e-5 | 1.76e-4 |
+| 0.25 | 0.0583 s | 1.93e-4 | 6.63e-4 |
+| 0.30 | 0.0470 s | 5.10e-4 | 2.39e-3 |
+| 0.40 | 0.0339 s | 1.80e-3 | 1.07e-2 |
+
+`theta=0.3` is a useful explicit 6CO8 timing experiment, but it is not the new
+default until its fine-virus RHS sums are compared against the existing
+`theta=0.2` result. The expected long-term implementation is a flattened GPU
+charge tree: persistent node/moment/leaf-charge arrays, one GPU target per
+panel quadrature point, an explicit bounded traversal stack, multipole
+evaluation for accepted nodes, and direct charge evaluation only in reached
+leaves. This changes the hardware used without changing the current tree-RHS
+equations or acceptance rule.
+
 Focused tests:
 
 ```sh

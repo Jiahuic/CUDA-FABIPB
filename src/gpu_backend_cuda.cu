@@ -4,7 +4,9 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <limits.h>
 #include <cstring>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>
@@ -60,7 +62,9 @@ struct NearfieldGpuCache {
   const ssystem *sys;
   int nPnls;
   int nearfieldMode;
+  int streaming;
   long long nInteractions;
+  long long chunkCapacity;
   long long caseDisjointCount;
   long long caseOneCommonCount;
   long long caseTwoCommonCount;
@@ -95,9 +99,11 @@ struct NearfieldGpuCache {
 };
 
 NearfieldGpuCache gNear = {};
+char gNearfieldLastError[512] = "";
 
 struct M2LGpuCache {
   const ssystem *sys;
+  int streaming;
   int nCubes;
   int nPairs;
   int nGroups;
@@ -105,7 +111,10 @@ struct M2LGpuCache {
   int maxIdxDim;
   long long totalPairCoeff;
   int totalCubeCoeff;
+  int *h_pairSrc;
   int *h_pairCoeffOffset;
+  int *h_groupStart;
+  int *h_groupCount;
   int *h_groupDst;
   int *h_groupOrder;
   int *h_cubeCoeffOffset;
@@ -143,6 +152,9 @@ struct M2LGpuCache {
   double *d_lec2;
   double *d_lec3;
   double *d_lec4;
+  int streamPairCapacity;
+  int streamGroupCapacity;
+  int streamCoeffCapacity;
 };
 
 M2LGpuCache gM2L = {};
@@ -226,6 +238,73 @@ struct PrecondGpuCache {
 PrecondGpuCache gPrecond = {};
 std::mutex gPrecondMutex;
 
+void setNearfieldLastError(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(gNearfieldLastError, sizeof(gNearfieldLastError), fmt, ap);
+  va_end(ap);
+}
+
+int envFlagEnabled(const char *name) {
+  const char *value = getenv(name);
+  return value != NULL && atoi(value) != 0;
+}
+
+double bytesToGiB(size_t bytes) {
+  return (double)bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+size_t nearfieldHostBytes(const ssystem *sys, long long nInteractions) {
+  size_t ni = (size_t)nInteractions;
+  size_t nNearPairs = (size_t)sys->nNearPairsFlat;
+  size_t nLeaves = (size_t)sys->nLeafCubesFlat;
+  size_t nPnls = (size_t)sys->nPnls;
+  return nPnls * sizeof(NearPanelGeom) +
+         2U * ni * sizeof(int) +
+         nNearPairs * sizeof(int) +
+         nNearPairs * sizeof(long long) +
+         2U * nLeaves * sizeof(int) +
+         (nLeaves + 1U) * sizeof(int) +
+         4U * ni * sizeof(double);
+}
+
+size_t nearfieldDeviceBytes(const ssystem *sys, long long nInteractions) {
+  size_t ni = (size_t)nInteractions;
+  size_t nNearPairs = (size_t)sys->nNearPairsFlat;
+  size_t nLeaves = (size_t)sys->nLeafCubesFlat;
+  size_t nPnls = (size_t)sys->nPnls;
+  size_t vecBytes = 2U * nPnls * sizeof(double);
+  return nPnls * sizeof(NearPanelGeom) +
+         2U * ni * sizeof(int) +
+         nNearPairs * sizeof(int) +
+         nNearPairs * sizeof(long long) +
+         2U * nLeaves * sizeof(int) +
+         (nLeaves + 1U) * sizeof(int) +
+         4U * ni * sizeof(double) +
+         2U * vecBytes;
+}
+
+int cudaMallocNearfield(void **ptr, size_t bytes, const char *name) {
+  cudaError_t err = cudaMalloc(ptr, bytes);
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMalloc %s failed for %.3f GiB: %s",
+                          name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+int cudaMemcpyNearfield(void *dst, const void *src, size_t bytes,
+                        enum cudaMemcpyKind kind, const char *name) {
+  cudaError_t err = cudaMemcpy(dst, src, bytes, kind);
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy %s failed for %.3f GiB: %s",
+                          name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
 struct RhsPanelGeom {
   double v0[3];
   double a0[3];
@@ -264,6 +343,16 @@ __global__ void nearfieldDisjointQ1BuildKernel(
     double *k1,
     double *k2,
     double *k3);
+
+__global__ void nearfieldDisjointQ1ApplyKernel(
+    int nPnls,
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double alpha,
+    const double *sgm,
+    double *pot);
 
 void freeNearfieldCache() {
   free(gNear.h_panels);
@@ -323,11 +412,16 @@ void freeNearfieldCache() {
   gNear.sys = NULL;
   gNear.nPnls = 0;
   gNear.nearfieldMode = 0;
+  gNear.streaming = 0;
   gNear.nInteractions = 0;
+  gNear.chunkCapacity = 0;
 }
 
 void freeM2LCache() {
+  free(gM2L.h_pairSrc);
   free(gM2L.h_pairCoeffOffset);
+  free(gM2L.h_groupStart);
+  free(gM2L.h_groupCount);
   free(gM2L.h_groupDst);
   free(gM2L.h_groupOrder);
   free(gM2L.h_cubeCoeffOffset);
@@ -344,7 +438,10 @@ void freeM2LCache() {
   free(gM2L.h_lec2);
   free(gM2L.h_lec3);
   free(gM2L.h_lec4);
+  gM2L.h_pairSrc = NULL;
   gM2L.h_pairCoeffOffset = NULL;
+  gM2L.h_groupStart = NULL;
+  gM2L.h_groupCount = NULL;
   gM2L.h_groupDst = NULL;
   gM2L.h_groupOrder = NULL;
   gM2L.h_cubeCoeffOffset = NULL;
@@ -406,6 +503,7 @@ void freeM2LCache() {
   gM2L.d_lec4 = NULL;
 
   gM2L.sys = NULL;
+  gM2L.streaming = 0;
   gM2L.nCubes = 0;
   gM2L.nPairs = 0;
   gM2L.nGroups = 0;
@@ -413,6 +511,9 @@ void freeM2LCache() {
   gM2L.maxIdxDim = 0;
   gM2L.totalPairCoeff = 0;
   gM2L.totalCubeCoeff = 0;
+  gM2L.streamPairCapacity = 0;
+  gM2L.streamGroupCapacity = 0;
+  gM2L.streamCoeffCapacity = 0;
 }
 
 void freeLeafCache() {
@@ -621,17 +722,77 @@ int ensurePrecondCapacity(int nPanels, int nPairs) {
 int allocateHostArrays(long long n) {
   size_t ni = (size_t)n;
   gNear.h_panels = (NearPanelGeom *)malloc((size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
+  if (!gNear.h_panels) {
+    setNearfieldLastError("host malloc h_panels failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nPnls * sizeof(NearPanelGeom)));
+    return 0;
+  }
   gNear.h_src = (int *)malloc(ni * sizeof(int));
+  if (!gNear.h_src) {
+    setNearfieldLastError("host malloc h_src failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(int)));
+    return 0;
+  }
   gNear.h_dst = (int *)malloc(ni * sizeof(int));
+  if (!gNear.h_dst) {
+    setNearfieldLastError("host malloc h_dst failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(int)));
+    return 0;
+  }
   gNear.h_pairSrcCount = (int *)malloc((size_t)gNear.sys->nNearPairsFlat * sizeof(int));
+  if (!gNear.h_pairSrcCount) {
+    setNearfieldLastError("host malloc h_pairSrcCount failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nNearPairsFlat * sizeof(int)));
+    return 0;
+  }
   gNear.h_pairInteractionOffset = (long long *)malloc((size_t)gNear.sys->nNearPairsFlat * sizeof(long long));
+  if (!gNear.h_pairInteractionOffset) {
+    setNearfieldLastError("host malloc h_pairInteractionOffset failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nNearPairsFlat * sizeof(long long)));
+    return 0;
+  }
   gNear.h_leafPanelStart = (int *)malloc((size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
+  if (!gNear.h_leafPanelStart) {
+    setNearfieldLastError("host malloc h_leafPanelStart failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nLeafCubesFlat * sizeof(int)));
+    return 0;
+  }
   gNear.h_leafPanelCount = (int *)malloc((size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
+  if (!gNear.h_leafPanelCount) {
+    setNearfieldLastError("host malloc h_leafPanelCount failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nLeafCubesFlat * sizeof(int)));
+    return 0;
+  }
   gNear.h_leafPairOffset = (int *)calloc((size_t)gNear.sys->nLeafCubesFlat + 1, sizeof(int));
+  if (!gNear.h_leafPairOffset) {
+    setNearfieldLastError("host calloc h_leafPairOffset failed for %.3f GiB",
+                          bytesToGiB(((size_t)gNear.sys->nLeafCubesFlat + 1U) * sizeof(int)));
+    return 0;
+  }
   gNear.h_k0 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k0) {
+    setNearfieldLastError("host malloc h_k0 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   gNear.h_k1 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k1) {
+    setNearfieldLastError("host malloc h_k1 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   gNear.h_k2 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k2) {
+    setNearfieldLastError("host malloc h_k2 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   gNear.h_k3 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k3) {
+    setNearfieldLastError("host malloc h_k3 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   if (!gNear.h_panels || !gNear.h_src || !gNear.h_dst || !gNear.h_pairSrcCount ||
       !gNear.h_pairInteractionOffset || !gNear.h_leafPanelStart ||
       !gNear.h_leafPanelCount || !gNear.h_leafPairOffset ||
@@ -644,36 +805,33 @@ int allocateHostArrays(long long n) {
 int allocateDeviceArrays(int nPnls, long long nInteractions) {
   size_t ni = (size_t)nInteractions;
   size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
-  cudaError_t err = cudaSuccess;
 
-  err = cudaMalloc((void **)&gNear.d_panels, (size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_src, ni * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_dst, ni * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_pairSrcCount, (size_t)gNear.sys->nNearPairsFlat * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_pairInteractionOffset, (size_t)gNear.sys->nNearPairsFlat * sizeof(long long));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_leafPanelStart, (size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_leafPanelCount, (size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_leafPairOffset, ((size_t)gNear.sys->nLeafCubesFlat + 1) * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k0, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k1, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k2, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k3, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_sgm, vecBytes);
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_pot, vecBytes);
-  if (err != cudaSuccess) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_panels,
+                           (size_t)gNear.sys->nPnls * sizeof(NearPanelGeom),
+                           "d_panels")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_src, ni * sizeof(int), "d_src")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_dst, ni * sizeof(int), "d_dst")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_pairSrcCount,
+                           (size_t)gNear.sys->nNearPairsFlat * sizeof(int),
+                           "d_pairSrcCount")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_pairInteractionOffset,
+                           (size_t)gNear.sys->nNearPairsFlat * sizeof(long long),
+                           "d_pairInteractionOffset")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_leafPanelStart,
+                           (size_t)gNear.sys->nLeafCubesFlat * sizeof(int),
+                           "d_leafPanelStart")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_leafPanelCount,
+                           (size_t)gNear.sys->nLeafCubesFlat * sizeof(int),
+                           "d_leafPanelCount")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_leafPairOffset,
+                           ((size_t)gNear.sys->nLeafCubesFlat + 1U) * sizeof(int),
+                           "d_leafPairOffset")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k0, ni * sizeof(double), "d_k0")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k1, ni * sizeof(double), "d_k1")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k2, ni * sizeof(double), "d_k2")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k3, ni * sizeof(double), "d_k3")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_sgm, vecBytes, "d_sgm")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_pot, vecBytes, "d_pot")) return 0;
 
   return 1;
 }
@@ -695,6 +853,92 @@ int buildNearfieldPanelGeometry(const ssystem *sys) {
       gNear.h_panels[i].normal[k] = pnl->normal[k];
     }
     gNear.h_panels[i].area = pnl->area;
+  }
+  return 1;
+}
+
+long long nearfieldStreamingCapacity(size_t freeBytes) {
+  const char *env = getenv("FABIPB_GPU_NEARFIELD_CHUNK_MIB");
+  size_t requestedBytes = 512U * 1024U * 1024U;
+  const size_t bytesPerInteraction = 2U * sizeof(int) + 4U * sizeof(double);
+  size_t reserveBytes = 256U * 1024U * 1024U;
+
+  if (env != NULL) {
+    double mib = atof(env);
+    if (mib > 0.0) {
+      requestedBytes = (size_t)(mib * 1024.0 * 1024.0);
+    }
+  }
+  if (freeBytes > reserveBytes && requestedBytes > freeBytes - reserveBytes) {
+    requestedBytes = freeBytes - reserveBytes;
+  }
+  if (requestedBytes < bytesPerInteraction * 1024U) {
+    return 0;
+  }
+  return (long long)(requestedBytes / bytesPerInteraction);
+}
+
+int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions,
+                                 size_t freeBytes) {
+  long long capacity = nearfieldStreamingCapacity(freeBytes);
+  size_t ni;
+  size_t vecBytes;
+
+  if (sys->maxQuadOrder != 1) {
+    setNearfieldLastError("streaming nearfield currently requires qOrd=1 (got %d)",
+                          sys->maxQuadOrder);
+    return 0;
+  }
+  if (capacity <= 0) {
+    setNearfieldLastError("not enough free GPU memory for a nearfield streaming chunk");
+    return 0;
+  }
+
+  gNear.sys = sys;
+  gNear.nPnls = sys->nPnls;
+  gNear.nearfieldMode = 0;
+  gNear.streaming = 1;
+  gNear.nInteractions = totalInteractions;
+  gNear.chunkCapacity = capacity;
+  ni = (size_t)capacity;
+  vecBytes = (size_t)(2 * sys->nPnls) * sizeof(double);
+
+  gNear.h_panels = (NearPanelGeom *)malloc((size_t)sys->nPnls * sizeof(NearPanelGeom));
+  gNear.h_src = (int *)malloc(ni * sizeof(int));
+  gNear.h_dst = (int *)malloc(ni * sizeof(int));
+  gNear.h_k0 = (double *)malloc(ni * sizeof(double));
+  gNear.h_k1 = (double *)malloc(ni * sizeof(double));
+  gNear.h_k2 = (double *)malloc(ni * sizeof(double));
+  gNear.h_k3 = (double *)malloc(ni * sizeof(double));
+  if (gNear.h_panels == NULL || gNear.h_src == NULL || gNear.h_dst == NULL ||
+      gNear.h_k0 == NULL || gNear.h_k1 == NULL || gNear.h_k2 == NULL ||
+      gNear.h_k3 == NULL) {
+    setNearfieldLastError("host allocation for %.3f GiB nearfield streaming chunk failed",
+                          bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
+    return 0;
+  }
+  if (!buildNearfieldPanelGeometry(sys)) return 0;
+
+  if (!cudaMallocNearfield((void **)&gNear.d_panels,
+                           (size_t)sys->nPnls * sizeof(NearPanelGeom), "stream d_panels") ||
+      !cudaMallocNearfield((void **)&gNear.d_src, ni * sizeof(int), "stream d_src") ||
+      !cudaMallocNearfield((void **)&gNear.d_dst, ni * sizeof(int), "stream d_dst") ||
+      !cudaMallocNearfield((void **)&gNear.d_k0, ni * sizeof(double), "stream d_k0") ||
+      !cudaMallocNearfield((void **)&gNear.d_k1, ni * sizeof(double), "stream d_k1") ||
+      !cudaMallocNearfield((void **)&gNear.d_k2, ni * sizeof(double), "stream d_k2") ||
+      !cudaMallocNearfield((void **)&gNear.d_k3, ni * sizeof(double), "stream d_k3") ||
+      !cudaMallocNearfield((void **)&gNear.d_sgm, vecBytes, "stream d_sgm") ||
+      !cudaMallocNearfield((void **)&gNear.d_pot, vecBytes, "stream d_pot")) {
+    return 0;
+  }
+  if (!cudaMemcpyNearfield(gNear.d_panels, gNear.h_panels,
+                           (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                           cudaMemcpyHostToDevice, "stream panels")) return 0;
+
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield streaming: interactions=%lld chunk-capacity=%lld chunk-device=%.3f GiB qOrd=1\n",
+           totalInteractions, capacity,
+           bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
   }
   return 1;
 }
@@ -845,6 +1089,79 @@ int allocateM2LDeviceArrays() {
   err = cudaMalloc((void **)&gM2L.d_lec4, nMom * sizeof(double));
   if (err != cudaSuccess) return 0;
 
+  return 1;
+}
+
+int allocateM2LStreamingArrays(size_t chunkBytes) {
+  size_t nCubes = (size_t)gM2L.nCubes;
+  size_t nMom = (size_t)gM2L.totalCubeCoeff;
+  size_t idxFlat = (size_t)gM2L.maxIdxDim * (size_t)gM2L.maxIdxDim *
+                   (size_t)gM2L.maxIdxDim;
+  size_t maxMom = (size_t)(((gM2L.maxOrder + 1) * (gM2L.maxOrder + 2) *
+                            (gM2L.maxOrder + 3)) / 6);
+  size_t coeffCapacity = (chunkBytes * 3U / 4U) / (2U * sizeof(double));
+  size_t pairCapacity = (chunkBytes / 4U) / (2U * sizeof(int));
+  size_t groupCapacity = std::min((size_t)gM2L.nGroups, (size_t)1048576U);
+
+  if (coeffCapacity > (size_t)INT_MAX) coeffCapacity = (size_t)INT_MAX;
+  if (pairCapacity > (size_t)INT_MAX) pairCapacity = (size_t)INT_MAX;
+  if (coeffCapacity == 0 || pairCapacity == 0 || groupCapacity == 0) return 0;
+  gM2L.streamCoeffCapacity = (int)coeffCapacity;
+  gM2L.streamPairCapacity = (int)pairCapacity;
+  gM2L.streamGroupCapacity = (int)groupCapacity;
+
+  gM2L.h_pairSrc = (int *)malloc(pairCapacity * sizeof(int));
+  gM2L.h_pairCoeffOffset = (int *)malloc((pairCapacity + 1U) * sizeof(int));
+  gM2L.h_groupStart = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_groupCount = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_groupDst = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_groupOrder = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_cubeCoeffOffset = (int *)malloc(nCubes * sizeof(int));
+  gM2L.h_cubeNMom = (int *)malloc(nCubes * sizeof(int));
+  gM2L.h_idxI1 = (int *)malloc(maxMom * sizeof(int));
+  gM2L.h_idxI2 = (int *)malloc(maxMom * sizeof(int));
+  gM2L.h_idxI3 = (int *)malloc(maxMom * sizeof(int));
+  gM2L.h_idx3Flat = (int *)malloc(idxFlat * sizeof(int));
+  gM2L.h_g0 = (double *)malloc(coeffCapacity * sizeof(double));
+  gM2L.h_gk = (double *)malloc(coeffCapacity * sizeof(double));
+  gM2L.h_momPot = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_momDpdn = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec1 = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec2 = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec3 = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec4 = (double *)malloc(nMom * sizeof(double));
+  if (!gM2L.h_pairSrc || !gM2L.h_pairCoeffOffset ||
+      !gM2L.h_groupStart || !gM2L.h_groupCount ||
+      !gM2L.h_groupDst || !gM2L.h_groupOrder || !gM2L.h_cubeCoeffOffset ||
+      !gM2L.h_cubeNMom || !gM2L.h_idxI1 || !gM2L.h_idxI2 || !gM2L.h_idxI3 ||
+      !gM2L.h_idx3Flat || !gM2L.h_g0 || !gM2L.h_gk || !gM2L.h_momPot ||
+      !gM2L.h_momDpdn || !gM2L.h_lec1 || !gM2L.h_lec2 ||
+      !gM2L.h_lec3 || !gM2L.h_lec4) return 0;
+
+#define M2L_STREAM_CUDA_ALLOC(ptr, count, type) \
+  do { if (cudaMalloc((void **)&(ptr), (count) * sizeof(type)) != cudaSuccess) return 0; } while (0)
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_pairSrc, pairCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_pairCoeffOffset, pairCapacity + 1U, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupStart, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupCount, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupDst, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupOrder, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_cubeCoeffOffset, nCubes, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_cubeNMom, nCubes, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idxI1, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idxI2, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idxI3, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idx3Flat, idxFlat, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_sgn3, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_g0, coeffCapacity, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_gk, coeffCapacity, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_momPot, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_momDpdn, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec1, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec2, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec3, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec4, nMom, double);
+#undef M2L_STREAM_CUDA_ALLOC
   return 1;
 }
 
@@ -999,6 +1316,74 @@ void buildM2LIndexTables() {
   }
 }
 
+size_t m2lStreamingChunkBytes() {
+  const char *env = getenv("FABIPB_GPU_M2L_CHUNK_MIB");
+  double mib = 512.0;
+  if (env != NULL && atof(env) > 0.0) mib = atof(env);
+  return (size_t)(mib * 1024.0 * 1024.0);
+}
+
+size_t m2lFullDeviceBytes() {
+  size_t nPairs = (size_t)gM2L.nPairs;
+  size_t nGroups = (size_t)gM2L.nGroups;
+  size_t nCubes = (size_t)gM2L.nCubes;
+  size_t nMom = (size_t)gM2L.totalCubeCoeff;
+  size_t nPairCoeff = (size_t)gM2L.totalPairCoeff;
+  return 2U * nPairCoeff * sizeof(double) +
+         2U * nPairs * sizeof(int) +
+         4U * nGroups * sizeof(int) +
+         2U * nCubes * sizeof(int) +
+         6U * nMom * sizeof(double);
+}
+
+int buildM2LStreamingTables(const ssystem *sys) {
+  int cubeIdx;
+  size_t chunkBytes = m2lStreamingChunkBytes();
+  size_t nCubes = (size_t)gM2L.nCubes;
+  size_t maxMom = (size_t)sys->nMom[sys->maxOrder];
+  size_t idxFlat = (size_t)gM2L.maxIdxDim * (size_t)gM2L.maxIdxDim *
+                   (size_t)gM2L.maxIdxDim;
+
+  if (gM2L.totalCubeCoeff > INT_MAX) {
+    printf("GPU M2L streaming unavailable: cube coefficient offsets exceed INT_MAX\n");
+    return 0;
+  }
+  gM2L.streaming = 1;
+  if (!allocateM2LStreamingArrays(chunkBytes)) return 0;
+  buildM2LIndexTables();
+
+  for (cubeIdx = 0; cubeIdx < gM2L.nCubes; cubeIdx++) {
+    cube *cb = sys->fmmCubeByIdx[cubeIdx];
+    int nMom = sys->nMom[sys->ordM2L[cb->level]];
+    if (cubeIdx == 0) {
+      gM2L.h_cubeCoeffOffset[cubeIdx] = 0;
+    } else {
+      gM2L.h_cubeCoeffOffset[cubeIdx] =
+          gM2L.h_cubeCoeffOffset[cubeIdx - 1] + gM2L.h_cubeNMom[cubeIdx - 1];
+    }
+    gM2L.h_cubeNMom[cubeIdx] = nMom;
+  }
+
+#define M2L_STREAM_UPLOAD(dst, src, count, type) \
+  do { if (cudaMemcpy((dst), (src), (count) * sizeof(type), cudaMemcpyHostToDevice) != cudaSuccess) return 0; } while (0)
+  M2L_STREAM_UPLOAD(gM2L.d_cubeCoeffOffset, gM2L.h_cubeCoeffOffset, nCubes, int);
+  M2L_STREAM_UPLOAD(gM2L.d_cubeNMom, gM2L.h_cubeNMom, nCubes, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idxI1, gM2L.h_idxI1, maxMom, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idxI2, gM2L.h_idxI2, maxMom, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idxI3, gM2L.h_idxI3, maxMom, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idx3Flat, gM2L.h_idx3Flat, idxFlat, int);
+  M2L_STREAM_UPLOAD(gM2L.d_sgn3, sgn3, maxMom, int);
+#undef M2L_STREAM_UPLOAD
+
+  if (sys->benchmarkMode > 0) {
+    printf("GPU M2L streaming cache: cubes=%d pairs=%d coeff=%lld pair-capacity=%d coeff-capacity=%d group-capacity=%d device-chunk=%.3f GiB\n",
+           gM2L.nCubes, gM2L.nPairs, gM2L.totalPairCoeff,
+           gM2L.streamPairCapacity, gM2L.streamCoeffCapacity,
+           gM2L.streamGroupCapacity, bytesToGiB(chunkBytes));
+  }
+  return 1;
+}
+
 int buildM2LTables(const ssystem *sys) {
   int cubeIdx;
   int pairIdx;
@@ -1013,6 +1398,7 @@ int buildM2LTables(const ssystem *sys) {
   gM2L.maxIdxDim = sys->maxOrder + 1;
   gM2L.totalPairCoeff = 0;
   gM2L.totalCubeCoeff = 0;
+  gM2L.streaming = 0;
 
   for (cubeIdx = 0; cubeIdx < sys->nFmmCubesFlat; cubeIdx++) {
     cube *cb = sys->fmmCubeByIdx[cubeIdx];
@@ -1027,6 +1413,24 @@ int buildM2LTables(const ssystem *sys) {
 
   if (gM2L.nPairs <= 0 || gM2L.nGroups <= 0 || gM2L.nCubes <= 0) {
     return 0;
+  }
+  {
+    size_t freeBytes = 0, totalBytes = 0;
+    size_t fullBytes = m2lFullDeviceBytes();
+    int forceStreaming = envFlagEnabled("FABIPB_GPU_M2L_FORCE_STREAMING");
+    int offsetOverflow = gM2L.totalPairCoeff > INT_MAX;
+    int memoryOverflow = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess) {
+      memoryOverflow = fullBytes > (freeBytes * 4U / 5U);
+      if (sys->benchmarkMode > 0) {
+        printf("GPU M2L estimate: coeff=%lld full-device=%.3f GiB free=%.3f GiB total=%.3f GiB offset64-required=%d\n",
+               gM2L.totalPairCoeff, bytesToGiB(fullBytes), bytesToGiB(freeBytes),
+               bytesToGiB(totalBytes), offsetOverflow);
+      }
+    }
+    if (forceStreaming || offsetOverflow || memoryOverflow) {
+      return buildM2LStreamingTables(sys);
+    }
   }
   if (!allocateM2LHostArrays()) {
     return 0;
@@ -1196,10 +1600,15 @@ int buildNearfieldTables(const ssystem *sys) {
   long long totalInteractions = 0;
   long long k = 0;
   long long disjointBuildCount = 0;
+  size_t hostBytes = 0;
+  size_t deviceBytes = 0;
+  size_t freeBytes = 0;
+  size_t totalGpuBytes = 0;
   double t0, t1;
   int collectCaseCounts = (sys->benchmarkMode > 0);
   int useGpuDisjointBuild = gpuNearfieldDisjointBuildEnabled(sys);
 
+  setNearfieldLastError("not attempted");
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
     int srcLeaf = sys->nearPairSrc[pairIdx];
     int dstLeaf = sys->nearPairDst[pairIdx];
@@ -1209,10 +1618,36 @@ int buildNearfieldTables(const ssystem *sys) {
   }
 
   if (totalInteractions <= 0) {
+    setNearfieldLastError("nearfield cache has no interactions");
     return 0;
+  }
+  hostBytes = nearfieldHostBytes(sys, totalInteractions);
+  deviceBytes = nearfieldDeviceBytes(sys, totalInteractions);
+  if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
+    if (sys->benchmarkMode > 0) {
+      printf("GPU nearfield estimate: interactions=%lld host-cache=%.3f GiB device-cache=%.3f GiB free=%.3f GiB total=%.3f GiB mode=%d\n",
+             totalInteractions, bytesToGiB(hostBytes), bytesToGiB(deviceBytes),
+             bytesToGiB(freeBytes), bytesToGiB(totalGpuBytes), sys->gpuNearfieldMode);
+    }
+    if (envFlagEnabled("FABIPB_GPU_NEARFIELD_FORCE_STREAMING")) {
+      return buildNearfieldStreamingCache(sys, totalInteractions, freeBytes);
+    }
+    if (deviceBytes > freeBytes && !envFlagEnabled("FABIPB_GPU_NEARFIELD_ALLOW_OVERSIZE")) {
+      if (!envFlagEnabled("FABIPB_GPU_NEARFIELD_DISABLE_STREAMING")) {
+        return buildNearfieldStreamingCache(sys, totalInteractions, freeBytes);
+      }
+      setNearfieldLastError("estimated device cache %.3f GiB exceeds free GPU memory %.3f GiB and streaming is disabled",
+                            bytesToGiB(deviceBytes), bytesToGiB(freeBytes));
+      return 0;
+    }
+  } else if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield estimate: interactions=%lld host-cache=%.3f GiB device-cache=%.3f GiB free=unknown mode=%d\n",
+           totalInteractions, bytesToGiB(hostBytes), bytesToGiB(deviceBytes),
+           sys->gpuNearfieldMode);
   }
   gNear.sys = sys;
   gNear.nearfieldMode = sys->gpuNearfieldMode;
+  gNear.streaming = 0;
   gNear.caseDisjointCount = 0;
   gNear.caseOneCommonCount = 0;
   gNear.caseTwoCommonCount = 0;
@@ -1223,6 +1658,7 @@ int buildNearfieldTables(const ssystem *sys) {
     return 0;
   }
   if (!buildNearfieldPanelGeometry(sys)) {
+    setNearfieldLastError("nearfield panel geometry build failed");
     return 0;
   }
 
@@ -1393,33 +1829,76 @@ int buildNearfieldTables(const ssystem *sys) {
     return 0;
   }
 
-  if (cudaMemcpy(gNear.d_panels, gNear.h_panels,
-                 (size_t)sys->nPnls * sizeof(NearPanelGeom), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_src, gNear.h_src, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_dst, gNear.h_dst, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_pairSrcCount, gNear.h_pairSrcCount, (size_t)sys->nNearPairsFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_pairInteractionOffset, gNear.h_pairInteractionOffset, (size_t)sys->nNearPairsFlat * sizeof(long long), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_leafPanelStart, gNear.h_leafPanelStart, (size_t)sys->nLeafCubesFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_leafPanelCount, gNear.h_leafPanelCount, (size_t)sys->nLeafCubesFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_leafPairOffset, gNear.h_leafPairOffset, ((size_t)sys->nLeafCubesFlat + 1) * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k0, gNear.h_k0, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k1, gNear.h_k1, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k2, gNear.h_k2, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k3, gNear.h_k3, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_panels, gNear.h_panels,
+                           (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                           cudaMemcpyHostToDevice, "h_panels -> d_panels")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src,
+                           (size_t)totalInteractions * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_src -> d_src")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst,
+                           (size_t)totalInteractions * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_dst -> d_dst")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_pairSrcCount, gNear.h_pairSrcCount,
+                           (size_t)sys->nNearPairsFlat * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_pairSrcCount -> d_pairSrcCount")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_pairInteractionOffset, gNear.h_pairInteractionOffset,
+                           (size_t)sys->nNearPairsFlat * sizeof(long long),
+                           cudaMemcpyHostToDevice, "h_pairInteractionOffset -> d_pairInteractionOffset")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_leafPanelStart, gNear.h_leafPanelStart,
+                           (size_t)sys->nLeafCubesFlat * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_leafPanelStart -> d_leafPanelStart")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_leafPanelCount, gNear.h_leafPanelCount,
+                           (size_t)sys->nLeafCubesFlat * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_leafPanelCount -> d_leafPanelCount")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_leafPairOffset, gNear.h_leafPairOffset,
+                           ((size_t)sys->nLeafCubesFlat + 1U) * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_leafPairOffset -> d_leafPairOffset")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k0, gNear.h_k0,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k0 -> d_k0")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k1, gNear.h_k1,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k1 -> d_k1")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k2, gNear.h_k2,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k2 -> d_k2")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k3, gNear.h_k3,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k3 -> d_k3")) return 0;
   t1 = wall_seconds_cuda_local();
   fmmNearGpuUploadTime += (t1 - t0);
 
   if (useGpuDisjointBuild && disjointBuildCount > 0) {
     int blockSize = 256;
     int gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
-    if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-    if (cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    cudaError_t err = cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      setNearfieldLastError("cudaMemcpyToSymbol c_nearKappa failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      setNearfieldLastError("cudaMemcpyToSymbol c_nearEpsilon failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
     t0 = wall_seconds_cuda_local();
     nearfieldDisjointQ1BuildKernel<<<gridSize, blockSize>>>(
         gNear.nInteractions, gNear.d_panels, gNear.d_src, gNear.d_dst,
         gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3);
-    if (cudaGetLastError() != cudaSuccess) return 0;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield disjoint build kernel launch failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield disjoint build kernel failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
     t1 = wall_seconds_cuda_local();
     fmmNearGpuCoeffTime += (t1 - t0);
   }
@@ -1846,6 +2325,59 @@ __global__ void nearfieldDisjointQ1BuildKernel(
   k3[tid] = pnlX->area * pnlY->area * out[3];
 }
 
+__global__ void nearfieldDisjointQ1ApplyKernel(
+    int nPnls,
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nInteractions) return;
+
+  int s = src[tid];
+  int d = dst[tid];
+  const NearPanelGeom *pnlX = &panels[d];
+  const NearPanelGeom *pnlY = &panels[s];
+  double r0[3], r1[3], r[3], out[4];
+  double scale;
+  int k;
+
+  if (!nearDisjointCase(pnlX, pnlY)) return;
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k] - pnlY->vtx[0][k];
+    r1[k] = r0[k] + 0.5 * (pnlX->a2[k] + 0.5 * pnlX->a0[k]);
+    r[k] = r1[k] - 0.5 * (pnlY->a2[k] + 0.5 * pnlY->a0[k]);
+  }
+  kernelKer4Device(r, pnlX->normal, pnlY->normal, out);
+  scale = pnlX->area * pnlY->area;
+#if __CUDA_ARCH__ >= 600
+  atomicAdd(&pot[d], alpha * scale * (out[0] * sgm[s + nPnls] + out[1] * sgm[s]));
+  atomicAdd(&pot[d + nPnls], alpha * scale * (out[2] * sgm[s + nPnls] + out[3] * sgm[s]));
+#else
+  {
+    double addPot = alpha * scale * (out[0] * sgm[s + nPnls] + out[1] * sgm[s]);
+    double addDpdn = alpha * scale * (out[2] * sgm[s + nPnls] + out[3] * sgm[s]);
+    unsigned long long int *addr1 = (unsigned long long int *)&pot[d];
+    unsigned long long int *addr2 = (unsigned long long int *)&pot[d + nPnls];
+    unsigned long long int old1 = *addr1, assumed1;
+    unsigned long long int old2 = *addr2, assumed2;
+    do {
+      assumed1 = old1;
+      old1 = atomicCAS(addr1, assumed1,
+                       __double_as_longlong(addPot + __longlong_as_double(assumed1)));
+    } while (assumed1 != old1);
+    do {
+      assumed2 = old2;
+      old2 = atomicCAS(addr2, assumed2,
+                       __double_as_longlong(addDpdn + __longlong_as_double(assumed2)));
+    } while (assumed2 != old2);
+  }
+#endif
+}
+
 __global__ void nearfieldLeafApplyKernel(
     int nPnls,
     const int *leafPanelStart,
@@ -2163,6 +2695,233 @@ __global__ void l2pLeafKernel(
     pot[panelIdx + nPnls] = beta * pot[panelIdx + nPnls] + alpha * sumDpdn;
   }
 }
+
+int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alpha,
+                                 long long *specialTotal) {
+  const int blockSize = 256;
+  int gridSize = (int)((count + blockSize - 1) / blockSize);
+  long long specialCount = 0;
+  size_t indexBytes = (size_t)count * sizeof(int);
+  cudaError_t err;
+  long long idx;
+
+  if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, indexBytes,
+                           cudaMemcpyHostToDevice, "stream src") ||
+      !cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst, indexBytes,
+                           cudaMemcpyHostToDevice, "stream dst")) return 0;
+
+  nearfieldDisjointQ1ApplyKernel<<<gridSize, blockSize>>>(
+      gNear.nPnls, count, gNear.d_panels, gNear.d_src, gNear.d_dst,
+      alpha, gNear.d_sgm, gNear.d_pot);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("streaming disjoint kernel launch failed: %s",
+                          cudaGetErrorString(err));
+    return 0;
+  }
+
+  for (idx = 0; idx < count; idx++) {
+    int srcIdx = gNear.h_src[idx];
+    int dstIdx = gNear.h_dst[idx];
+    panel *pnlX = sys->panelByIdx[dstIdx];
+    panel *pnlY = sys->panelByIdx[srcIdx];
+    int idxX[3], idxY[3];
+    int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+    if (nVtx != 0) {
+      double *KER = panelIA0(pnlX, pnlY);
+      gNear.h_src[specialCount] = srcIdx;
+      gNear.h_dst[specialCount] = dstIdx;
+      gNear.h_k0[specialCount] = KER[0];
+      gNear.h_k1[specialCount] = KER[1];
+      gNear.h_k2[specialCount] = KER[2];
+      gNear.h_k3[specialCount] = KER[3];
+      specialCount++;
+    }
+  }
+
+  if (specialCount > 0) {
+    size_t specialIndexBytes = (size_t)specialCount * sizeof(int);
+    size_t specialCoeffBytes = (size_t)specialCount * sizeof(double);
+    int specialGrid = (int)((specialCount + blockSize - 1) / blockSize);
+    if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, specialIndexBytes,
+                             cudaMemcpyHostToDevice, "stream special src") ||
+        !cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst, specialIndexBytes,
+                             cudaMemcpyHostToDevice, "stream special dst") ||
+        !cudaMemcpyNearfield(gNear.d_k0, gNear.h_k0, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k0") ||
+        !cudaMemcpyNearfield(gNear.d_k1, gNear.h_k1, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k1") ||
+        !cudaMemcpyNearfield(gNear.d_k2, gNear.h_k2, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k2") ||
+        !cudaMemcpyNearfield(gNear.d_k3, gNear.h_k3, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k3")) return 0;
+    nearfieldApplyKernel<<<specialGrid, blockSize>>>(
+        gNear.nPnls, specialCount, gNear.d_src, gNear.d_dst,
+        gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
+        alpha, gNear.d_sgm, gNear.d_pot);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("streaming special-panel kernel launch failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+  }
+  *specialTotal += specialCount;
+  return 1;
+}
+
+int applyNearfieldStreaming(const ssystem *sys, double alpha) {
+  long long count = 0;
+  long long chunks = 0;
+  long long specialTotal = 0;
+  int pairIdx;
+  cudaError_t err;
+
+  kernel = kernelKER4;
+  err = cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0,
+                           cudaMemcpyHostToDevice);
+  if (err == cudaSuccess) {
+    err = cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0,
+                             cudaMemcpyHostToDevice);
+  }
+  if (err != cudaSuccess) {
+    setNearfieldLastError("streaming kernel constant upload failed: %s",
+                          cudaGetErrorString(err));
+    return 0;
+  }
+
+  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+    int srcLeaf = sys->nearPairSrc[pairIdx];
+    int dstLeaf = sys->nearPairDst[pairIdx];
+    int srcStart = sys->leafPanelStart[srcLeaf];
+    int srcCount = sys->leafPanelCount[srcLeaf];
+    int dstStart = sys->leafPanelStart[dstLeaf];
+    int dstCount = sys->leafPanelCount[dstLeaf];
+    int i, j;
+    for (i = 0; i < dstCount; i++) {
+      for (j = 0; j < srcCount; j++) {
+        gNear.h_src[count] = srcStart + j;
+        gNear.h_dst[count] = dstStart + i;
+        count++;
+        if (count == gNear.chunkCapacity) {
+          if (!applyNearfieldStreamingChunk(sys, count, alpha, &specialTotal)) return 0;
+          count = 0;
+          chunks++;
+        }
+      }
+    }
+  }
+  if (count > 0) {
+    if (!applyNearfieldStreamingChunk(sys, count, alpha, &specialTotal)) return 0;
+    chunks++;
+  }
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("streaming nearfield execution failed: %s",
+                          cudaGetErrorString(err));
+    return 0;
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield streaming apply: chunks=%lld interactions=%lld special=%lld\n",
+           chunks, gNear.nInteractions, specialTotal);
+  }
+  return 1;
+}
+
+int flushM2LStreamingChunk(int pairCount, int groupCount, int coeffCount) {
+  cudaError_t err;
+  const int blockSize = 128;
+  if (pairCount <= 0 || groupCount <= 0 || coeffCount <= 0) return 1;
+
+#define M2L_CHUNK_UPLOAD(dst, src, count, type) \
+  do { \
+    err = cudaMemcpy((dst), (src), (size_t)(count) * sizeof(type), cudaMemcpyHostToDevice); \
+    if (err != cudaSuccess) return 0; \
+  } while (0)
+  M2L_CHUNK_UPLOAD(gM2L.d_pairSrc, gM2L.h_pairSrc, pairCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_pairCoeffOffset, gM2L.h_pairCoeffOffset, pairCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupStart, gM2L.h_groupStart, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupCount, gM2L.h_groupCount, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupDst, gM2L.h_groupDst, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupOrder, gM2L.h_groupOrder, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_g0, gM2L.h_g0, coeffCount, double);
+  M2L_CHUNK_UPLOAD(gM2L.d_gk, gM2L.h_gk, coeffCount, double);
+#undef M2L_CHUNK_UPLOAD
+
+  m2lGroupedKernel<<<groupCount, blockSize>>>(
+      groupCount, gM2L.maxIdxDim,
+      gM2L.d_groupStart, gM2L.d_groupCount, gM2L.d_groupDst, gM2L.d_groupOrder,
+      gM2L.d_pairSrc, gM2L.d_pairCoeffOffset,
+      gM2L.d_cubeCoeffOffset,
+      gM2L.d_idxI1, gM2L.d_idxI2, gM2L.d_idxI3, gM2L.d_idx3Flat, gM2L.d_sgn3,
+      gM2L.d_g0, gM2L.d_gk, epsilon,
+      gM2L.d_momPot, gM2L.d_momDpdn,
+      gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+int applyM2LStreamingChunks(const ssystem *sys) {
+  int groupIdx;
+  int pairCount = 0;
+  int groupCount = 0;
+  int coeffCount = 0;
+  int chunks = 0;
+
+  for (groupIdx = 0; groupIdx < sys->nM2LDstGroups; groupIdx++) {
+    int globalStart = sys->m2lDstGroupStart[groupIdx];
+    int count = sys->m2lDstGroupCount[groupIdx];
+    int order = sys->m2lPairOrder[globalStart];
+    int nMom = sys->nMom[order];
+    long long neededCoeff = (long long)count * (long long)nMom;
+    int j;
+
+    if (count > gM2L.streamPairCapacity || neededCoeff > gM2L.streamCoeffCapacity) {
+      printf("GPU M2L streaming group exceeds chunk capacity: group=%d pairs=%d coeff=%lld\n",
+             groupIdx, count, neededCoeff);
+      return 0;
+    }
+    if (groupCount == gM2L.streamGroupCapacity ||
+        pairCount + count > gM2L.streamPairCapacity ||
+        (long long)coeffCount + neededCoeff > gM2L.streamCoeffCapacity) {
+      if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
+      pairCount = 0;
+      groupCount = 0;
+      coeffCount = 0;
+      chunks++;
+    }
+
+    gM2L.h_groupStart[groupCount] = pairCount;
+    gM2L.h_groupCount[groupCount] = count;
+    gM2L.h_groupDst[groupCount] = sys->m2lPairDst[globalStart];
+    gM2L.h_groupOrder[groupCount] = order;
+    for (j = 0; j < count; j++) {
+      int globalPair = globalStart + j;
+      cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[globalPair]];
+      cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[globalPair]];
+      double r[3];
+      int k;
+      for (k = 0; k < 3; k++) r[k] = dst->x[k] - src->x[k];
+      setupDerivs(order, r);
+      gM2L.h_pairSrc[pairCount] = sys->m2lPairSrc[globalPair];
+      gM2L.h_pairCoeffOffset[pairCount] = coeffCount;
+      memcpy(&gM2L.h_g0[coeffCount], dG0[0], (size_t)nMom * sizeof(double));
+      memcpy(&gM2L.h_gk[coeffCount], dGk[0], (size_t)nMom * sizeof(double));
+      pairCount++;
+      coeffCount += nMom;
+    }
+    groupCount++;
+  }
+  if (groupCount > 0) {
+    if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
+    chunks++;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+  if (sys->benchmarkMode > 0) {
+    printf("GPU M2L streaming apply: chunks=%d pairs=%d coeff=%lld\n",
+           chunks, gM2L.nPairs, gM2L.totalPairCoeff);
+  }
+  return 1;
+}
 }  // namespace
 
 int gpuBackendAvailable(void) {
@@ -2179,6 +2938,10 @@ int gpuBackendAvailable(void) {
   return (deviceCount > 0) ? 1 : 0;
 }
 
+const char *gpuNearfieldLastError(void) {
+  return gNearfieldLastError[0] ? gNearfieldLastError : "unknown nearfield GPU failure";
+}
+
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
   cudaError_t err;
   size_t vecBytes;
@@ -2188,8 +2951,10 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   static int printedMode = -1;
 
   if (sys == NULL || sgm == NULL || pot == NULL) {
+    setNearfieldLastError("invalid input pointer");
     return 0;
   }
+  setNearfieldLastError("not attempted");
 
   if (gNear.sys != sys) {
     t0 = wall_seconds_cuda_local();
@@ -2205,9 +2970,17 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   vecBytes = (size_t)(2 * gNear.nPnls) * sizeof(double);
   t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(gNear.d_sgm, sgm, vecBytes, cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy sgm host-to-device failed for %.3f GiB: %s",
+                          bytesToGiB(vecBytes), cudaGetErrorString(err));
+    return 0;
+  }
   err = cudaMemcpy(gNear.d_pot, pot, vecBytes, cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy pot host-to-device failed for %.3f GiB: %s",
+                          bytesToGiB(vecBytes), cudaGetErrorString(err));
+    return 0;
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuH2DTime += (t1 - t0);
 
@@ -2219,7 +2992,9 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
     printedMode = sys->gpuNearfieldMode;
   }
   t0 = wall_seconds_cuda_local();
-  if (sys->gpuNearfieldMode == 1) {
+  if (gNear.streaming) {
+    if (!applyNearfieldStreaming(sys, alpha)) return 0;
+  } else if (sys->gpuNearfieldMode == 1) {
     gridSize = sys->nLeafCubesFlat;
     nearfieldLeafApplyKernel<<<gridSize, blockSize>>>(
         gNear.nPnls,
@@ -2234,16 +3009,30 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
         gNear.d_src, gNear.d_dst, gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
         alpha, gNear.d_sgm, gNear.d_pot);
   }
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return 0;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 0;
+  if (!gNear.streaming) {
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield apply kernel launch failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield apply kernel failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuKernelTime += (t1 - t0);
 
   t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(pot, gNear.d_pot, vecBytes, cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy pot device-to-host failed for %.3f GiB: %s",
+                          bytesToGiB(vecBytes), cudaGetErrorString(err));
+    return 0;
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuD2HTime += (t1 - t0);
   return 1;
@@ -2430,20 +3219,24 @@ int gpuM2LApply(ssystem *sys) {
   err = cudaMemset(gM2L.d_lec4, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
   if (err != cudaSuccess) return 0;
 
-  blockSize = 128;
-  m2lGroupedKernel<<<gM2L.nGroups, blockSize>>>(
-      gM2L.nGroups, gM2L.maxIdxDim,
-      gM2L.d_groupStart, gM2L.d_groupCount, gM2L.d_groupDst, gM2L.d_groupOrder,
-      gM2L.d_pairSrc, gM2L.d_pairCoeffOffset,
-      gM2L.d_cubeCoeffOffset,
-      gM2L.d_idxI1, gM2L.d_idxI2, gM2L.d_idxI3, gM2L.d_idx3Flat, gM2L.d_sgn3,
-      gM2L.d_g0, gM2L.d_gk, epsilon,
-      gM2L.d_momPot, gM2L.d_momDpdn,
-      gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return 0;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 0;
+  if (gM2L.streaming) {
+    if (!applyM2LStreamingChunks(sys)) return 0;
+  } else {
+    blockSize = 128;
+    m2lGroupedKernel<<<gM2L.nGroups, blockSize>>>(
+        gM2L.nGroups, gM2L.maxIdxDim,
+        gM2L.d_groupStart, gM2L.d_groupCount, gM2L.d_groupDst, gM2L.d_groupOrder,
+        gM2L.d_pairSrc, gM2L.d_pairCoeffOffset,
+        gM2L.d_cubeCoeffOffset,
+        gM2L.d_idxI1, gM2L.d_idxI2, gM2L.d_idxI3, gM2L.d_idx3Flat, gM2L.d_sgn3,
+        gM2L.d_g0, gM2L.d_gk, epsilon,
+        gM2L.d_momPot, gM2L.d_momDpdn,
+        gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return 0;
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return 0;
+  }
 
   err = cudaMemcpy(gM2L.h_lec1, gM2L.d_lec1,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),

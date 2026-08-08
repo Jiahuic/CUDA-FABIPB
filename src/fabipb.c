@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gmres.h"
@@ -22,6 +23,7 @@
 #include "gpu_backend.h"
 
 #define DEFAULT_MAX_DIRECT_RHS_PAIRS 5000000000ULL
+#define DEFAULT_MAX_GPU_DIRECT_RHS_PAIRS 200000000000ULL
 
 #if defined(__GNUC__) || defined(__clang__)
 #define FABIPB_THREAD_LOCAL __thread
@@ -55,6 +57,10 @@ int cpuDirectApply(ssystem *sys, double alpha, double beta,
 
 double *panelRHS(int qOrder, panel *pnlX, double *chrY );
 double *panelRHSTree(ssystem *sys, int qOrder, panel *pnlX, cube *chgRoot);
+void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws);
+void freeRhsTreeWorkspace(RhsTreeWorkspace *ws);
+void panelRHSTreeWorkspace(ssystem *sys, int qOrder, panel *pnlX, cube *chgRoot,
+                           RhsTreeWorkspace *ws, double out[2]);
 double *panelIA0(panel *pnlX, panel *pnlY);
 int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
 void kernelKER4(double *x, double *y);
@@ -115,23 +121,34 @@ static int missing_external_thread_env(void) {
   return 0;
 }
 
-static unsigned long long getMaxDirectRhsPairs(void) {
-  const char *env = getenv("FABIPB_MAX_DIRECT_RHS_PAIRS");
+static unsigned long long parseUnsignedLongLongEnv(const char *name,
+                                                   unsigned long long defaultValue) {
+  const char *env = getenv(name);
   char *endptr = NULL;
   unsigned long long value;
 
   if (env == NULL || env[0] == '\0') {
-    return DEFAULT_MAX_DIRECT_RHS_PAIRS;
+    return defaultValue;
   }
 
   errno = 0;
   value = strtoull(env, &endptr, 10);
   if (errno != 0 || endptr == env || *endptr != '\0') {
-    fprintf(stderr, "Warning: ignoring invalid FABIPB_MAX_DIRECT_RHS_PAIRS='%s'\n", env);
-    return DEFAULT_MAX_DIRECT_RHS_PAIRS;
+    fprintf(stderr, "Warning: ignoring invalid %s='%s'\n", name, env);
+    return defaultValue;
   }
 
   return value;
+}
+
+static unsigned long long getMaxDirectRhsPairs(void) {
+  return parseUnsignedLongLongEnv("FABIPB_MAX_DIRECT_RHS_PAIRS",
+                                  DEFAULT_MAX_DIRECT_RHS_PAIRS);
+}
+
+static unsigned long long getMaxGpuDirectRhsPairs(void) {
+  return parseUnsignedLongLongEnv("FABIPB_MAX_GPU_DIRECT_RHS_PAIRS",
+                                  DEFAULT_MAX_GPU_DIRECT_RHS_PAIRS);
 }
 
 static int allowLargeDirectRhs(void) {
@@ -148,17 +165,28 @@ static unsigned long long countDirectRhsPairs(int nPnls, int nChar) {
   return (unsigned long long)nPnls * (unsigned long long)nChar;
 }
 
+static int canUseGpuDirectRhs(int gpuMode) {
+  return gpuMode > 0 && gpuBackendAvailable();
+}
+
+static unsigned long long getActiveDirectRhsPairLimit(int gpuMode) {
+  return canUseGpuDirectRhs(gpuMode) ? getMaxGpuDirectRhsPairs()
+                                     : getMaxDirectRhsPairs();
+}
+
 /*
  * Decides whether setupRHS should use the tree-accelerated charge-to-panel
  * path instead of the direct panel-charge double loop. FABIPB_FORCE_TREE_RHS
  * forces the tree path regardless of size (used to validate the tree path
  * against the direct path on small meshes). FABIPB_ALLOW_LARGE_DIRECT_RHS
- * preserves its original meaning: force the direct loop even above the pair
- * limit, for an intentional long benchmark.
+ * preserves its original meaning: force the direct path even above the active
+ * pair limit, for an intentional long benchmark. GPU runs use a separate,
+ * larger cap because the CUDA direct RHS is practical for medium-large cases
+ * where the CPU direct loop is not.
  */
-static int shouldUseTreeRhs(int nPnls, int nChar) {
+static int shouldUseTreeRhs(int nPnls, int nChar, int gpuMode) {
   unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
-  unsigned long long maxDirectRhsPairs = getMaxDirectRhsPairs();
+  unsigned long long maxDirectRhsPairs = getActiveDirectRhsPairLimit(gpuMode);
 
   if (forceTreeRhs()) {
     return 1;
@@ -166,9 +194,9 @@ static int shouldUseTreeRhs(int nPnls, int nChar) {
   return rhsPairs > maxDirectRhsPairs && !allowLargeDirectRhs();
 }
 
-static void reportDirectRhsLimit(int nPnls, int nChar) {
+static void reportDirectRhsLimit(int nPnls, int nChar, int gpuMode) {
   unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
-  unsigned long long maxDirectRhsPairs = getMaxDirectRhsPairs();
+  unsigned long long maxDirectRhsPairs = getActiveDirectRhsPairLimit(gpuMode);
 
   if (rhsPairs > maxDirectRhsPairs && !allowLargeDirectRhs() && !forceTreeRhs()) {
     printf("setupRHS: %llu panel-charge interactions (panels=%d charges=%d) exceeds "
@@ -416,10 +444,15 @@ static void print_usage(const char *prog) {
   printf("  -c=1      compare one CPU/GPU applyFMM call before GMRES\n");
   printf("  -C=1      compare one original/cached preconditioner apply before GMRES\n");
   printf("Environment guards:\n");
-  printf("  FABIPB_MAX_DIRECT_RHS_PAIRS=<n>  cap direct setupRHS work\n");
-  printf("  FABIPB_ALLOW_LARGE_DIRECT_RHS=1  bypass the direct setupRHS cap\n");
+  printf("  FABIPB_MAX_DIRECT_RHS_PAIRS=<n>      cap CPU direct setupRHS work\n");
+  printf("  FABIPB_MAX_GPU_DIRECT_RHS_PAIRS=<n>  cap GPU direct setupRHS work\n");
+  printf("  FABIPB_ALLOW_LARGE_DIRECT_RHS=1  bypass the active direct setupRHS cap\n");
   printf("  FABIPB_FORCE_TREE_RHS=1   force the tree-accelerated setupRHS path\n");
   printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio (default 0.2)\n");
+  printf("  FABIPB_RHS_THREADS=<n> setupRHS tree worker threads (default: online CPUs, max 128)\n");
+  printf("  FABIPB_RHS_SUMMARY_PATH=<path> write raw and TABI-style RHS summary CSV\n");
+  printf("  FABIPB_RHS_SAMPLE_PATH=<path> write sampled RHS rows after setupRHS\n");
+  printf("  FABIPB_RHS_SAMPLE_STRIDE=<n> sample every nth RHS row (default: 1000)\n");
   printf("  FABIPB_DEBUG_COMPARE_RHS=1  also run the other RHS path and report the diff\n");
   printf("  FABIPB_DEBUG_RHS_NORMS=1  report RHS/source-term norms and equation checks\n");
   printf("  FABIPB_DEBUG_OPERATOR_NORMS=1  compare direct operator with TABI-style collocation\n");
@@ -438,6 +471,10 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_TABI_NODEPATCH_SAMPLE_VERTS=<n>  sample vertices before dense nodepatch checks\n");
   printf("  FABIPB_TABI_NODEPATCH_TREE=1  use approximate tree matvec for full nodepatch diagnostic\n");
   printf("  FABIPB_TABI_NODEPATCH_TREE_THETA=<x>  nodepatch tree acceptance ratio (default 0.35)\n");
+  printf("  FABIPB_GMRES_INITIAL=rhs|zero  choose GMRES initial guess (default: rhs)\n");
+  printf("  FABIPB_GMRES_DUMP_PREFIX=<path>  dump GMRES setup/first-iteration vectors\n");
+  printf("  FABIPB_GMRES_DUMP_STRIDE=<n>  dump every nth GMRES vector row (default: 1)\n");
+  printf("  FABIPB_GMRES_STOP_AFTER_ITER=<n>  debug stop after n GMRES iterations\n");
   printf("  FABIPB_DEBUG_SOLUTION_NORMS=1  report post-GMRES solution norms\n");
   printf("  FABIPB_DEBUG_ENERGY_COMPONENTS=1  report both energy-functional terms\n");
   printf("  FABIPB_WRITE_SOLUTION=<path>  write post-GMRES panel solution CSV\n");
@@ -448,6 +485,7 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_STOP_AFTER_OPERATOR=1  stop after operator diagnostic\n");
   printf("  FABIPB_STOP_AFTER_TABI_NODEPATCH=1  stop after nodepatch diagnostic\n");
   printf("  FABIPB_STOP_AFTER_RHS=1   stop after setupRHS, skipping preconditioner/GMRES\n");
+  printf("  FABIPB_STOP_AFTER_GMRES=1 stop after GMRES, skipping post-solve treecode energy\n");
   printf("  -h        show this help\n");
 }
 /*
@@ -506,6 +544,18 @@ static int debugSolutionNorms(void) {
   return env != NULL && strcmp(env, "1") == 0;
 }
 
+static const char *gmresInitialMode(void) {
+  const char *env = getenv("FABIPB_GMRES_INITIAL");
+  if (env == NULL || env[0] == '\0') {
+    return "rhs";
+  }
+  if (strcmp(env, "zero") == 0 || strcmp(env, "rhs") == 0) {
+    return env;
+  }
+  fprintf(stderr, "Warning: ignoring invalid FABIPB_GMRES_INITIAL='%s'; using rhs\n", env);
+  return "rhs";
+}
+
 static void writeSolutionIfRequested(ssystem *sys, double *sgm) {
   const char *path = getenv("FABIPB_WRITE_SOLUTION");
   FILE *fp;
@@ -520,15 +570,142 @@ static void writeSolutionIfRequested(ssystem *sys, double *sgm) {
     fprintf(stderr, "Warning: cannot write solution dump '%s'\n", path);
     return;
   }
-  fprintf(fp, "idx,x,y,z,area,component0,component1\n");
+  fprintf(fp, "idx,mesh_face_idx,x,y,z,area,component0,component1\n");
   for (i = 0, pnl = sys->pnlLst; pnl != NULL; pnl = pnl->nextC, i++) {
-    fprintf(fp, "%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
-            i, pnl->x[0], pnl->x[1], pnl->x[2], pnl->area,
-            sgm[i], sgm[sys->nPnls + i]);
+    int idx = pnl->idx;
+    fprintf(fp, "%d,%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
+            idx, pnl->nSurf - 1, pnl->x[0], pnl->x[1], pnl->x[2], pnl->area,
+            sgm[idx], sgm[sys->nPnls + idx]);
   }
   fclose(fp);
   if (sys->benchmarkMode > 0) {
     printf("Wrote solution dump: %s\n", path);
+  }
+}
+
+typedef struct {
+  int count;
+  double sum;
+  double l1;
+  double l2;
+  double inf;
+  double areaWeightedSum;
+  double areaWeightedL1;
+  double areaWeightedL2;
+} RhsSummaryStats;
+
+static unsigned long long rhsSampleStride(void) {
+  unsigned long long stride =
+      parseUnsignedLongLongEnv("FABIPB_RHS_SAMPLE_STRIDE", 1000ULL);
+  return (stride > 0ULL) ? stride : 1000ULL;
+}
+
+static void rhsSummaryAdd(RhsSummaryStats *stats, double value, double area) {
+  double av = fabs(value);
+  double weighted = value * area;
+  double wav = fabs(weighted);
+
+  stats->count++;
+  stats->sum += value;
+  stats->l1 += av;
+  stats->l2 += value * value;
+  if (av > stats->inf) {
+    stats->inf = av;
+  }
+  stats->areaWeightedSum += weighted;
+  stats->areaWeightedL1 += wav;
+  stats->areaWeightedL2 += weighted * weighted;
+}
+
+static void writeRhsSummaryRow(FILE *fp, const char *quantity, int component,
+                               const RhsSummaryStats *stats,
+                               double totalArea) {
+  fprintf(fp,
+          "%s,%d,%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
+          quantity, component, stats->count, totalArea, stats->sum, stats->l1,
+          sqrt(stats->l2), stats->inf,
+          (stats->count > 0) ? stats->sum / (double)stats->count : 0.0,
+          stats->areaWeightedSum, stats->areaWeightedL1,
+          sqrt(stats->areaWeightedL2),
+          (totalArea > 0.0) ? stats->areaWeightedSum / totalArea : 0.0);
+}
+
+static void writeRhsSummaryIfRequested(ssystem *sys, double *sgm) {
+  const char *summaryPath = getenv("FABIPB_RHS_SUMMARY_PATH");
+  const char *samplePath = getenv("FABIPB_RHS_SAMPLE_PATH");
+  FILE *summary = NULL;
+  FILE *sample = NULL;
+  RhsSummaryStats integrated[2];
+  RhsSummaryStats tabiAvg[2];
+  double totalArea = 0.0;
+  unsigned long long sampleStride = rhsSampleStride();
+  int i;
+  panel *pnl;
+
+  if ((summaryPath == NULL || summaryPath[0] == '\0') &&
+      (samplePath == NULL || samplePath[0] == '\0')) {
+    return;
+  }
+
+  memset(integrated, 0, sizeof(integrated));
+  memset(tabiAvg, 0, sizeof(tabiAvg));
+
+  if (summaryPath != NULL && summaryPath[0] != '\0') {
+    summary = fopen(summaryPath, "w");
+    if (summary == NULL) {
+      fprintf(stderr, "Warning: cannot write RHS summary '%s'\n", summaryPath);
+    }
+  }
+  if (samplePath != NULL && samplePath[0] != '\0') {
+    sample = fopen(samplePath, "w");
+    if (sample == NULL) {
+      fprintf(stderr, "Warning: cannot write RHS sample '%s'\n", samplePath);
+    } else {
+      fprintf(sample,
+              "idx,mesh_face_idx,x,y,z,nx,ny,nz,area,integrated0,integrated1,tabi_area_avg0,tabi_area_avg1\n");
+    }
+  }
+
+  for (i = 0, pnl = sys->pnlLst; pnl != NULL; pnl = pnl->nextC, i++) {
+    int idx = pnl->idx;
+    double area = (pnl->area > 0.0) ? pnl->area : 1.0;
+    double integrated0 = sgm[idx];
+    double integrated1 = sgm[sys->nPnls + idx];
+    double avg0 = integrated0 / area;
+    double avg1 = integrated1 / area;
+
+    totalArea += (pnl->area > 0.0) ? pnl->area : 0.0;
+    rhsSummaryAdd(&integrated[0], integrated0, 1.0);
+    rhsSummaryAdd(&integrated[1], integrated1, 1.0);
+    rhsSummaryAdd(&tabiAvg[0], avg0, area);
+    rhsSummaryAdd(&tabiAvg[1], avg1, area);
+
+    if (sample != NULL && (((unsigned long long)idx % sampleStride) == 0ULL)) {
+      fprintf(sample,
+              "%d,%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
+              idx, pnl->nSurf - 1, pnl->x[0], pnl->x[1], pnl->x[2],
+              pnl->normal[0], pnl->normal[1], pnl->normal[2], pnl->area,
+              integrated0, integrated1, avg0, avg1);
+    }
+  }
+
+  if (summary != NULL) {
+    fprintf(summary,
+            "quantity,component,count,total_area,sum,l1,l2,inf,mean,area_weighted_sum,area_weighted_l1,area_weighted_l2,area_weighted_mean\n");
+    writeRhsSummaryRow(summary, "integrated", 0, &integrated[0], totalArea);
+    writeRhsSummaryRow(summary, "integrated", 1, &integrated[1], totalArea);
+    writeRhsSummaryRow(summary, "tabi_area_avg", 0, &tabiAvg[0], totalArea);
+    writeRhsSummaryRow(summary, "tabi_area_avg", 1, &tabiAvg[1], totalArea);
+    fclose(summary);
+    if (sys->benchmarkMode > 0) {
+      printf("Wrote RHS summary: %s\n", summaryPath);
+    }
+  }
+  if (sample != NULL) {
+    fclose(sample);
+    if (sys->benchmarkMode > 0) {
+      printf("Wrote RHS sample: %s stride=%llu\n", samplePath, sampleStride);
+    }
   }
 }
 
@@ -2301,7 +2478,7 @@ static void runTabiNodepatchDiagnostic(ssystem *sys) {
   restart = (ldw < 50) ? ldw : 50;
   ldh = restart + 1;
   maxIter = tabiNodepatchMaxIter();
-  CALLOC(work, ldw * (restart + 4), double);
+  CALLOC(work, (size_t)ldw * (size_t)(restart + 4), double);
   CALLOC(h, ldh * (restart + 2), double);
   t0 = wall_seconds();
   gmres(ldw, rhs, solution, restart, work, ldw, h, ldh,
@@ -2334,12 +2511,174 @@ static void runTabiNodepatchDiagnostic(ssystem *sys) {
   freeTabiNodepatchMesh(mesh);
 }
 
+typedef struct {
+  ssystem *sys;
+  panel **panels;
+  int begin;
+  int end;
+  int qOrder;
+  double fac;
+  double *sgm;
+} RhsTreeSetupTask;
+
+static int rhsTreeThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_RHS_THREADS");
+  long hc;
+  int threads;
+
+  if (env != NULL && env[0] != '\0') {
+    threads = atoi(env);
+  } else {
+    hc = sysconf(_SC_NPROCESSORS_ONLN);
+    threads = (hc > 0) ? (int)hc : 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 128) {
+    threads = 128;
+  }
+  return threads;
+}
+
+static void *rhsTreeSetupWorker(void *arg) {
+  RhsTreeSetupTask *task = (RhsTreeSetupTask *)arg;
+  RhsTreeWorkspace ws;
+  double intgr[2];
+  int i;
+
+  initRhsTreeWorkspace(task->sys, &ws);
+  for (i = task->begin; i < task->end; i++) {
+    panel *pnl = task->panels[i];
+    panelRHSTreeWorkspace(task->sys, task->qOrder, pnl,
+                          task->sys->chgCubeList[0], &ws, intgr);
+    task->sgm[pnl->idx] = task->fac * intgr[0];
+    task->sgm[task->sys->nPnls + pnl->idx] = task->fac * intgr[1];
+  }
+  freeRhsTreeWorkspace(&ws);
+  return NULL;
+}
+
+static panel **getPanelArrayForRhs(ssystem *sys, int *owned) {
+  panel **panels;
+  panel *pnl;
+  int i;
+
+  *owned = 0;
+  if (sys->panelByIdx != NULL) {
+    return sys->panelByIdx;
+  }
+
+  CALLOC(panels, sys->nPnls, panel*);
+  for (i = 0, pnl = sys->pnlLst; pnl != NULL && i < sys->nPnls; pnl = pnl->nextC, i++) {
+    panels[i] = pnl;
+  }
+  if (i != sys->nPnls) {
+    fprintf(stderr, "Error: panel list length mismatch while preparing RHS tree array\n");
+    exit(1);
+  }
+  *owned = 1;
+  return panels;
+}
+
+static void setupRHSTreeParallel(ssystem *sys, int qOrder, double fac, double *sgm) {
+  int nPnls = sys->nPnls;
+  int nThreads = rhsTreeThreadCount(nPnls);
+  int ownPanels = 0;
+  int t, created = 0, failed = 0;
+  panel **panels = getPanelArrayForRhs(sys, &ownPanels);
+  RhsTreeSetupTask *tasks;
+  pthread_t *threads;
+  double theta = rhsTreeTheta();
+
+  if (sys->benchmarkMode > 0) {
+    printf("setupRHS tree evaluator: threads=%d panels=%d theta=%g\n",
+           nThreads, nPnls, theta);
+  }
+
+  CALLOC(tasks, nThreads, RhsTreeSetupTask);
+  CALLOC(threads, nThreads, pthread_t);
+
+  for (t = 0; t < nThreads; t++) {
+    int begin = (int)(((long long)nPnls * t) / nThreads);
+    int end = (int)(((long long)nPnls * (t + 1)) / nThreads);
+    tasks[t].sys = sys;
+    tasks[t].panels = panels;
+    tasks[t].begin = begin;
+    tasks[t].end = end;
+    tasks[t].qOrder = qOrder;
+    tasks[t].fac = fac;
+    tasks[t].sgm = sgm;
+  }
+
+  if (nThreads == 1) {
+    rhsTreeSetupWorker(&tasks[0]);
+  } else {
+    for (t = 0; t < nThreads; t++) {
+      if (pthread_create(&threads[t], NULL, rhsTreeSetupWorker, &tasks[t]) != 0) {
+        failed = 1;
+        break;
+      }
+      created++;
+    }
+    for (t = 0; t < created; t++) {
+      pthread_join(threads[t], NULL);
+    }
+    if (failed) {
+      fprintf(stderr,
+              "Warning: pthread_create failed for setupRHS tree; recomputing serially\n");
+      memset(sgm, 0, (size_t)(2 * nPnls) * sizeof(double));
+      tasks[0].begin = 0;
+      tasks[0].end = nPnls;
+      rhsTreeSetupWorker(&tasks[0]);
+    }
+  }
+
+  free(threads);
+  free(tasks);
+  if (ownPanels) {
+    free(panels);
+  }
+}
+
+static void setupRHSTree(ssystem *sys, int qOrder, double fac, double *sgm) {
+  int i, j;
+  int nPnls = sys->nPnls, nChar = sys->nChar;
+  double *intgr;
+  panel *pnl;
+
+  ensureChargeTreeBuilt(sys);
+  setupRHSTreeParallel(sys, qOrder, fac, sgm);
+  if (debugCompareRhs()) {
+    double *sgmDirect;
+    CALLOC(sgmDirect, 2*nPnls, double);
+    for ( i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {
+      sgmDirect[i] = 0.0; sgmDirect[nPnls+i] = 0.0;
+      for ( j=0; j<nChar; j++ ) {
+        intgr=panelRHS(qOrder, pnl, &sys->pos[3*j]);
+        sgmDirect[i] += sys->chr[j]*intgr[0];
+        sgmDirect[i+nPnls] += sys->chr[j]*intgr[1];
+      }
+      sgmDirect[i] *= fac;
+      sgmDirect[nPnls+i] *= fac;
+    }
+    compareSetupRhsOnce(sys, sgmDirect, sgm);
+    free(sgmDirect);
+  }
+  if (debugRhsNorms()) {
+    compareRhsToCentroidSource(sys, sgm);
+  }
+}
+
 void setupRHS(ssystem *sys, double *sgm) {
   int i, j;
   int nPnls = sys->nPnls, nChar = sys->nChar, qOrder=sys->maxQuadOrder;
   unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
-  unsigned long long maxDirectRhsPairs = getMaxDirectRhsPairs();
-  int useTree = shouldUseTreeRhs(nPnls, nChar);
+  unsigned long long maxDirectRhsPairs = getActiveDirectRhsPairLimit(sys->gpuMode);
+  int useTree = shouldUseTreeRhs(nPnls, nChar, sys->gpuMode);
   double *intgr, fac;
   panel *pnl;
   static int warnedGpuRHS = 0;
@@ -2356,40 +2695,24 @@ void setupRHS(ssystem *sys, double *sgm) {
   }
 
   if (useTree) {
-    ensureChargeTreeBuilt(sys);
-    for ( i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {
-      intgr = panelRHSTree(sys, qOrder, pnl, sys->chgCubeList[0]);
-      sgm[i] = fac*intgr[0];
-      sgm[nPnls+i] = fac*intgr[1];
-    }
-    if (debugCompareRhs()) {
-      double *sgmDirect;
-      CALLOC(sgmDirect, 2*nPnls, double);
-      for ( i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {
-        sgmDirect[i] = 0.0; sgmDirect[nPnls+i] = 0.0;
-        for ( j=0; j<nChar; j++ ) {
-          intgr=panelRHS(qOrder, pnl, &sys->pos[3*j]);
-          sgmDirect[i] += sys->chr[j]*intgr[0];
-          sgmDirect[i+nPnls] += sys->chr[j]*intgr[1];
-        }
-        sgmDirect[i] *= fac;
-        sgmDirect[nPnls+i] *= fac;
-      }
-      compareSetupRhsOnce(sys, sgmDirect, sgm);
-      free(sgmDirect);
-    }
-    if (debugRhsNorms()) {
-      compareRhsToCentroidSource(sys, sgm);
-    }
+    setupRHSTree(sys, qOrder, fac, sgm);
+    writeRhsSummaryIfRequested(sys, sgm);
     return;
   }
 
   if (sys->gpuMode > 0 && gpuSetupRHS(sys, qOrder, fac, sgm)) {
+    writeRhsSummaryIfRequested(sys, sgm);
     return;
   }
   if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedGpuRHS) {
     printf("GPU RHS path unavailable; using CPU setupRHS.\n");
     warnedGpuRHS = 1;
+  }
+  if (rhsPairs > getMaxDirectRhsPairs() && !allowLargeDirectRhs()) {
+    printf("GPU RHS path unavailable above CPU direct cap; using tree-accelerated RHS.\n");
+    setupRHSTree(sys, qOrder, fac, sgm);
+    writeRhsSummaryIfRequested(sys, sgm);
+    return;
   }
 
   /* triangles order for Direct */
@@ -2406,6 +2729,7 @@ void setupRHS(ssystem *sys, double *sgm) {
   if (debugRhsNorms()) {
     compareRhsToCentroidSource(sys, sgm);
   }
+  writeRhsSummaryIfRequested(sys, sgm);
 } /* setupRHS */
 
 
@@ -2635,7 +2959,7 @@ int main(int nargs, char *argv[]){
     printf("Mesh-only mode: stopping after mesh generation.\n");
     return 0;
   }
-  reportDirectRhsLimit(nPnls, sys->nChar);
+  reportDirectRhsLimit(nPnls, sys->nChar, sys->gpuMode);
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
 
@@ -2732,13 +3056,31 @@ int main(int nargs, char *argv[]){
     comparePrecondOnce(sys, sgm);
   }
   for ( i=0; i<2*sys->nPnls; i++ ) pot[i] = sgm[i];
+  {
+    const char *initialMode = gmresInitialMode();
+    if (strcmp(initialMode, "zero") == 0) {
+      for ( i=0; i<2*sys->nPnls; i++ ) sgm[i] = 0.0;
+    }
+    if (sys->benchmarkMode > 0) {
+      printf("GMRES initial guess mode: %s\n", initialMode);
+    }
+  }
 
   MtV = MtVmain;
   PtV = PtVmain;
   ldw = 2*nPnls;
   ldh = arnoldiSz+1;
 
-  CALLOC(GMRES_work, ldw*(arnoldiSz+4), double);
+  {
+    size_t gmresWorkCount = (size_t)ldw * (size_t)(arnoldiSz + 4);
+    if (sys->benchmarkMode > 0) {
+      printf("GMRES workspace: dimension=%d restart=%d storage=%.3f GiB\n",
+             ldw, arnoldiSz,
+             (double)(gmresWorkCount * sizeof(double)) /
+                 (1024.0 * 1024.0 * 1024.0));
+    }
+    CALLOC(GMRES_work, gmresWorkCount, double);
+  }
   CALLOC(GMRES_h, ldh*(arnoldiSz+2), double);
 
   resetFmmMatvecStats();
@@ -2755,22 +3097,30 @@ int main(int nargs, char *argv[]){
   }
   writeSolutionIfRequested(sys, sgm);
 
-  stage_t0 = wall_seconds();
-  if (debugEnergyComponents()) {
-    double p0, p1;
-    applyTreecodeComponents(sys, sgm, &p0, &p1);
-    ptl = p0 + p1;
-    printf("Energy component debug: raw_component0=%e scaled_component0=%e "
-           "raw_component1=%e scaled_component1=%e raw_total=%e scale=%e\n",
-           p0, p0*twoPi*para, p1, p1*twoPi*para, ptl, twoPi*para);
+  if (getenv("FABIPB_STOP_AFTER_GMRES") != NULL) {
+    treecode_t = 0.0;
+    end_t = wall_seconds() - start_t;
+    printf("FABIPB_STOP_AFTER_GMRES set: skipping post-GMRES treecode energy.\n");
+    printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
+    printf("solvation energy: skipped\n");
   } else {
-    applyTreecode( sys, sgm, &ptl );
+    stage_t0 = wall_seconds();
+    if (debugEnergyComponents()) {
+      double p0, p1;
+      applyTreecodeComponents(sys, sgm, &p0, &p1);
+      ptl = p0 + p1;
+      printf("Energy component debug: raw_component0=%e scaled_component0=%e "
+             "raw_component1=%e scaled_component1=%e raw_total=%e scale=%e\n",
+             p0, p0*twoPi*para, p1, p1*twoPi*para, ptl, twoPi*para);
+    } else {
+      applyTreecode( sys, sgm, &ptl );
+    }
+    treecode_t = wall_seconds() - stage_t0;
+    ptl *= twoPi*para;
+    end_t = wall_seconds() - start_t;
+    printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
+    printf("solvation energy: %f\n", ptl);
   }
-  treecode_t = wall_seconds() - stage_t0;
-  ptl *= twoPi*para;
-  end_t = wall_seconds() - start_t;
-  printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
-  printf("solvation energy: %f\n", ptl);
   if (sys->benchmarkMode > 0) {
     printf("Top-level stage times (s): loadPanel=%.6f gkInit=%.6f setupFMM=%.6f setupPC=%.6f setupRHS=%.6f gmres=%.6f treecode=%.6f\n",
            loadPanel_t, gkInit_t, setupFMM_t_local, setupPC_t, setupRHS_t, gmres_t, treecode_t);

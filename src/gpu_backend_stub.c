@@ -5,6 +5,10 @@ int gpuBackendAvailable(void) {
   return 0;
 }
 
+const char *gpuNearfieldLastError(void) {
+  return "CUDA backend not compiled";
+}
+
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
   (void)sys;
   (void)alpha;
