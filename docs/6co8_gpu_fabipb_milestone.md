@@ -125,13 +125,13 @@ all streamed M2L and nearfield chunks for every GMRES matvec.
 Generate and solve a fresh `sdens=1` case in a new directory:
 
 ```sh
-FMM_R=1 OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+SDENS=1 OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
 ```
 
 Generate and solve a fresh `sdens=2` case in a new directory:
 
 ```sh
-FMM_R=0.5 FMM_DEPTH=9 OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_R05_depth9_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+SDENS=2 FMM_DEPTH=9 OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_sdens2_depth9_full scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
 ```
 
 `OUT_DIR` must be new or empty. `FABIPB_REUSE_MESH=1` trusts existing
@@ -139,6 +139,13 @@ FMM_R=0.5 FMM_DEPTH=9 OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_R05_depth9_f
 Changing only `-R` while reusing an old prefix can therefore print a new mesh
 request while solving the old mesh. Always confirm the raw vertex and face
 counts in the log.
+
+The runner now exposes `SDENS`, not the internal FABIPB `R` parameter. It
+translates `R=1/SDENS` for NanoShaper. This makes the command and result names
+consistent with TABI-PB, but it does not claim that MSMS and NanoShaper have
+identical density semantics: MSMS and NanoShaper use different resolution
+controls and can produce different topology and panel counts at the same
+nominal density. Exact comparisons should therefore reuse one saved mesh.
 
 ## Runtime Record
 

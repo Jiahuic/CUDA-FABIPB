@@ -6,7 +6,14 @@ fabipb_bin="${FABIPB_BIN:-$repo_root/build/fabipb}"
 pqr="${1:-$repo_root/test_proteins/ZIKV_6CO8_zenodo.pqr}"
 out_dir="${OUT_DIR:-$repo_root/results/fmm/6co8_fabipb_fast/$(date -u +%Y%m%d_%H%M%S)}"
 
-fmm_r="${FMM_R:-1}"
+sdens="${SDENS:-1}"
+fmm_r="$(awk -v density="$sdens" 'BEGIN {
+  if (density <= 0) exit 1
+  printf "%.12g", 1.0 / density
+}')" || {
+  echo "SDENS must be a positive number: $sdens" >&2
+  exit 1
+}
 fmm_depth="${FMM_DEPTH:-8}"
 fmm_gpu="${FMM_GPU:-1}"
 fmm_q2m="${FMM_Q2M:-0}"
@@ -68,7 +75,8 @@ pqr=$pqr_abs
 fabipb_bin=$fabipb_bin
 nanoshaper_bin=$nanoshaper_bin
 mesh_backend=nanoshaper
-fmm_r=$fmm_r
+sdens=$sdens
+internal_fmm_r=$fmm_r
 fmm_depth=$fmm_depth
 fmm_gpu=$fmm_gpu
 fmm_q2m=$fmm_q2m
