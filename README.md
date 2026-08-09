@@ -230,6 +230,54 @@ Show command-line help:
 ./build/fabipb -h
 ```
 
+### Calculation Workflows
+
+For the full Zenodo 6CO8 calculation, use the production runner. It records
+the command, mesh metadata, RHS summary, GMRES status, and stage timings under
+`results/`.
+
+`SDENS` is the user-facing NanoShaper/TABI density label. The runner translates
+it internally to FABIPB's mesh parameter.
+
+```sh
+SDENS=1 \
+OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_full \
+./scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+
+SDENS=2 FMM_DEPTH=9 \
+OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_sdens2_depth9_full \
+./scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+```
+
+Run the supported regression checks after rebuilding:
+
+```sh
+cmake --build build -j 4
+./tests/run_zenodo_issue_tests.sh
+```
+
+For matched TABI-PB/FABIPB size comparisons:
+
+```sh
+./scripts/compare_tabi_fmm_size_sweep.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+```
+
+For CPU/GPU FMM comparisons on a small or medium protein:
+
+```sh
+./scripts/compare_gpu_cpu.sh test_proteins/1a63
+```
+
+For systematic benchmark and parameter studies:
+
+```sh
+./scripts/run_benchmark_matrix.sh test_proteins/1a63
+./scripts/run_fmm_param_matrix.sh test_proteins/1a63
+```
+
+The benchmark matrix already includes the `hybrid_best` configuration; the
+old standalone hybrid-only runner is archived under `scripts/archive/`.
+
 Notes:
 
 - default output is intentionally quiet: final wall time and solvation energy
@@ -240,7 +288,7 @@ Notes:
 - `-r=1` selects the direct GPU baseline matvec instead of the FMM matvec
 - direct mode is intended for benchmark/reference use and may be limited by GPU memory
 - direct mode prints its estimated host/device memory footprint before allocation
-- `-c=1` and `-C=1` are development-only compare modes and should not be used for timing runs
+- compare modes should not be used for timing runs
 
 ## Mesh calibration workflow
 
