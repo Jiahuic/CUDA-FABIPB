@@ -2720,22 +2720,125 @@ int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alp
     return 0;
   }
 
-  for (idx = 0; idx < count; idx++) {
-    int srcIdx = gNear.h_src[idx];
-    int dstIdx = gNear.h_dst[idx];
-    panel *pnlX = sys->panelByIdx[dstIdx];
-    panel *pnlY = sys->panelByIdx[srcIdx];
-    int idxX[3], idxY[3];
-    int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
-    if (nVtx != 0) {
-      double *KER = panelIA0(pnlX, pnlY);
-      gNear.h_src[specialCount] = srcIdx;
-      gNear.h_dst[specialCount] = dstIdx;
-      gNear.h_k0[specialCount] = KER[0];
-      gNear.h_k1[specialCount] = KER[1];
-      gNear.h_k2[specialCount] = KER[2];
-      gNear.h_k3[specialCount] = KER[3];
-      specialCount++;
+  /*
+   * Classify every interaction in the chunk and compact the touching/self
+   * ("special") ones to the front of the chunk buffers.
+   *
+   * This is the dominant cost of the streaming path: nrCommonVtx() runs once
+   * per interaction, on every matvec. On a 420k-panel mesh that is 476M calls
+   * per matvec, and it used to run on one thread inside a timer labelled
+   * "kernel", which is why the GPU looked slow when the work was actually on
+   * the host.
+   *
+   * Parallelising needs care because the compaction is in-place: the loop
+   * reads h_src[idx] and writes h_src[specialCount] with specialCount <= idx.
+   * That is safe in a serial pass but not across threads, where one thread's
+   * writes can land in a range another thread has not read yet. So the work is
+   * split: each thread first classifies its own range into thread-local
+   * buffers (reads only), then, after every thread has finished reading, the
+   * results are copied back at prefix-summed offsets. Output order matches the
+   * serial version exactly, so the coefficients uploaded to the GPU are
+   * identical.
+   */
+  {
+    int nThreads = nearfieldBuildThreadCount((int)((count > (long long)INT_MAX)
+                                                   ? (long long)INT_MAX : count));
+    if (nThreads <= 1) {
+      for (idx = 0; idx < count; idx++) {
+        int srcIdx = gNear.h_src[idx];
+        int dstIdx = gNear.h_dst[idx];
+        panel *pnlX = sys->panelByIdx[dstIdx];
+        panel *pnlY = sys->panelByIdx[srcIdx];
+        int idxX[3], idxY[3];
+        int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+        if (nVtx != 0) {
+          double *KER = panelIA0(pnlX, pnlY);
+          gNear.h_src[specialCount] = srcIdx;
+          gNear.h_dst[specialCount] = dstIdx;
+          gNear.h_k0[specialCount] = KER[0];
+          gNear.h_k1[specialCount] = KER[1];
+          gNear.h_k2[specialCount] = KER[2];
+          gNear.h_k3[specialCount] = KER[3];
+          specialCount++;
+        }
+      }
+    } else {
+      std::vector<std::vector<int> > tSrc((size_t)nThreads), tDst((size_t)nThreads);
+      std::vector<std::vector<double> > tK0((size_t)nThreads), tK1((size_t)nThreads),
+                                        tK2((size_t)nThreads), tK3((size_t)nThreads);
+      std::vector<std::thread> workers;
+      std::vector<long long> offset((size_t)nThreads + 1U, 0);
+      int t;
+
+      workers.reserve((size_t)nThreads);
+      for (t = 0; t < nThreads; t++) {
+        workers.push_back(std::thread([&, t]() {
+          long long begin = (count * (long long)t) / (long long)nThreads;
+          long long end = (count * (long long)(t + 1)) / (long long)nThreads;
+          std::vector<int> &vs = tSrc[(size_t)t];
+          std::vector<int> &vd = tDst[(size_t)t];
+          std::vector<double> &v0 = tK0[(size_t)t];
+          std::vector<double> &v1 = tK1[(size_t)t];
+          std::vector<double> &v2 = tK2[(size_t)t];
+          std::vector<double> &v3 = tK3[(size_t)t];
+          long long i;
+          /* Touching/self pairs are a small minority of the chunk (~1% on a
+           * compact protein, ~7% on the virus mesh). Reserving an eighth up
+           * front keeps the common case free of reallocation without holding
+           * much memory; the vectors still grow if a chunk is unusually dense. */
+          size_t guess = (size_t)((end - begin) / 8 + 1);
+          vs.reserve(guess); vd.reserve(guess);
+          v0.reserve(guess); v1.reserve(guess);
+          v2.reserve(guess); v3.reserve(guess);
+
+          for (i = begin; i < end; i++) {
+            int srcIdx = gNear.h_src[i];
+            int dstIdx = gNear.h_dst[i];
+            panel *pnlX = sys->panelByIdx[dstIdx];
+            panel *pnlY = sys->panelByIdx[srcIdx];
+            int idxX[3], idxY[3];
+            int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+            if (nVtx != 0) {
+              double *KER = panelIA0(pnlX, pnlY);
+              vs.push_back(srcIdx);
+              vd.push_back(dstIdx);
+              v0.push_back(KER[0]);
+              v1.push_back(KER[1]);
+              v2.push_back(KER[2]);
+              v3.push_back(KER[3]);
+            }
+          }
+        }));
+      }
+      for (t = 0; t < nThreads; t++) {
+        workers[(size_t)t].join();
+      }
+
+      for (t = 0; t < nThreads; t++) {
+        offset[(size_t)t + 1U] = offset[(size_t)t] + (long long)tSrc[(size_t)t].size();
+      }
+      specialCount = offset[(size_t)nThreads];
+
+      /* Every thread has finished reading, so writing back in place is safe. */
+      workers.clear();
+      for (t = 0; t < nThreads; t++) {
+        workers.push_back(std::thread([&, t]() {
+          size_t n = tSrc[(size_t)t].size();
+          long long at = offset[(size_t)t];
+          if (n == 0U) {
+            return;
+          }
+          memcpy(&gNear.h_src[at], &tSrc[(size_t)t][0], n * sizeof(int));
+          memcpy(&gNear.h_dst[at], &tDst[(size_t)t][0], n * sizeof(int));
+          memcpy(&gNear.h_k0[at], &tK0[(size_t)t][0], n * sizeof(double));
+          memcpy(&gNear.h_k1[at], &tK1[(size_t)t][0], n * sizeof(double));
+          memcpy(&gNear.h_k2[at], &tK2[(size_t)t][0], n * sizeof(double));
+          memcpy(&gNear.h_k3[at], &tK3[(size_t)t][0], n * sizeof(double));
+        }));
+      }
+      for (t = 0; t < nThreads; t++) {
+        workers[(size_t)t].join();
+      }
     }
   }
 
