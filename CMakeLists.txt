@@ -47,6 +47,24 @@ if(FMM_PB_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
   find_package(CUDAToolkit REQUIRED)
   set(FMM_PB_HAS_CUDA ON)
   list(APPEND FMM_PB_SOURCES src/gpu_backend_cuda.cu)
+
+  # Pin the device architecture. With nothing set, nvcc uses its own default
+  # (sm_52 on CUDA 12.x), which costs twice over on a modern card: the driver
+  # JIT-compiles the embedded compute_52 PTX at every process start, and every
+  # double-precision atomicAdd takes the software compare-and-swap emulation
+  # loop, because the native FP64 atomic is only compiled in when
+  # __CUDA_ARCH__ >= 600. Check with:
+  #   cuobjdump --list-elf build/CMakeFiles/fabipb.dir/src/gpu_backend_cuda.cu.o
+  #   cuobjdump -sass ... | grep -E 'RED\.E\.ADD\.F64|ATOM\.E\.CAS'
+  # "native" builds for the GPU in the build machine; set
+  # -DFMM_PB_CUDA_ARCHITECTURES=... to target a different one.
+  if(NOT DEFINED FMM_PB_CUDA_ARCHITECTURES)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+      set(FMM_PB_CUDA_ARCHITECTURES native)
+    else()
+      set(FMM_PB_CUDA_ARCHITECTURES 70 80 86 89)
+    endif()
+  endif()
 else()
   list(APPEND FMM_PB_SOURCES src/gpu_backend_stub.c)
 endif()
@@ -68,6 +86,7 @@ endif()
 
 if(FMM_PB_HAS_CUDA)
   target_compile_definitions(fabipb PRIVATE FMM_PB_HAS_CUDA_BACKEND=1)
+  set_property(TARGET fabipb PROPERTY CUDA_ARCHITECTURES ${FMM_PB_CUDA_ARCHITECTURES})
 else()
   target_compile_definitions(fabipb PRIVATE FMM_PB_HAS_CUDA_BACKEND=0)
 endif()
@@ -145,6 +164,9 @@ endif()
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 message(STATUS "BLA_VENDOR hint: ${BLA_VENDOR}")
 message(STATUS "CUDA backend enabled: ${FMM_PB_HAS_CUDA}")
+if(FMM_PB_HAS_CUDA)
+  message(STATUS "CUDA architectures: ${FMM_PB_CUDA_ARCHITECTURES}")
+endif()
 message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
 message(STATUS "LAPACK libraries: ${LAPACK_LIBRARIES}")
 message(STATUS "Resolved OpenBLAS libraries: ${FMM_PB_OPENBLAS_REALPATHS}")
