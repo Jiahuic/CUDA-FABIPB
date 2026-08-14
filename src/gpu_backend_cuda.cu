@@ -108,6 +108,17 @@ struct NearfieldGpuCache {
    * occupies [specialOffset[c], specialOffset[c+1]). Chunk boundaries depend
    * only on geometry and chunkCapacity, so they repeat exactly every matvec.
    */
+  /*
+   * Flattened leaf-pair table, uploaded once, from which the streaming
+   * disjoint kernel derives panel indices instead of having them shipped
+   * every matvec. Per pair: the running interaction offset, and the panel
+   * ranges of its source and destination leaves.
+   */
+  int streamPairCount;
+  long long *d_streamPairOffset;
+  int *d_streamPairSrcStart;
+  int *d_streamPairSrcCount;
+  int *d_streamPairDstStart;
   /* Whether each chunk staging buffer came from cudaHostAlloc (page-locked)
    * or plain malloc, so the right free is used. */
   int h_srcPinned;
@@ -508,6 +519,15 @@ void freeNearfieldCache() {
   cudaFree(gNear.d_k3);
   cudaFree(gNear.d_sgm);
   cudaFree(gNear.d_pot);
+  cudaFree(gNear.d_streamPairOffset);
+  cudaFree(gNear.d_streamPairSrcStart);
+  cudaFree(gNear.d_streamPairSrcCount);
+  cudaFree(gNear.d_streamPairDstStart);
+  gNear.d_streamPairOffset = NULL;
+  gNear.d_streamPairSrcStart = NULL;
+  gNear.d_streamPairSrcCount = NULL;
+  gNear.d_streamPairDstStart = NULL;
+  gNear.streamPairCount = 0;
   gNear.d_panels = NULL;
   gNear.d_src = NULL;
   gNear.d_dst = NULL;
@@ -1078,10 +1098,74 @@ int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions
                            (size_t)sys->nPnls * sizeof(NearPanelGeom),
                            cudaMemcpyHostToDevice, "stream panels")) return 0;
 
+  /*
+   * Build and upload the leaf-pair table once. It lets the disjoint kernel
+   * derive its own panel indices, so from the second matvec onward neither the
+   * host index loop nor the per-chunk index upload has to run at all. The
+   * table is ~20 bytes per leaf pair, against 8 bytes per interaction for the
+   * arrays it replaces.
+   */
+  {
+    int nPairs = sys->nNearPairsFlat;
+    std::vector<long long> hOffset((size_t)nPairs + 1U);
+    std::vector<int> hSrcStart((size_t)nPairs), hSrcCount((size_t)nPairs),
+                     hDstStart((size_t)nPairs);
+    long long running = 0;
+    int p;
+
+    for (p = 0; p < nPairs; p++) {
+      int srcLeaf = sys->nearPairSrc[p];
+      int dstLeaf = sys->nearPairDst[p];
+      hOffset[(size_t)p] = running;
+      hSrcStart[(size_t)p] = sys->leafPanelStart[srcLeaf];
+      hSrcCount[(size_t)p] = sys->leafPanelCount[srcLeaf];
+      hDstStart[(size_t)p] = sys->leafPanelStart[dstLeaf];
+      running += (long long)sys->leafPanelCount[srcLeaf] *
+                 (long long)sys->leafPanelCount[dstLeaf];
+    }
+    hOffset[(size_t)nPairs] = running;
+
+    if (running != totalInteractions) {
+      setNearfieldLastError("leaf-pair table totals %lld interactions, expected %lld",
+                            running, totalInteractions);
+      return 0;
+    }
+
+    if (!cudaMallocNearfield((void **)&gNear.d_streamPairOffset,
+                             ((size_t)nPairs + 1U) * sizeof(long long), "stream pairOffset") ||
+        !cudaMallocNearfield((void **)&gNear.d_streamPairSrcStart,
+                             (size_t)nPairs * sizeof(int), "stream pairSrcStart") ||
+        !cudaMallocNearfield((void **)&gNear.d_streamPairSrcCount,
+                             (size_t)nPairs * sizeof(int), "stream pairSrcCount") ||
+        !cudaMallocNearfield((void **)&gNear.d_streamPairDstStart,
+                             (size_t)nPairs * sizeof(int), "stream pairDstStart")) {
+      return 0;
+    }
+    if (!cudaMemcpyNearfield(gNear.d_streamPairOffset, &hOffset[0],
+                             ((size_t)nPairs + 1U) * sizeof(long long),
+                             cudaMemcpyHostToDevice, "stream pairOffset") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairSrcStart, &hSrcStart[0],
+                             (size_t)nPairs * sizeof(int),
+                             cudaMemcpyHostToDevice, "stream pairSrcStart") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairSrcCount, &hSrcCount[0],
+                             (size_t)nPairs * sizeof(int),
+                             cudaMemcpyHostToDevice, "stream pairSrcCount") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairDstStart, &hDstStart[0],
+                             (size_t)nPairs * sizeof(int),
+                             cudaMemcpyHostToDevice, "stream pairDstStart")) {
+      return 0;
+    }
+    gNear.streamPairCount = nPairs;
+  }
+
   if (sys->benchmarkMode > 0) {
     printf("GPU nearfield streaming: interactions=%lld chunk-capacity=%lld chunk-device=%.3f GiB qOrd=1\n",
            totalInteractions, capacity,
            bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
+    printf("GPU nearfield streaming pair table: pairs=%d device=%.3f GiB\n",
+           gNear.streamPairCount,
+           bytesToGiB(((size_t)gNear.streamPairCount + 1U) * sizeof(long long) +
+                      3U * (size_t)gNear.streamPairCount * sizeof(int)));
   }
   return 1;
 }
@@ -2468,20 +2552,19 @@ __global__ void nearfieldDisjointQ1BuildKernel(
   k3[tid] = pnlX->area * pnlY->area * out[3];
 }
 
-__global__ void nearfieldDisjointQ1ApplyKernel(
+/*
+ * Shared body for the two disjoint-pair kernels: one reads the panel indices
+ * from uploaded arrays, the other derives them from the leaf-pair table. Both
+ * call this so the arithmetic cannot drift apart.
+ */
+__device__ __forceinline__ void nearDisjointQ1Apply(
     int nPnls,
-    long long nInteractions,
+    int s,
+    int d,
     const NearPanelGeom *panels,
-    const int *src,
-    const int *dst,
     double alpha,
     const double *sgm,
     double *pot) {
-  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
-  if (tid >= nInteractions) return;
-
-  int s = src[tid];
-  int d = dst[tid];
   const NearPanelGeom *pnlX = &panels[d];
   const NearPanelGeom *pnlY = &panels[s];
   double r0[3], r1[3], r[3], out[4];
@@ -2519,6 +2602,75 @@ __global__ void nearfieldDisjointQ1ApplyKernel(
     } while (assumed2 != old2);
   }
 #endif
+}
+
+__global__ void nearfieldDisjointQ1ApplyKernel(
+    int nPnls,
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nInteractions) return;
+  nearDisjointQ1Apply(nPnls, src[tid], dst[tid], panels, alpha, sgm, pot);
+}
+
+/*
+ * Same work, but the panel indices are computed instead of transferred.
+ *
+ * The host used to materialise src/dst for every interaction and upload them
+ * on every matvec -- 3.8 GB per matvec on a 420k-panel mesh, and 62 GB on the
+ * virus, which is more than the card holds. They are a pure function of the
+ * leaf-pair table, so each thread recovers its own pair from the interaction
+ * offsets and derives the two panel indices directly.
+ *
+ * Chunk c covers global interactions [c*chunkCapacity, ...), because the host
+ * loop simply counts interactions and flushes at chunkCapacity.
+ */
+__global__ void nearfieldDisjointQ1GeneratedKernel(
+    int nPnls,
+    long long chunkStart,
+    long long count,
+    int nPairs,
+    const long long *pairOffset,
+    const int *pairSrcStart,
+    const int *pairSrcCount,
+    const int *pairDstStart,
+    const NearPanelGeom *panels,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  long long g;
+  long long local;
+  int lo = 0;
+  int hi = nPairs;
+  int p, sc, i, j;
+
+  if (tid >= count) return;
+  g = chunkStart + tid;
+
+  /* Largest p with pairOffset[p] <= g; pairOffset holds nPairs+1 entries. */
+  while (hi - lo > 1) {
+    int mid = (lo + hi) >> 1;
+    if (pairOffset[mid] <= g) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  p = lo;
+
+  local = g - pairOffset[p];
+  sc = pairSrcCount[p];
+  i = (int)(local / (long long)sc);
+  j = (int)(local - (long long)i * (long long)sc);
+
+  nearDisjointQ1Apply(nPnls, pairSrcStart[p] + j, pairDstStart[p] + i,
+                      panels, alpha, sgm, pot);
 }
 
 __global__ void nearfieldLeafApplyKernel(
@@ -2850,6 +3002,9 @@ int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alp
   /* Replay a previously classified chunk instead of redoing the work. */
   int useCache = (gNear.specialCacheEnabled && gNear.specialCacheValid &&
                   chunkIdx < gNear.specialCacheChunks);
+  /* With the cache live the host stops filling h_src/h_dst, so the disjoint
+   * kernel has to derive the indices itself. */
+  int useGenerated = (useCache && gNear.d_streamPairOffset != NULL);
   const int *upSrc;
   const int *upDst;
   const double *upK0;
@@ -2857,14 +3012,23 @@ int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alp
   const double *upK2;
   const double *upK3;
 
-  if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, indexBytes,
-                           cudaMemcpyHostToDevice, "stream src") ||
-      !cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst, indexBytes,
-                           cudaMemcpyHostToDevice, "stream dst")) return 0;
+  if (useGenerated) {
+    nearfieldDisjointQ1GeneratedKernel<<<gridSize, blockSize>>>(
+        gNear.nPnls, chunkIdx * gNear.chunkCapacity, count,
+        gNear.streamPairCount, gNear.d_streamPairOffset,
+        gNear.d_streamPairSrcStart, gNear.d_streamPairSrcCount,
+        gNear.d_streamPairDstStart,
+        gNear.d_panels, alpha, gNear.d_sgm, gNear.d_pot);
+  } else {
+    if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, indexBytes,
+                             cudaMemcpyHostToDevice, "stream src") ||
+        !cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst, indexBytes,
+                             cudaMemcpyHostToDevice, "stream dst")) return 0;
 
-  nearfieldDisjointQ1ApplyKernel<<<gridSize, blockSize>>>(
-      gNear.nPnls, count, gNear.d_panels, gNear.d_src, gNear.d_dst,
-      alpha, gNear.d_sgm, gNear.d_pot);
+    nearfieldDisjointQ1ApplyKernel<<<gridSize, blockSize>>>(
+        gNear.nPnls, count, gNear.d_panels, gNear.d_src, gNear.d_dst,
+        alpha, gNear.d_sgm, gNear.d_pot);
+  }
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     setNearfieldLastError("streaming disjoint kernel launch failed: %s",
@@ -3089,30 +3253,49 @@ int applyNearfieldStreaming(const ssystem *sys, double alpha) {
     return 0;
   }
 
-  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
-    int srcLeaf = sys->nearPairSrc[pairIdx];
-    int dstLeaf = sys->nearPairDst[pairIdx];
-    int srcStart = sys->leafPanelStart[srcLeaf];
-    int srcCount = sys->leafPanelCount[srcLeaf];
-    int dstStart = sys->leafPanelStart[dstLeaf];
-    int dstCount = sys->leafPanelCount[dstLeaf];
-    int i, j;
-    for (i = 0; i < dstCount; i++) {
-      for (j = 0; j < srcCount; j++) {
-        gNear.h_src[count] = srcStart + j;
-        gNear.h_dst[count] = dstStart + i;
-        count++;
-        if (count == gNear.chunkCapacity) {
-          if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
-          count = 0;
-          chunks++;
+  /*
+   * Once the special cache is populated, nothing downstream reads the host
+   * index arrays: the specials come from the cache and the disjoint kernel
+   * derives its own indices. Skip building them altogether and just walk the
+   * chunk boundaries, which are fixed multiples of chunkCapacity. This removes
+   * both the index writes and their upload -- 3.8 GB per matvec on a
+   * 420k-panel mesh, 62 GB on the virus.
+   */
+  if (gNear.specialCacheValid && gNear.d_streamPairOffset != NULL) {
+    long long remaining = gNear.nInteractions;
+    while (remaining > 0) {
+      long long thisChunk = (remaining < gNear.chunkCapacity) ? remaining
+                                                              : gNear.chunkCapacity;
+      if (!applyNearfieldStreamingChunk(sys, thisChunk, alpha, chunks, &specialTotal)) return 0;
+      remaining -= thisChunk;
+      chunks++;
+    }
+  } else {
+    for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+      int srcLeaf = sys->nearPairSrc[pairIdx];
+      int dstLeaf = sys->nearPairDst[pairIdx];
+      int srcStart = sys->leafPanelStart[srcLeaf];
+      int srcCount = sys->leafPanelCount[srcLeaf];
+      int dstStart = sys->leafPanelStart[dstLeaf];
+      int dstCount = sys->leafPanelCount[dstLeaf];
+      int i, j;
+      for (i = 0; i < dstCount; i++) {
+        for (j = 0; j < srcCount; j++) {
+          gNear.h_src[count] = srcStart + j;
+          gNear.h_dst[count] = dstStart + i;
+          count++;
+          if (count == gNear.chunkCapacity) {
+            if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
+            count = 0;
+            chunks++;
+          }
         }
       }
     }
-  }
-  if (count > 0) {
-    if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
-    chunks++;
+    if (count > 0) {
+      if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
+      chunks++;
+    }
   }
   /*
    * The first matvec has now classified every chunk, so later ones can replay
