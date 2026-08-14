@@ -81,17 +81,30 @@ int PtVmain(double *pot, double *sgm);
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
 void applyPanelChargeTreeEnergy( ssystem *sys, double *sgm, double *pot );
 
+/*
+ * Pin the *external* math-library thread counts to 1.
+ *
+ * These control BLAS/LAPACK/OpenMP internal parallelism, where the reduction
+ * order is not fixed, so leaving them free makes results vary run to run.
+ * Pinning them keeps a run reproducible.
+ *
+ * FABIPB's own worker-thread counts are deliberately NOT in this list. They
+ * partition their loops into disjoint output slots, so the result is identical
+ * at any thread count (verified: the nearfield build gives the same energy to
+ * every printed digit at 1, 4, 16 and 32 threads). Pinning them here cost real
+ * time for no reproducibility benefit -- the nearfield host build alone ran
+ * 9.52 s single-threaded versus 2.73 s at 32 threads on a 420k-panel mesh, and
+ * the production runner never overrode it. Benchmark runs still get a fully
+ * pinned environment from scripts/with_benchmark_env.sh, which sets each of
+ * them explicitly.
+ */
 static void set_benchmark_thread_defaults(void) {
   const char *vars[] = {
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS",
-    "FABIPB_SETUP_THREADS",
-    "FABIPB_PRECOND_APPLY_THREADS",
-    "FABIPB_NEARFIELD_BUILD_THREADS",
-    "FABIPB_DIRECT_THREADS"
+    "BLIS_NUM_THREADS"
   };
   size_t i;
 
@@ -204,17 +217,20 @@ static void reportDirectRhsLimit(int nPnls, int nChar, int gpuMode) {
   }
 }
 
+/*
+ * Only the external math libraries are listed here. They read their thread
+ * count once at library init, which can happen before main(), so setting the
+ * variable has to be followed by a re-exec to take effect. FABIPB's own worker
+ * counts are read lazily through getenv() at each use, need no re-exec, and are
+ * left unpinned -- see set_benchmark_thread_defaults() for why.
+ */
 static void ensure_startup_thread_env(int nargs, char *argv[]) {
   const char *vars[] = {
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS",
-    "FABIPB_SETUP_THREADS",
-    "FABIPB_PRECOND_APPLY_THREADS",
-    "FABIPB_NEARFIELD_BUILD_THREADS",
-    "FABIPB_DIRECT_THREADS"
+    "BLIS_NUM_THREADS"
   };
   int needsExec = 0;
   size_t i;
