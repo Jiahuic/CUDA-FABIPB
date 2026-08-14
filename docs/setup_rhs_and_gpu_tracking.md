@@ -1,5 +1,10 @@
 # setupRHS and GPU Tracking
 
+> Historical note: this document retains measurements from the investigation.
+> Some one-off debug commands shown below were removed from the production
+> code during cleanup. Use the current 6CO8 runner and the supported options
+> in `build/fabipb -h` for new runs.
+
 Current branch:
 
 ```text
@@ -36,7 +41,6 @@ Direction 1: use the accelerated charge-tree RHS.
 - The charge tree uses at least fourth-order expansions and a default acceptance
   ratio of `FABIPB_RHS_TREE_THETA=0.2`.
 - `FABIPB_FORCE_TREE_RHS=1` selects the tree path for small reference cases.
-- `FABIPB_DEBUG_COMPARE_RHS=1` compares it with the direct RHS.
 - Override only for an intentional long run:
 
 ```sh
@@ -57,7 +61,7 @@ GMRES iterations:            29 for both paths
 
 RHS equation setup check:
 
-`FABIPB_DEBUG_RHS_NORMS=1` compares the assembled root-FMM RHS against the
+An earlier diagnostic compared the assembled root-FMM RHS against the
 TABI-PB source-term formula evaluated at root's own panel quadrature points,
 after dividing the integrated Galerkin RHS by panel area. On `1a63` with
 NanoShaper `R=8`, `eps1=4`, `eps2=80`, direct RHS matches to roundoff:
@@ -484,5 +488,4 @@ The wrapper runs:
 
 - `tests/test_pqr_parser_zero_radius.sh`
 - `tests/test_rhs_guard.sh`
-- `tests/test_rhs_tree_accuracy.sh`
 - `tests/test_gpu_request_smoke.sh`

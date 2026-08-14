@@ -26,24 +26,6 @@ typedef struct {
 
 static CpuDirectCache gCpuDirect = {0};
 
-static const char *skipSelfPanelMode(void) {
-  const char *env = getenv("FABIPB_SKIP_SELF_PANEL");
-  return (env != NULL) ? env : "";
-}
-
-static int skipSelfCoeff(int coeffIdx) {
-  const char *mode = skipSelfPanelMode();
-
-  if (strcmp(mode, "1") == 0 || strcmp(mode, "all") == 0) {
-    return 1;
-  }
-  if (strcmp(mode, "k0") == 0 && coeffIdx == 0) { return 1; }
-  if (strcmp(mode, "k1") == 0 && coeffIdx == 1) { return 1; }
-  if (strcmp(mode, "k2") == 0 && coeffIdx == 2) { return 1; }
-  if (strcmp(mode, "k3") == 0 && coeffIdx == 3) { return 1; }
-  return 0;
-}
-
 typedef struct {
   const ssystem *sys;
   int begin;
@@ -86,10 +68,10 @@ static void *cpuDirectBuildWorker(void *arg) {
       double *KER;
 
       KER = panelIA0(pnlX, pnlY);
-      gCpuDirect.k0[idx] = (i == j && skipSelfCoeff(0)) ? 0.0 : KER[0];
-      gCpuDirect.k1[idx] = (i == j && skipSelfCoeff(1)) ? 0.0 : KER[1];
-      gCpuDirect.k2[idx] = (i == j && skipSelfCoeff(2)) ? 0.0 : KER[2];
-      gCpuDirect.k3[idx] = (i == j && skipSelfCoeff(3)) ? 0.0 : KER[3];
+      gCpuDirect.k0[idx] = KER[0];
+      gCpuDirect.k1[idx] = KER[1];
+      gCpuDirect.k2[idx] = KER[2];
+      gCpuDirect.k3[idx] = KER[3];
     }
   }
   return NULL;
@@ -163,8 +145,10 @@ static int buildCpuDirectTables(const ssystem *sys) {
       }
       for (i = 0; i < nThreads; i++) {
         tasks[i].sys = sys;
-        tasks[i].begin = (sys->nPnls * i) / nThreads;
-        tasks[i].end = (sys->nPnls * (i + 1)) / nThreads;
+        /* (long long) so the product cannot overflow int at virus scale and
+         * hand a worker a negative range; see setupRHSTreeParallel. */
+        tasks[i].begin = (int)(((long long)sys->nPnls * i) / nThreads);
+        tasks[i].end = (int)(((long long)sys->nPnls * (i + 1)) / nThreads);
         pthread_create(&threads[i], NULL, cpuDirectBuildWorker, &tasks[i]);
       }
       for (i = 0; i < nThreads; i++) {
@@ -182,10 +166,6 @@ static int buildCpuDirectTables(const ssystem *sys) {
     printf("CPU direct cache: panel-pairs=%lld host-coeff=%.3f GB\n",
            nInteractions,
            (double)totalCoeffBytes / (1024.0 * 1024.0 * 1024.0));
-    if (skipSelfPanelMode()[0] != '\0') {
-      printf("CPU direct cache: FABIPB_SKIP_SELF_PANEL=%s, selected self-panel coefficients zeroed\n",
-             skipSelfPanelMode());
-    }
   }
   return 1;
 }

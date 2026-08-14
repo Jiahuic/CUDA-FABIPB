@@ -3,6 +3,8 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "gkGlobal.h"
 #include "gk.h"
 
@@ -21,6 +23,7 @@ extern double **dGk;     /* workspace for setupDerivs */
 extern double kappa;
 extern double epsilon;
 extern void (*kernel)();
+extern void (*kernelD)(double r, int p, double *G0, double *Gk);
 extern double **Q2M0, **Q2M1;   /* moments */
 extern double *ifact3;
 extern int *sgn3;
@@ -54,6 +57,43 @@ double rhsTreeTheta(void) {
   return theta;
 }
 
+/*
+ * Acceptance ratio for the post-solve panel-charge energy treecode.
+ *
+ * This is deliberately NOT rhsTreeTheta(). The RHS tolerance is routinely
+ * loosened to 0.3 to cut setupRHS time on virus-scale inputs, which is
+ * acceptable there but measurably degrades the energy functional: on 1a63 the
+ * energy error against the theta->0 limit grows from 7.2e-6 at theta=0.2 to
+ * 5.2e-4 at theta=0.3 (a 70x loss) while buying little, because the energy
+ * evaluation runs once instead of once per GMRES iteration. Keeping a separate
+ * knob lets the RHS stay fast without silently spending that accuracy.
+ */
+double energyTreeTheta(void) {
+  static int initialized = 0;
+  static double theta = 0.2;
+
+  if (!initialized) {
+    const char *env = getenv("FABIPB_ENERGY_TREE_THETA");
+    initialized = 1;
+    if (env != NULL) {
+      char *endptr = NULL;
+      double value;
+
+      errno = 0;
+      value = strtod(env, &endptr);
+      if (errno == 0 && endptr != env && *endptr == '\0' &&
+          value > 0.0 && value <= 1.0) {
+        theta = value;
+      } else {
+        fprintf(stderr,
+                "Warning: ignoring invalid FABIPB_ENERGY_TREE_THETA='%s'; using 0.2\n",
+                env);
+      }
+    }
+  }
+  return theta;
+}
+
 void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws) {
   int k, p;
 
@@ -68,10 +108,13 @@ void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws) {
   ws->maxOrder = sys->maxOrder;
   ws->derivOrder = sys->maxOrder + 1;
   CALLOC(ws->gvals0, ws->derivOrder + 1, double);
+  CALLOC(ws->gvalsk, ws->derivOrder + 1, double);
   CALLOC(ws->dg0, ws->derivOrder + 1, double*);
+  CALLOC(ws->dgk, ws->derivOrder + 1, double*);
   for (k = 0; k <= ws->derivOrder; k++) {
     p = ws->derivOrder - k;
     CALLOC(ws->dg0[k], sys->nMom[p], double);
+    CALLOC(ws->dgk[k], sys->nMom[p], double);
   }
 }
 
@@ -87,8 +130,86 @@ void freeRhsTreeWorkspace(RhsTreeWorkspace *ws) {
     }
     free(ws->dg0);
   }
+  if (ws->dgk != NULL) {
+    for (k = 0; k <= ws->derivOrder; k++) {
+      free(ws->dgk[k]);
+    }
+    free(ws->dgk);
+  }
   free(ws->gvals0);
+  free(ws->gvalsk);
   memset(ws, 0, sizeof(*ws));
+}
+
+static void setupScreenedDerivsLocal(ssystem *sys, RhsTreeWorkspace *ws,
+                                     int order, const double *x) {
+  int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2;
+  double r;
+
+  ASSERT(sys != NULL && ws != NULL);
+  ASSERT(order >= 0 && order <= ws->derivOrder);
+
+  r = sqrt(SQR(x[0]) + SQR(x[1]) + SQR(x[2]));
+  kernelD(r, order, ws->gvals0, ws->gvalsk);
+
+  for (p = 0; p <= order; p++) {
+    ws->dg0[p][0] = ws->gvals0[p];
+    ws->dgk[p][0] = ws->gvalsk[p];
+  }
+
+  for (p = 0; p < order; p++) {
+    p1 = p + 1;
+    ws->dg0[p][1] = ws->dg0[p1][0] * x[2];
+    ws->dg0[p][2] = ws->dg0[p1][0] * x[1];
+    ws->dg0[p][3] = ws->dg0[p1][0] * x[0];
+    ws->dgk[p][1] = ws->dgk[p1][0] * x[2];
+    ws->dgk[p][2] = ws->dgk[p1][0] * x[1];
+    ws->dgk[p][3] = ws->dgk[p1][0] * x[0];
+  }
+
+  for (iRow = 2; iRow <= order; iRow++) {
+    for (p = 0; p <= order - iRow; p++) {
+      p1 = p + 1;
+      idx = idx3[0][0][iRow];
+      iRow1 = iRow - 1;
+
+      idx1 = idx3[0][0][iRow1];
+      idx2 = idx3[0][0][iRow - 2];
+      ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[2] + ws->dg0[p1][idx2] * iRow1;
+      ws->dgk[p][idx] = ws->dgk[p1][idx1] * x[2] + ws->dgk[p1][idx2] * iRow1;
+      idx++;
+
+      idx1 = idx3[0][0][iRow1];
+      ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[1];
+      ws->dgk[p][idx] = ws->dgk[p1][idx1] * x[1];
+      idx++;
+
+      for (i2 = 2; i2 <= iRow; i2++, idx++) {
+        i3 = iRow - i2;
+        idx1 = idx3[0][i2 - 1][i3];
+        idx2 = idx3[0][i2 - 2][i3];
+        ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[1] + ws->dg0[p1][idx2] * (i2 - 1);
+        ws->dgk[p][idx] = ws->dgk[p1][idx1] * x[1] + ws->dgk[p1][idx2] * (i2 - 1);
+      }
+
+      for (i2 = 0; i2 <= iRow1; i2++, idx++) {
+        i3 = iRow1 - i2;
+        idx1 = idx3[0][i2][i3];
+        ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[0];
+        ws->dgk[p][idx] = ws->dgk[p1][idx1] * x[0];
+      }
+
+      for (i1 = 2; i1 <= iRow; i1++) {
+        for (i2 = 0; i2 <= iRow - i1; i2++, idx++) {
+          i3 = iRow - i1 - i2;
+          idx1 = idx3[i1 - 1][i2][i3];
+          idx2 = idx3[i1 - 2][i2][i3];
+          ws->dg0[p][idx] = ws->dg0[p1][idx1] * x[0] + ws->dg0[p1][idx2] * (i1 - 1);
+          ws->dgk[p][idx] = ws->dgk[p1][idx1] * x[0] + ws->dgk[p1][idx2] * (i1 - 1);
+        }
+      }
+    }
+  }
 }
 
 static void setupCoulombDerivsLocal(ssystem *sys, RhsTreeWorkspace *ws,
@@ -338,40 +459,6 @@ double Treecode( ssystem *sys, cube *cb, double *pos, double *sgm ) {
   }
 }
 
-static void TreecodeComponents(ssystem *sys, cube *cb, double *pos,
-                               double *sgm, double *pot0, double *pot1) {
-  int order = sys->ordM2L[cb->level];
-  int i, k;
-  double theta = 0.2;
-  double dist, r[3], *intgr;
-  panel *pnl;
-
-  for (k=0; k<3; k++) r[k] = pos[k]-cb->x[k];
-  dist = sqrt(SQR(r[0])+SQR(r[1])+SQR(r[2]));
-
-  if (cb->eRad < theta*dist && cb->level >= sys->height) {
-    double cluster0, cluster1;
-    setupDerivs(order, r);
-    partclusterComponents(sys, dG0[0], dGk[0], cb, &cluster0, &cluster1);
-    *pot0 += cluster0;
-    *pot1 += cluster1;
-    return;
-  }
-
-  if (cb->level == sys->depth) {
-    for (i=0, pnl=cb->pnls; i<cb->nPnls; i++, pnl=pnl->nextC) {
-      intgr = panelPotential(sys->maxQuadOrder, pos, pnl);
-      *pot0 += intgr[1]*sgm[pnl->idx];
-      *pot1 += intgr[0]*sgm[pnl->idx+sys->nPnls];
-    }
-    return;
-  }
-
-  for (i=0; i<cb->nKids; i++) {
-    TreecodeComponents(sys, cb->kids[i], pos, sgm, pot0, pot1);
-  }
-}
-
 static void buildTreecodeMoments(ssystem *sys, double *sgm) {
   cube *cb;
   int depth=sys->depth, height=sys->height, nPnls=sys->nPnls;
@@ -423,20 +510,258 @@ void applyTreecode( ssystem *sys, double *sgm, double *pot ) {
   }
 }
 
-void applyTreecodeComponents(ssystem *sys, double *sgm,
-                             double *pot0, double *pot1) {
-  cube *Topcb=sys->cubeList[0];
+static void chgClusterEnergyEval(ssystem *sys, cube *chgCb, panel *pnlX,
+                                 RhsTreeWorkspace *ws, double *y) {
+  int order = rhsChargeExpansionOrder(sys, chgCb->level);
+  int nMom = sys->nMom[order];
+  double *mom = chgCb->mom_chr;
+  double *nrm = pnlX->normal;
+  double *dg0 = ws->dg0[0];
+  double *dgk = ws->dgk[0];
+  double y0 = 0.0, y1 = 0.0;
+  int i, i1, i2, i3, n;
+
+  ASSERT(chgCb->level >= 0 && chgCb->level <= sys->chgDepth);
+  ASSERT(order >= 0 && order <= sys->maxOrder);
+  ASSERT(nMom > 0 && nMom < 1000000);
+  ASSERT(mom != NULL);
+
+  for (i = n = 0; n <= order; n++) {
+    for (i1 = 0; i1 <= n; i1++) {
+      for (i2 = 0; i2 <= n - i1; i2++, i++) {
+        double dnG0, dnGk;
+        i3 = n - i1 - i2;
+        y0 += sgn3[i] * mom[i] * (dg0[i] - dgk[i]);
+        dnG0 = nrm[0] * dg0[idx3[i1 + 1][i2][i3]]
+             + nrm[1] * dg0[idx3[i1][i2 + 1][i3]]
+             + nrm[2] * dg0[idx3[i1][i2][i3 + 1]];
+        dnGk = nrm[0] * dgk[idx3[i1 + 1][i2][i3]]
+             + nrm[1] * dgk[idx3[i1][i2 + 1][i3]]
+             + nrm[2] * dgk[idx3[i1][i2][i3 + 1]];
+        y1 += sgn3[i] * mom[i] * (epsilon * dnGk - dnG0);
+      }
+    }
+  }
+  y[0] = y0;
+  y[1] = y1;
+}
+
+static void energyTreeWalk(ssystem *sys, cube *chgCb, double *quadPt,
+                           panel *pnlX, RhsTreeWorkspace *ws, double *y) {
+  double theta = energyTreeTheta();
+  double dist, r[3], yFar[2];
+  int k, i;
+
+  for (k = 0; k < 3; k++) {
+    r[k] = quadPt[k] - chgCb->x[k];
+  }
+  dist = sqrt(SQR(r[0]) + SQR(r[1]) + SQR(r[2]));
+
+  if (chgCb->eRad < theta * dist && chgCb->level >= sys->height) {
+    setupScreenedDerivsLocal(sys, ws, rhsChargeExpansionOrder(sys, chgCb->level) + 1, r);
+    chgClusterEnergyEval(sys, chgCb, pnlX, ws, yFar);
+    y[0] += yFar[0];
+    y[1] += yFar[1];
+    return;
+  }
+
+  if (chgCb->level == sys->chgDepth) {
+    double *nrm = pnlX->normal;
+    for (i = 0; i < chgCb->nChgs; i++) {
+      int j = chgCb->chgIdx[i];
+      double x[3], r2, rnorm, G0, Gk, coef, ip, dG0dn, dGkdn;
+      for (k = 0; k < 3; k++) {
+        x[k] = quadPt[k] - sys->pos[3 * j + k];
+      }
+      r2 = SQR(x[0]) + SQR(x[1]) + SQR(x[2]);
+      rnorm = sqrt(r2);
+      G0 = fourPiI / rnorm;
+      Gk = exp(-kappa * rnorm) * G0;
+      coef = (kappa * rnorm + 1.0) * exp(-kappa * rnorm);
+      ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
+      dG0dn = -ip * G0 / r2;
+      dGkdn = coef * dG0dn;
+      y[0] += sys->chr[j] * (G0 - Gk);
+      y[1] += sys->chr[j] * (epsilon * dGkdn - dG0dn);
+    }
+    return;
+  }
+
+  for (i = 0; i < chgCb->nKids; i++) {
+    energyTreeWalk(sys, chgCb->kids[i], quadPt, pnlX, ws, y);
+  }
+}
+
+static void panelEnergyTree(ssystem *sys, int qOrder, panel *pnlX,
+                            cube *chgRoot, RhsTreeWorkspace *ws, double out[2]) {
+  int ix, jx, k;
+  double r0[3], r[3], *ax2, *ax0;
+  double *tLeg, *wLeg;
+  double y[2];
+
+  tLeg = tLegA[qOrder];
+  wLeg = wLegA[qOrder];
+  ax2 = pnlX->a[2];
+  ax0 = pnlX->a[0];
+
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k];
+  }
+
+  out[0] = 0.0;
+  out[1] = 0.0;
+  for (ix = 0; ix < qOrder; ix++) {
+    for (jx = 0; jx < qOrder; jx++) {
+      for (k = 0; k < 3; k++) {
+        r[k] = r0[k] + tLeg[ix] * (ax2[k] + tLeg[jx] * ax0[k]);
+      }
+      y[0] = 0.0;
+      y[1] = 0.0;
+      energyTreeWalk(sys, chgRoot, r, pnlX, ws, y);
+      out[0] += y[0] * tLeg[ix] * wLeg[ix] * wLeg[jx];
+      out[1] += y[1] * tLeg[ix] * wLeg[ix] * wLeg[jx];
+    }
+  }
+  out[0] *= 2.0 * pnlX->area;
+  out[1] *= 2.0 * pnlX->area;
+}
+
+typedef struct {
+  ssystem *sys;
+  panel **panels;
+  const double *sgm;
+  int begin;
+  int end;
+  double sum;
+} PanelEnergyTask;
+
+static int energyThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_ENERGY_THREADS");
+  long hc;
+  int threads;
+
+  if (env != NULL && env[0] != '\0') {
+    threads = atoi(env);
+  } else {
+    hc = sysconf(_SC_NPROCESSORS_ONLN);
+    threads = (hc > 0) ? (int)hc : 1;
+  }
+  if (threads < 1) {
+    threads = 1;
+  }
+  if (threads > nTasks) {
+    threads = nTasks;
+  }
+  if (threads > 128) {
+    threads = 128;
+  }
+  return threads;
+}
+
+static panel **panelEnergyArray(ssystem *sys, int *owned) {
+  panel **panels;
+  panel *pnl;
   int i;
 
-  buildTreecodeMoments(sys, sgm);
-  *pot0 = 0.;
-  *pot1 = 0.;
-  for (i=0; i<sys->nChar; i++) {
-    double chargePot0 = 0., chargePot1 = 0.;
-    TreecodeComponents(sys, Topcb, &sys->pos[3*i], sgm,
-                       &chargePot0, &chargePot1);
-    *pot0 += sys->chr[i]*chargePot0;
-    *pot1 += sys->chr[i]*chargePot1;
+  *owned = 0;
+  if (sys->panelByIdx != NULL) {
+    return sys->panelByIdx;
+  }
+
+  CALLOC(panels, sys->nPnls, panel*);
+  for (i = 0, pnl = sys->pnlLst; pnl != NULL && i < sys->nPnls; pnl = pnl->nextC, i++) {
+    panels[i] = pnl;
+  }
+  ASSERT(i == sys->nPnls);
+  *owned = 1;
+  return panels;
+}
+
+static void *panelEnergyWorker(void *arg) {
+  PanelEnergyTask *task = (PanelEnergyTask *)arg;
+  ssystem *sys = task->sys;
+  RhsTreeWorkspace ws;
+  double local = 0.0;
+  double intgr[2];
+  int i;
+
+  initRhsTreeWorkspace(sys, &ws);
+  for (i = task->begin; i < task->end; i++) {
+    panel *pnl = task->panels[i];
+    panelEnergyTree(sys, sys->maxQuadOrder, pnl, sys->chgCubeList[0], &ws, intgr);
+    local += intgr[0] * task->sgm[pnl->idx + sys->nPnls] +
+             intgr[1] * task->sgm[pnl->idx];
+  }
+  freeRhsTreeWorkspace(&ws);
+  task->sum = local;
+  return NULL;
+}
+
+void applyPanelChargeTreeEnergy( ssystem *sys, double *sgm, double *pot ) {
+  int ownPanels = 0;
+  int nThreads, t, created = 0, failed = 0;
+  panel **panels;
+  PanelEnergyTask *tasks;
+  pthread_t *threads;
+
+  ASSERT(sys->chgCubeList != NULL && sys->chgCubeList[0] != NULL);
+
+  *pot = 0.0;
+  if (sys->nPnls <= 0) {
+    return;
+  }
+
+  panels = panelEnergyArray(sys, &ownPanels);
+  nThreads = energyThreadCount(sys->nPnls);
+  if (sys->benchmarkMode > 0) {
+    printf("panel-tree energy evaluator: threads=%d panels=%d theta=%g\n",
+           nThreads, sys->nPnls, energyTreeTheta());
+  }
+
+  CALLOC(tasks, nThreads, PanelEnergyTask);
+  CALLOC(threads, nThreads, pthread_t);
+  for (t = 0; t < nThreads; t++) {
+    int begin = (int)(((long long)sys->nPnls * t) / nThreads);
+    int end = (int)(((long long)sys->nPnls * (t + 1)) / nThreads);
+    tasks[t].sys = sys;
+    tasks[t].panels = panels;
+    tasks[t].sgm = sgm;
+    tasks[t].begin = begin;
+    tasks[t].end = end;
+  }
+
+  if (nThreads == 1) {
+    panelEnergyWorker(&tasks[0]);
+    created = 1;
+  } else {
+    for (t = 0; t < nThreads; t++) {
+      if (pthread_create(&threads[t], NULL, panelEnergyWorker, &tasks[t]) != 0) {
+        failed = 1;
+        break;
+      }
+      created++;
+    }
+    for (t = 0; t < created; t++) {
+      pthread_join(threads[t], NULL);
+    }
+    if (failed) {
+      fprintf(stderr,
+              "Warning: pthread_create failed for panel-tree energy; recomputing serially\n");
+      tasks[0].begin = 0;
+      tasks[0].end = sys->nPnls;
+      panelEnergyWorker(&tasks[0]);
+      created = 1;
+    }
+  }
+
+  for (t = 0; t < created; t++) {
+    *pot += tasks[t].sum;
+  }
+
+  free(threads);
+  free(tasks);
+  if (ownPanels) {
+    free(panels);
   }
 }
 
@@ -513,8 +838,7 @@ void rhsTreeWalk(ssystem *sys, cube *chgCb, double *quadPt, panel *pnlX, double 
    * A particle(single target point)-cluster evaluation needs a
    * tighter admissibility ratio than panel-panel M2L: at
    * sys->maxSepRatio (0.8, tuned for applyFMM()'s panel-cluster to
-   * panel-cluster interactions), a debug compare against the direct
-   * RHS loop (FABIPB_DEBUG_COMPARE_RHS=1) showed unacceptable relative
+   * panel-cluster interactions), direct-reference sweeps showed unacceptable
    * error at the FMM separation ratio. With the charge tree's minimum
    * fourth-order expansion, 0.2 keeps both RHS components below 0.1%
    * relative L2 error on the scale-1 1a63 reference while preserving

@@ -272,11 +272,6 @@ static int useGeometricPanelNormals(void) {
          (strcmp(env, "geometric") == 0 || strcmp(env, "face") == 0);
 }
 
-static int debugPanelNormalStats(void) {
-  const char *env = getenv("FABIPB_DEBUG_PANEL_NORMALS");
-  return env != NULL && strcmp(env, "1") == 0;
-}
-
 static int computeGeometricNormal(const double *v0, const double *v1,
                                   const double *v2, double *normal) {
   double e1[3], e2[3], len;
@@ -303,6 +298,25 @@ static int computeGeometricNormal(const double *v0, const double *v1,
  * loadpanel returns a list of panel structs derived from passed data:
  * shape, vertices, and type.
  */
+/*
+ * Skips one line of a mesh file.
+ *
+ * getc() returns int, and the previous "while ((c = getc(fp)) != '\n')" stored
+ * it in a char: the EOF sentinel (-1) then never compares equal to '\n', so a
+ * truncated, empty, or header-only mesh file spun here forever with no output
+ * and no error. Returns 0 at end of file so the caller can report it.
+ */
+static int skipMeshLine(FILE *fp) {
+  int ch;
+
+  while ((ch = getc(fp)) != '\n') {
+    if (ch == EOF) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *sys,
                  const char *meshControlName, double meshControlValue,
                  const char *backendParamName, double backendParamValue) {
@@ -324,22 +338,7 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
 
   double *nrm, len;
   int useGeomNormals = useGeometricPanelNormals();
-  int normalStats = debugPanelNormalStats();
-  double normalDotMin = 1.0, normalDotSum = 0.0;
-  int normalDotCount = 0, normalFlipped = 0;
-  int normalDotLt50 = 0, normalDotLt70 = 0, normalDotLt90 = 0, normalDotLt99 = 0;
-  double normalAreaLt50 = 0.0, normalAreaLt70 = 0.0, normalAreaLt90 = 0.0, normalAreaLt99 = 0.0;
-  double worstDot[8], worstArea[8], worstCentroid[8][3];
-  int worstPanel[8];
-
-  for (i = 0; i < 8; i++) {
-    worstDot[i] = 2.0;
-    worstArea[i] = 0.0;
-    worstPanel[i] = -1;
-    for (j = 0; j < 3; j++) {
-      worstCentroid[i][j] = 0.0;
-    }
-  }
+  int degenerateNormals = 0;
 
   /* read in vertices */
   sys->nChar = 0;
@@ -555,15 +554,35 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
 
   /* open the file and read through the first two rows */
   for ( i=1; i<=2; i++ ) {
-    while ( (c=getc(fp))!='\n' ){
-   }
+    if (!skipMeshLine(fp)) {
+      fprintf(stderr, "Error: '%s' ended inside its 2-line header\n", fname);
+      exit(1);
+    }
   }
 
+  /* nspt is read from the file; leaving it uninitialized on a malformed header
+   * used to feed an indeterminate count straight into CALLOC below and then
+   * write out of bounds in the read loop. */
+  nspt = 0;
   if ( mesh_flag != 2 ) {
     ierr=fscanf(fp,"%d %d %lf %lf ",&nspt,&natm,&den,&prob_rds);
     //printf("nspt=%d, natm=%d, den=%lf, prob=%lf\n", nspt,natm,den,prob_rds);
+    if (ierr != 4) {
+      fprintf(stderr, "Error: malformed vertex header in '%s' (read %d of 4 fields)\n",
+              fname, ierr < 0 ? 0 : ierr);
+      exit(1);
+    }
   } else if ( mesh_flag == 2 ) {
     ierr = fscanf(fp, "%d", &nspt);
+    if (ierr != 1) {
+      fprintf(stderr, "Error: malformed vertex header in '%s' (expected a vertex count)\n",
+              fname);
+      exit(1);
+    }
+  }
+  if (nspt <= 0) {
+    fprintf(stderr, "Error: '%s' declares %d vertices\n", fname, nspt);
+    exit(1);
   }
 
   /*allocate variables for vertices file*/
@@ -576,6 +595,13 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
 
   for ( i=0; i<=nspt-1; i++ ) {
     ierr=fscanf(fp,"%lf %lf %lf %lf %lf %lf %d %d %d",&a1,&a2,&a3,&b1,&b2,&b3,&i1,&i2,&i3);
+    /* Only the first six fields are used, so accept formats that carry fewer
+     * trailing columns; anything short of six means the file is truncated and
+     * the remaining vertices would silently keep the previous values. */
+    if (ierr < 6) {
+      fprintf(stderr, "Error: '%s' truncated at vertex %d of %d\n", fname, i + 1, nspt);
+      exit(1);
+    }
 
     sptpos[0][i]=a1;
     sptpos[1][i]=a2;
@@ -593,13 +619,33 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
     fprintf(stderr, "Error: cannot open faces file '%s'\n", fname);
     exit(1);
   }
-  for ( i=1; i<=2; i++ ) { while ((c=getc(fp))!='\n'){} }
+  for ( i=1; i<=2; i++ ) {
+    if (!skipMeshLine(fp)) {
+      fprintf(stderr, "Error: '%s' ended inside its 2-line header\n", fname);
+      exit(1);
+    }
+  }
 
+  nface = 0;
   if ( mesh_flag != 2 ) {
     ierr=fscanf(fp,"%d %d %lf %lf ",&nface,&natm,&den,&prob_rds);
   //printf("nface=%d, natm=%d, den=%lf, prob=%lf\n", nface,natm,den,prob_rds);
+    if (ierr != 4) {
+      fprintf(stderr, "Error: malformed face header in '%s' (read %d of 4 fields)\n",
+              fname, ierr < 0 ? 0 : ierr);
+      exit(1);
+    }
   } else if ( mesh_flag == 2 ) {
     ierr = fscanf(fp, "%d", &nface);
+    if (ierr != 1) {
+      fprintf(stderr, "Error: malformed face header in '%s' (expected a face count)\n",
+              fname);
+      exit(1);
+    }
+  }
+  if (nface <= 0) {
+    fprintf(stderr, "Error: '%s' declares %d faces\n", fname, nface);
+    exit(1);
   }
 
   printf("Mesh raw counts: vertices=%d faces=%d\n", nspt, nface);
@@ -609,6 +655,21 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
 
   for ( i=0; i<=nface-1; i++ ) {
     ierr=fscanf(fp,"%d %d %d %d %d",&j1,&j2,&j3,&i1,&i2);
+    /* Only the three vertex indices are used; see the vertex loop above. */
+    if (ierr < 3) {
+      fprintf(stderr, "Error: '%s' truncated at face %d of %d\n", fname, i + 1, nface);
+      exit(1);
+    }
+    /* Indices are 1-based and are dereferenced later as sptpos[k][idx-1]. An
+     * out-of-range index used to read arbitrary heap memory into the panel
+     * vertices and normals, and the solve would run on to a plausible-looking
+     * but wrong energy. */
+    if (j1 < 1 || j1 > nspt || j2 < 1 || j2 > nspt || j3 < 1 || j3 > nspt) {
+      fprintf(stderr,
+              "Error: '%s' face %d references vertex (%d, %d, %d) outside 1..%d\n",
+              fname, i + 1, j1, j2, j3, nspt);
+      exit(1);
+    }
     nvert[3*i]=j1;
     nvert[3*i+1]=j2;
     nvert[3*i+2]=j3;
@@ -686,59 +747,6 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
       }
 
       nrm = pnl->normal;
-      if (normalStats) {
-        double vertexNormal[3], geomNormal[3], dot;
-        vertexNormal[0] = pnl->nrm[0][0]/2. + (pnl->nrm[1][0] + pnl->nrm[2][0])/4.;
-        vertexNormal[1] = pnl->nrm[0][1]/2. + (pnl->nrm[1][1] + pnl->nrm[2][1])/4.;
-        vertexNormal[2] = pnl->nrm[0][2]/2. + (pnl->nrm[1][2] + pnl->nrm[2][2])/4.;
-        len = sqrt(SQR(vertexNormal[0]) + SQR(vertexNormal[1]) + SQR(vertexNormal[2]));
-        if (len > 0.0) {
-          for (j = 0; j < 3; j++) vertexNormal[j] /= len;
-        }
-        if (computeGeometricNormal(pnl->vtx[0], pnl->vtx[1], pnl->vtx[2], geomNormal)) {
-          dot = geomNormal[0]*vertexNormal[0] + geomNormal[1]*vertexNormal[1] + geomNormal[2]*vertexNormal[2];
-          if (dot < 0.0) dot = -dot;
-          if (dot < normalDotMin) normalDotMin = dot;
-          normalDotSum += dot;
-          normalDotCount++;
-          if (dot < 0.50) {
-            normalDotLt50++;
-            normalAreaLt50 += area_local;
-          }
-          if (dot < 0.70) {
-            normalDotLt70++;
-            normalAreaLt70 += area_local;
-          }
-          if (dot < 0.90) {
-            normalDotLt90++;
-            normalAreaLt90 += area_local;
-          }
-          if (dot < 0.99) {
-            normalDotLt99++;
-            normalAreaLt99 += area_local;
-          }
-          for (k = 0; k < 8; k++) {
-            if (dot < worstDot[k]) {
-              int m;
-              for (m = 7; m > k; m--) {
-                worstDot[m] = worstDot[m-1];
-                worstArea[m] = worstArea[m-1];
-                worstPanel[m] = worstPanel[m-1];
-                worstCentroid[m][0] = worstCentroid[m-1][0];
-                worstCentroid[m][1] = worstCentroid[m-1][1];
-                worstCentroid[m][2] = worstCentroid[m-1][2];
-              }
-              worstDot[k] = dot;
-              worstArea[k] = area_local;
-              worstPanel[k] = *numSing;
-              worstCentroid[k][0] = xx[0];
-              worstCentroid[k][1] = xx[1];
-              worstCentroid[k][2] = xx[2];
-              break;
-            }
-          }
-        }
-      }
       if (useGeomNormals) {
         double vertexNormal[3], geomNormal[3], dot;
         vertexNormal[0] = pnl->nrm[0][0]/2. + (pnl->nrm[1][0] + pnl->nrm[2][0])/4.;
@@ -755,7 +763,6 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
         if (dot < 0.0) {
           for (j = 0; j < 3; j++) geomNormal[j] = -geomNormal[j];
           dot = -dot;
-          normalFlipped++;
         }
         for (j = 0; j < 3; j++) nrm[j] = geomNormal[j];
       } else {
@@ -763,7 +770,20 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
         nrm[1] = pnl->nrm[0][1]/2. + (pnl->nrm[1][1] + pnl->nrm[2][1])/4.;
         nrm[2] = pnl->nrm[0][2]/2. + (pnl->nrm[1][2] + pnl->nrm[2][2])/4.;
         len = sqrt(SQR(nrm[0]) + SQR(nrm[1]) + SQR(nrm[2]));
-        for ( j=0; j<3; j++ ) nrm[j] /= len;
+        /* The three vertex normals can cancel on a pinched or duplicated-vertex
+         * SES patch, leaving len == 0. Dividing then gives NaN normals that
+         * propagate silently through panelIA0 into the whole operator and RHS,
+         * and the run ends with "solvation energy: nan" and no hint of the
+         * cause. The panel already passed the area >= 1e-5 filter, so its
+         * geometric face normal is well defined; fall back to that. */
+        if (len > 0.0) {
+          for ( j=0; j<3; j++ ) nrm[j] /= len;
+        } else if (computeGeometricNormal(pnl->vtx[0], pnl->vtx[1], pnl->vtx[2], nrm)) {
+          degenerateNormals++;
+        } else {
+          nrm[0] = 0.0; nrm[1] = 0.0; nrm[2] = 1.0;
+          degenerateNormals++;
+        }
       }
 
       pnl->shape = 3;
@@ -774,25 +794,14 @@ panel *loadPanel(char *panelfile, const char *meshParam, int *numSing, ssystem *
   }
 
   printf("Mesh filtered panels: kept=%d area=%f\n", *numSing, s_area);
-  if (useGeomNormals || normalStats) {
-    printf("Panel normal convention: %s\n",
-           useGeomNormals ? "geometric-face aligned to vertex-normal orientation" :
-                            "weighted vertex normals");
+  if (useGeomNormals) {
+    printf("Panel normal convention: geometric-face aligned to vertex-normal orientation\n");
   }
-  if (normalStats && normalDotCount > 0) {
-    printf("Panel normal diagnostic: geom-vs-vertex dot min=%e mean=%e flipped=%d count=%d\n",
-           normalDotMin, normalDotSum/(double)normalDotCount, normalFlipped, normalDotCount);
-    printf("Panel normal diagnostic thresholds: dot<0.50 count=%d area=%e dot<0.70 count=%d area=%e dot<0.90 count=%d area=%e dot<0.99 count=%d area=%e\n",
-           normalDotLt50, normalAreaLt50,
-           normalDotLt70, normalAreaLt70,
-           normalDotLt90, normalAreaLt90,
-           normalDotLt99, normalAreaLt99);
-    printf("Panel normal diagnostic worst panels:\n");
-    for (i = 0; i < 8 && worstPanel[i] >= 0; i++) {
-      printf("  rank=%d panel=%d dot=%e area=%e centroid=(%e,%e,%e)\n",
-             i, worstPanel[i], worstDot[i], worstArea[i],
-             worstCentroid[i][0], worstCentroid[i][1], worstCentroid[i][2]);
-    }
+  if (degenerateNormals > 0) {
+    fprintf(stderr,
+            "Warning: %d panel(s) had cancelling vertex normals; used the geometric "
+            "face normal instead (mesh may have pinched or duplicated vertices)\n",
+            degenerateNormals);
   }
   //printf("%d ugly faces are deleted\n", nface-*numSing);
 

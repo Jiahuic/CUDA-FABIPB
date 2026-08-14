@@ -118,255 +118,6 @@ static int useGpuPrecondDisjoint(const ssystem *sys) {
           !(env != NULL && atoi(env) == 0));
 }
 
-static int precondDebugEnabled(void) {
-  static int initialized = 0;
-  static int enabled = 0;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG");
-    enabled = (env != NULL && atoi(env) != 0);
-    initialized = 1;
-  }
-  return enabled;
-}
-
-static int precondDebugLimit(void) {
-  static int initialized = 0;
-  static int limit = 8;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG_LIMIT");
-    if (env != NULL && atoi(env) > 0) {
-      limit = atoi(env);
-    }
-    initialized = 1;
-  }
-  return limit;
-}
-
-static int precondDebugTargetBlock(void) {
-  static int initialized = 0;
-  static int target = -1;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG_BLOCK");
-    if (env != NULL) {
-      target = atoi(env);
-    }
-    initialized = 1;
-  }
-  return target;
-}
-
-static int precondDebugBlockEnabled(int idx) {
-  if (!precondDebugEnabled()) {
-    return 0;
-  }
-  return idx < precondDebugLimit() || idx == precondDebugTargetBlock();
-}
-
-static int precondFirstApplyDebugEnabled(void) {
-  static int initialized = 0;
-  static int enabled = 0;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG_FIRST_APPLY");
-    enabled = (env != NULL && atoi(env) != 0);
-    initialized = 1;
-  }
-  return enabled;
-}
-
-static void printVectorPreview(const char *tag, int idx, const double *x, int n) {
-  int i;
-  int limit = (n < 6) ? n : 6;
-
-  printf("PRECOND vec %s: block=%d n=%d", tag, idx, n);
-  for (i = 0; i < limit; i++) {
-    printf(" x[%d]=%e", i, x[i]);
-  }
-  printf("\n");
-}
-
-static double vecInfNorm(const double *x, int n) {
-  int i;
-  double vmax = 0.0;
-
-  for (i = 0; i < n; i++) {
-    double ax = fabs(x[i]);
-    if (ax > vmax) {
-      vmax = ax;
-    }
-  }
-  return vmax;
-}
-
-static void printMatrixDiagnostics(const char *tag, int idx, int Msize, const double *amat) {
-  int i, j;
-  int maxRow = 0;
-  int maxCol = 0;
-  double diagMin = 0.0;
-  double diagMax = 0.0;
-  double rowSumInf = 0.0;
-  double maxAbs = 0.0;
-  double trace = 0.0;
-
-  for (i = 0; i < Msize; i++) {
-    double rowSum = 0.0;
-    double di = fabs(amat[i * Msize + i]);
-    if (i == 0 || di < diagMin) {
-      diagMin = di;
-    }
-    if (di > diagMax) {
-      diagMax = di;
-    }
-    trace += amat[i * Msize + i];
-    for (j = 0; j < Msize; j++) {
-      double aij = fabs(amat[i * Msize + j]);
-      rowSum += aij;
-      if (aij > maxAbs) {
-        maxAbs = aij;
-        maxRow = i;
-        maxCol = j;
-      }
-    }
-    if (rowSum > rowSumInf) {
-      rowSumInf = rowSum;
-    }
-  }
-
-  printf("PRECOND matrix %s: block=%d size=%d row_sum_inf=%e diag_abs_min=%e diag_abs_max=%e max_abs=%e max_pos=(%d,%d) trace=%e\n",
-         tag, idx, Msize, rowSumInf, diagMin, diagMax, maxAbs, maxRow, maxCol, trace);
-}
-
-static void printMatrixSvdDiagnostics(const char *tag, int idx, int Msize, const double *amat) {
-  char jobz = 'N';
-  int m = Msize;
-  int n = Msize;
-  int lda = Msize;
-  int ldu = 1;
-  int ldvt = 1;
-  int info = 0;
-  int lwork = -1;
-  int minmn = Msize;
-  int *iwork;
-  double wkopt = 0.0;
-  double *acopy;
-  double *s;
-  double *u_dummy;
-  double *vt_dummy;
-  double *work;
-  double sigmaMax;
-  double sigmaMin;
-  double condEst;
-
-  acopy = (double *)malloc((size_t)Msize * (size_t)Msize * sizeof(double));
-  s = (double *)malloc((size_t)minmn * sizeof(double));
-  iwork = (int *)malloc((size_t)(8 * minmn) * sizeof(int));
-  u_dummy = (double *)malloc(sizeof(double));
-  vt_dummy = (double *)malloc(sizeof(double));
-  if (acopy == NULL || s == NULL || iwork == NULL || u_dummy == NULL || vt_dummy == NULL) {
-    free(acopy);
-    free(s);
-    free(iwork);
-    free(u_dummy);
-    free(vt_dummy);
-    return;
-  }
-  memcpy(acopy, amat, (size_t)Msize * (size_t)Msize * sizeof(double));
-  dgesdd_(&jobz, &m, &n, acopy, &lda, s, u_dummy, &ldu, vt_dummy, &ldvt, &wkopt, &lwork, iwork, &info);
-  if (info != 0) {
-    printf("PRECOND svd %s: block=%d size=%d info=%d\n", tag, idx, Msize, info);
-    free(acopy);
-    free(s);
-    free(iwork);
-    free(u_dummy);
-    free(vt_dummy);
-    return;
-  }
-  lwork = (int)wkopt;
-  if (lwork < 1) {
-    lwork = 1;
-  }
-  work = (double *)malloc((size_t)lwork * sizeof(double));
-  if (work == NULL) {
-    free(acopy);
-    free(s);
-    free(iwork);
-    free(u_dummy);
-    free(vt_dummy);
-    return;
-  }
-  memcpy(acopy, amat, (size_t)Msize * (size_t)Msize * sizeof(double));
-  dgesdd_(&jobz, &m, &n, acopy, &lda, s, u_dummy, &ldu, vt_dummy, &ldvt, work, &lwork, iwork, &info);
-  if (info != 0) {
-    printf("PRECOND svd %s: block=%d size=%d info=%d\n", tag, idx, Msize, info);
-  } else {
-    sigmaMax = s[0];
-    sigmaMin = s[minmn - 1];
-    condEst = (sigmaMin > 0.0) ? (sigmaMax / sigmaMin) : INFINITY;
-    printf("PRECOND svd %s: block=%d size=%d sigma_max=%e sigma_min=%e cond2_est=%e\n",
-           tag, idx, Msize, sigmaMax, sigmaMin, condEst);
-  }
-  free(work);
-  free(acopy);
-  free(s);
-  free(iwork);
-  free(u_dummy);
-  free(vt_dummy);
-}
-
-static void printLuDiagnostics(const char *tag, int idx, int Msize, const double *lu, const int *ipiv, int info) {
-  int i;
-  int pivSwaps = 0;
-  double udiagMin = 0.0;
-  double udiagMax = 0.0;
-
-  for (i = 0; i < Msize; i++) {
-    double du = fabs(lu[i * Msize + i]);
-    if (i == 0 || du < udiagMin) {
-      udiagMin = du;
-    }
-    if (du > udiagMax) {
-      udiagMax = du;
-    }
-    if (ipiv != NULL && ipiv[i] != i + 1) {
-      pivSwaps++;
-    }
-  }
-
-  printf("PRECOND LU %s: block=%d size=%d info=%d udiag_min=%e udiag_max=%e piv_swaps=%d\n",
-         tag, idx, Msize, info, udiagMin, udiagMax, pivSwaps);
-}
-
-static void printSolveDiagnostics(const char *tag, int idx, int Msize, const double *amat, const double *rhsOrig, const double *sol) {
-  int i, j;
-  double rhsInf = vecInfNorm(rhsOrig, Msize);
-  double solInf = vecInfNorm(sol, Msize);
-  double residInf = 0.0;
-
-  for (i = 0; i < Msize; i++) {
-    double ax = 0.0;
-    for (j = 0; j < Msize; j++) {
-      ax += amat[i * Msize + j] * sol[j];
-    }
-    {
-      double ri = fabs(ax - rhsOrig[i]);
-      if (ri > residInf) {
-        residInf = ri;
-      }
-    }
-  }
-
-  printf("PRECOND solve %s: block=%d size=%d rhs_inf=%e sol_inf=%e resid_inf=%e rel_resid_inf=%e\n",
-         tag, idx, Msize, rhsInf, solInf, residInf,
-         residInf / ((rhsInf > 0.0) ? rhsInf : 1.0));
-}
-
 static void *precondSetupWorker(void *arg) {
   PrecondSetupTask *task = (PrecondSetupTask *)arg;
   int idx;
@@ -459,15 +210,8 @@ static void *precondSetupWorker(void *arg) {
 
     if (task->buildLU) {
       int info;
-      if (precondDebugBlockEnabled(idx)) {
-        printMatrixDiagnostics("setup-cached-lu-raw", idx, Msize, pcBlocks[idx]);
-        printMatrixSvdDiagnostics("setup-cached-lu-raw", idx, Msize, pcBlocks[idx]);
-      }
       memcpy(pcLUBlocks[idx], pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
       dgetrf_(&Msize, &Msize, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], &info);
-      if (precondDebugBlockEnabled(idx)) {
-        printLuDiagnostics("setup-cached-lu", idx, Msize, pcLUBlocks[idx], pcIpivBlocks[idx], info);
-      }
       if (info != 0) {
         fprintf(stderr, "Error: dgetrf failed in cached LU setup for leaf %d (info=%d)\n",
                 idx, info);
@@ -563,7 +307,24 @@ void setupPreconditioning(ssystem *sys) {
 
   nPrecondBlocks = idx;
   maxnPnls *= 2;
-  CALLOC_FULL(matrixA, maxnPnls * maxnPnls, double, OFF, ASOLVER);
+  /*
+   * The dense block is indexed as pcBlocks[idx][i*Msize+j] with int arithmetic
+   * throughout, so a leaf holding more than 2^31/2 panels per side wraps the
+   * index negative and writes outside the block. That needs ~23k panels in one
+   * leaf cube, which only happens when a very large mesh is run on a shallow
+   * tree (the 41M-panel production run peaked at 105 per leaf). Catch it here
+   * with an actionable message rather than corrupting the heap.
+   */
+  if (maxnPnls > 46340) {
+    fprintf(stderr,
+            "Error: preconditioner leaf block is %d x %d, too large to index with "
+            "32-bit arithmetic.\n"
+            "       The tree is too shallow for this mesh: increase -t (current depth %d) "
+            "or use -P=3 (diagonal preconditioner).\n",
+            maxnPnls, maxnPnls, sys->depth);
+    exit(1);
+  }
+  CALLOC_FULL(matrixA, (size_t)maxnPnls * (size_t)maxnPnls, double, OFF, ASOLVER);
   CALLOC_FULL(ipiv, maxnPnls, int, OFF, ASOLVER);
   CALLOC_FULL(rhs, maxnPnls, double, OFF, ASOLVER);
   if ((sys->precondCacheMode > 0 && sys->precondCacheMode != 3) ||
@@ -584,9 +345,9 @@ void setupPreconditioning(ssystem *sys) {
 
       precondCubes[idx] = cb;
       pcBlockSize[idx] = Msize;
-      CALLOC_FULL(pcBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
+      CALLOC_FULL(pcBlocks[idx], (size_t)Msize * (size_t)Msize, double, OFF, ASOLVER);
       if (pcLUBlocks != NULL) {
-        CALLOC_FULL(pcLUBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
+        CALLOC_FULL(pcLUBlocks[idx], (size_t)Msize * (size_t)Msize, double, OFF, ASOLVER);
         CALLOC_FULL(pcIpivBlocks[idx], Msize, int, OFF, ASOLVER);
       }
     }
@@ -609,8 +370,8 @@ void setupPreconditioning(ssystem *sys) {
       for (idx = 0; idx < nThreads; idx++) {
         tasks[idx].sys = sys;
         tasks[idx].cubes = precondCubes;
-        tasks[idx].begin = (nPrecondBlocks * idx) / nThreads;
-        tasks[idx].end = (nPrecondBlocks * (idx + 1)) / nThreads;
+        tasks[idx].begin = (int)(((long long)nPrecondBlocks * idx) / nThreads);
+        tasks[idx].end = (int)(((long long)nPrecondBlocks * (idx + 1)) / nThreads);
         tasks[idx].scale1 = scale1;
         tasks[idx].scale2 = scale2;
         tasks[idx].buildLU = (pcLUBlocks != NULL);
@@ -671,12 +432,8 @@ int PtVfmm(double *pot, double *sgm) {
   scale2 = (1.0+1.0/epsilon)/2.0;
 
   for ( idx=0, cb=sys->cubeList[nlevel]; cb != NULL; cb=cb->next ) {
-    double *debugA = NULL;
-    double *debugRhs = NULL;
-    int debugThisBlock;
     Msize = 2*cb->nPnls;
     HMsize = cb->nPnls;
-    debugThisBlock = precondDebugBlockEnabled(idx);
 
     t0 = wall_seconds_pc();
     for ( i=0, pnlY=cb->pnls; i<HMsize; i++, pnlY=pnlY->nextC ) {
@@ -694,27 +451,25 @@ int PtVfmm(double *pot, double *sgm) {
       rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
     }
     pcAssembleTime += wall_seconds_pc() - t0;
-    if (debugThisBlock) {
-      debugA = (double *)malloc((size_t)Msize * (size_t)Msize * sizeof(double));
-      debugRhs = (double *)malloc((size_t)Msize * sizeof(double));
-      ASSERT(debugA != NULL);
-      ASSERT(debugRhs != NULL);
-      memcpy(debugA, matrixA, (size_t)Msize * (size_t)Msize * sizeof(double));
-      memcpy(debugRhs, rhs, (size_t)Msize * sizeof(double));
-    }
 
     t0 = wall_seconds_pc();
+    /* inc doubles as the LAPACK INFO out-parameter here and was never
+     * inspected: a singular leaf block left a zero pivot in U, and the dgetrs
+     * below then divided by it, seeding inf/NaN into the preconditioned vector
+     * and silently poisoning the Krylov basis. PtVfmmCachedLU already checks. */
     dgetrf_( &Msize, &Msize, matrixA, &Msize, ipiv, &inc );
-    if (debugThisBlock) {
-      printLuDiagnostics("apply-original", idx, Msize, matrixA, ipiv, inc);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrf failed in preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcFactorTime += wall_seconds_pc() - t0;
     t0 = wall_seconds_pc();
     dgetrs_( &nChr, &Msize, &oneI, matrixA, &Msize, ipiv, rhs, &Msize, &inc );
-    if (debugThisBlock) {
-      printSolveDiagnostics("apply-original", idx, Msize, debugA, debugRhs, rhs);
-      free(debugA);
-      free(debugRhs);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrs failed in preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcSolveTime += wall_seconds_pc() - t0;
 
@@ -750,11 +505,8 @@ int PtVfmmCached(double *pot, double *sgm) {
   ASSERT(pcBlockSize != NULL);
 
   for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
-    double *debugRhs = NULL;
-    int debugThisBlock;
     Msize = pcBlockSize[idx];
     HMsize = cb->nPnls;
-    debugThisBlock = precondDebugBlockEnabled(idx);
 
     t0 = wall_seconds_pc();
     memcpy(matrixA, pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
@@ -763,23 +515,21 @@ int PtVfmmCached(double *pot, double *sgm) {
       rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
     }
     pcAssembleTime += wall_seconds_pc() - t0;
-    if (debugThisBlock) {
-      debugRhs = (double *)malloc((size_t)Msize * sizeof(double));
-      ASSERT(debugRhs != NULL);
-      memcpy(debugRhs, rhs, (size_t)Msize * sizeof(double));
-    }
 
     t0 = wall_seconds_pc();
     dgetrf_(&Msize, &Msize, matrixA, &Msize, ipiv, &inc);
-    if (debugThisBlock) {
-      printLuDiagnostics("apply-cached", idx, Msize, matrixA, ipiv, inc);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrf failed in cached preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcFactorTime += wall_seconds_pc() - t0;
     t0 = wall_seconds_pc();
     dgetrs_(&nChr, &Msize, &oneI, matrixA, &Msize, ipiv, rhs, &Msize, &inc);
-    if (debugThisBlock) {
-      printSolveDiagnostics("apply-cached", idx, Msize, pcBlocks[idx], debugRhs, rhs);
-      free(debugRhs);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrs failed in cached preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcSolveTime += wall_seconds_pc() - t0;
 
@@ -798,13 +548,8 @@ int PtVfmmCached(double *pot, double *sgm) {
 }
 
 int PtVfmmCachedLU(double *pot, double *sgm) {
-  static int firstApplyLogged = 0;
   int i, idx, Msize, HMsize, info;
   int nPnls = sys->nPnls;
-  int debugFirstApply = precondFirstApplyDebugEnabled() && !firstApplyLogged;
-  int firstApplyMaxBlock = -1;
-  int firstApplyMaxLocal = -1;
-  double firstApplyMaxAbs = 0.0;
   cube *cb;
   double t0;
 
@@ -830,8 +575,8 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       for (idx = 0; idx < nThreads; idx++) {
         int maxRhs = 2 * pcBlockSizeMax;
         tasks[idx].cubes = applyCubes;
-        tasks[idx].begin = (nPrecondBlocks * idx) / nThreads;
-        tasks[idx].end = (nPrecondBlocks * (idx + 1)) / nThreads;
+        tasks[idx].begin = (int)(((long long)nPrecondBlocks * idx) / nThreads);
+        tasks[idx].end = (int)(((long long)nPrecondBlocks * (idx + 1)) / nThreads);
         tasks[idx].nPnls = nPnls;
         tasks[idx].sgm = sgm;
         tasks[idx].pot = pot;
@@ -863,11 +608,8 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
   }
 
   for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
-    double *debugRhs = NULL;
-    int debugThisBlock;
     Msize = pcBlockSize[idx];
     HMsize = cb->nPnls;
-    debugThisBlock = precondDebugBlockEnabled(idx);
 
     t0 = wall_seconds_pc();
     for (i = 0; i < HMsize; i++) {
@@ -875,48 +617,9 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
     }
     pcAssembleTime += wall_seconds_pc() - t0;
-    if (debugThisBlock || (debugFirstApply && idx < precondDebugLimit())) {
-      debugRhs = (double *)malloc((size_t)Msize * sizeof(double));
-      ASSERT(debugRhs != NULL);
-      memcpy(debugRhs, rhs, (size_t)Msize * sizeof(double));
-    }
-    if (debugThisBlock) {
-      printLuDiagnostics("apply-cached-lu", idx, Msize, pcLUBlocks[idx], pcIpivBlocks[idx], 0);
-    }
 
     t0 = wall_seconds_pc();
     dgetrs_(&nChr, &Msize, &oneI, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], rhs, &Msize, &info);
-    if (debugThisBlock) {
-      printSolveDiagnostics("apply-cached-lu", idx, Msize, pcBlocks[idx], debugRhs, rhs);
-    }
-    if (debugFirstApply) {
-      int localMaxIdx = 0;
-      double localMaxAbs = 0.0;
-      for (i = 0; i < Msize; i++) {
-        double av = fabs(rhs[i]);
-        if (av > localMaxAbs) {
-          localMaxAbs = av;
-          localMaxIdx = i;
-        }
-      }
-      if (idx < precondDebugLimit() && debugRhs != NULL) {
-        printf("PRECOND first-apply block=%d rhs_inf=%e out_inf=%e max_abs=%e local_idx=%d\n",
-               idx, vecInfNorm(debugRhs, Msize), vecInfNorm(rhs, Msize), localMaxAbs, localMaxIdx);
-      }
-      if (localMaxAbs > firstApplyMaxAbs) {
-        if (debugFirstApply) {
-          double rhsInf = (debugRhs != NULL) ? vecInfNorm(debugRhs, Msize) : -1.0;
-          printf("PRECOND first-apply new-max block=%d size=%d rhs_inf=%e out_inf=%e max_abs=%e local_idx=%d\n",
-                 idx, Msize, rhsInf, vecInfNorm(rhs, Msize), localMaxAbs, localMaxIdx);
-        }
-        firstApplyMaxAbs = localMaxAbs;
-        firstApplyMaxBlock = idx;
-        firstApplyMaxLocal = localMaxIdx;
-      }
-    }
-    if (debugRhs != NULL) {
-      free(debugRhs);
-    }
     if (info != 0) {
       fprintf(stderr, "Error: dgetrs failed in cached LU apply for leaf %d (info=%d)\n",
               idx, info);
@@ -933,12 +636,6 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       rhs[i] = 0.0;
     }
     pcScatterTime += wall_seconds_pc() - t0;
-  }
-
-  if (debugFirstApply) {
-    printf("PRECOND first-apply summary: max_block=%d max_local_idx=%d max_abs=%e\n",
-           firstApplyMaxBlock, firstApplyMaxLocal, firstApplyMaxAbs);
-    firstApplyLogged = 1;
   }
 
   return 0;

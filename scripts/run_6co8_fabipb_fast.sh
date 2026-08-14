@@ -19,7 +19,7 @@ fmm_gpu="${FMM_GPU:-1}"
 fmm_q2m="${FMM_Q2M:-0}"
 fmm_qorder="${FMM_QORDER:-1}"
 fmm_preconditioner="${FMM_PRECONDITIONER:-3}"
-restart="${GMRES_RESTART:-20}"
+restart="${GMRES_RESTART:-30}"
 max_iter="${GMRES_MAX_ITER:-100}"
 tolerance="${GMRES_TOLERANCE:-1e-4}"
 initial="${GMRES_INITIAL:-zero}"
@@ -30,10 +30,12 @@ stop_after_gmres="${STOP_AFTER_GMRES:-0}"
 fabipb_timeout="${FABIPB_TIMEOUT:-}"
 live_log="${LIVE_LOG:-1}"
 rhs_threads="${FABIPB_RHS_THREADS:-${FMM_RHS_THREADS:-$(nproc)}}"
+energy_threads="${FABIPB_ENERGY_THREADS:-${FMM_ENERGY_THREADS:-$(nproc)}}"
 rhs_tree_theta="${FABIPB_RHS_TREE_THETA:-${FMM_RHS_TREE_THETA:-0.3}}"
 rhs_sample_stride="${FABIPB_RHS_SAMPLE_STRIDE:-${RHS_SAMPLE_STRIDE:-1000}}"
 m2l_chunk_mib="${FABIPB_GPU_M2L_CHUNK_MIB:-512}"
 nearfield_chunk_mib="${FABIPB_GPU_NEARFIELD_CHUNK_MIB:-512}"
+energy_mode="${FABIPB_ENERGY_MODE:-charge-tree}"
 
 nanoshaper_bin="${FABIPB_NANOSHAPER_BIN:-}"
 if [[ -z "$nanoshaper_bin" ]]; then
@@ -90,10 +92,12 @@ pdie=$pdie
 sdie=$sdie
 force_tree_rhs=1
 rhs_threads=$rhs_threads
+energy_threads=$energy_threads
 rhs_tree_theta=$rhs_tree_theta
 rhs_summary_path=$rhs_summary_path
 rhs_sample_path=$rhs_sample_path
 rhs_sample_stride=$rhs_sample_stride
+energy_mode=$energy_mode
 reuse_mesh=1
 stop_after_rhs=$stop_after_rhs
 stop_after_gmres=$stop_after_gmres
@@ -106,6 +110,7 @@ env_args=(
   FABIPB_REUSE_MESH=1
   FABIPB_FORCE_TREE_RHS=1
   FABIPB_RHS_THREADS="$rhs_threads"
+  FABIPB_ENERGY_THREADS="$energy_threads"
   FABIPB_RHS_TREE_THETA="$rhs_tree_theta"
   FABIPB_RHS_SUMMARY_PATH="$rhs_summary_path"
   FABIPB_RHS_SAMPLE_PATH="$rhs_sample_path"
@@ -113,6 +118,7 @@ env_args=(
   FABIPB_GMRES_INITIAL="$initial"
   FABIPB_GPU_M2L_CHUNK_MIB="$m2l_chunk_mib"
   FABIPB_GPU_NEARFIELD_CHUNK_MIB="$nearfield_chunk_mib"
+  FABIPB_ENERGY_MODE="$energy_mode"
 )
 if [[ "$stop_after_rhs" == "1" ]]; then
   env_args+=(FABIPB_STOP_AFTER_RHS=1)

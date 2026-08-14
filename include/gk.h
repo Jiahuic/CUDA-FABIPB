@@ -117,7 +117,9 @@ typedef struct {
   int maxOrder;
   int derivOrder;
   double *gvals0;
+  double *gvalsk;
   double **dg0;
+  double **dgk;
 } RhsTreeWorkspace;
 
 typedef void (*KernelFn)(double *x, double *y);
