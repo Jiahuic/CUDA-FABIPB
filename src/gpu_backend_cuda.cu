@@ -108,6 +108,14 @@ struct NearfieldGpuCache {
    * occupies [specialOffset[c], specialOffset[c+1]). Chunk boundaries depend
    * only on geometry and chunkCapacity, so they repeat exactly every matvec.
    */
+  /* Whether each chunk staging buffer came from cudaHostAlloc (page-locked)
+   * or plain malloc, so the right free is used. */
+  int h_srcPinned;
+  int h_dstPinned;
+  int h_k0Pinned;
+  int h_k1Pinned;
+  int h_k2Pinned;
+  int h_k3Pinned;
   int specialCacheEnabled;
   int specialCacheValid;
   long long specialCacheChunks;
@@ -379,6 +387,40 @@ __global__ void nearfieldDisjointQ1ApplyKernel(
 /* Bytes held per cached special pair: two indices plus four coefficients. */
 #define NEAR_SPECIAL_CACHE_BYTES_PER_PAIR (2U * sizeof(int) + 4U * sizeof(double))
 
+/*
+ * Page-locked staging allocation, falling back to malloc. Pinned pages cannot
+ * be swapped, so cudaHostAlloc can fail where malloc succeeds; the caller only
+ * loses copy bandwidth, never correctness. *pinned records which was used so
+ * the buffer is released with the matching call.
+ */
+static void *allocNearfieldStagingHost(size_t bytes, int *pinned) {
+  void *p = NULL;
+
+  *pinned = 0;
+  if (bytes == 0U) {
+    return NULL;
+  }
+  if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) == cudaSuccess && p != NULL) {
+    *pinned = 1;
+    return p;
+  }
+  cudaGetLastError();  /* clear the sticky error from the failed attempt */
+  return malloc(bytes);
+}
+
+static void freeNearfieldStagingHost(void *p, int *pinned) {
+  if (p == NULL) {
+    *pinned = 0;
+    return;
+  }
+  if (*pinned) {
+    cudaFreeHost(p);
+  } else {
+    free(p);
+  }
+  *pinned = 0;
+}
+
 static void freeNearfieldSpecialCache(void) {
   delete gNear.specialOffset;
   delete gNear.cacheSrc;
@@ -426,17 +468,19 @@ static size_t nearfieldSpecialCacheBudget(void) {
 void freeNearfieldCache() {
   freeNearfieldSpecialCache();
   free(gNear.h_panels);
-  free(gNear.h_src);
-  free(gNear.h_dst);
+  /* The streaming path may have page-locked these; the cached path mallocs
+   * them, in which case the pinned flags are 0 and this is a plain free. */
+  freeNearfieldStagingHost(gNear.h_src, &gNear.h_srcPinned);
+  freeNearfieldStagingHost(gNear.h_dst, &gNear.h_dstPinned);
   free(gNear.h_pairSrcCount);
   free(gNear.h_pairInteractionOffset);
   free(gNear.h_leafPanelStart);
   free(gNear.h_leafPanelCount);
   free(gNear.h_leafPairOffset);
-  free(gNear.h_k0);
-  free(gNear.h_k1);
-  free(gNear.h_k2);
-  free(gNear.h_k3);
+  freeNearfieldStagingHost(gNear.h_k0, &gNear.h_k0Pinned);
+  freeNearfieldStagingHost(gNear.h_k1, &gNear.h_k1Pinned);
+  freeNearfieldStagingHost(gNear.h_k2, &gNear.h_k2Pinned);
+  freeNearfieldStagingHost(gNear.h_k3, &gNear.h_k3Pinned);
   gNear.h_panels = NULL;
   gNear.h_src = NULL;
   gNear.h_dst = NULL;
@@ -986,18 +1030,35 @@ int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions
   vecBytes = (size_t)(2 * sys->nPnls) * sizeof(double);
 
   gNear.h_panels = (NearPanelGeom *)malloc((size_t)sys->nPnls * sizeof(NearPanelGeom));
-  gNear.h_src = (int *)malloc(ni * sizeof(int));
-  gNear.h_dst = (int *)malloc(ni * sizeof(int));
-  gNear.h_k0 = (double *)malloc(ni * sizeof(double));
-  gNear.h_k1 = (double *)malloc(ni * sizeof(double));
-  gNear.h_k2 = (double *)malloc(ni * sizeof(double));
-  gNear.h_k3 = (double *)malloc(ni * sizeof(double));
+  /*
+   * The chunk staging buffers are page-locked. Every chunk copies its indices
+   * to the device on every matvec -- 3.8 GB per matvec on a 420k-panel mesh --
+   * and out of pageable memory the driver has to bounce that through an
+   * internal staging buffer, which measured 4.0 s of an 11.0 s nearfield
+   * stage. Pinning lets the DMA engine read the buffer directly.
+   *
+   * cudaHostAlloc can fail where malloc would succeed, since pinned pages
+   * cannot be swapped, so each falls back to ordinary memory rather than
+   * failing the run; correctness does not depend on it.
+   */
+  gNear.h_src = (int *)allocNearfieldStagingHost(ni * sizeof(int), &gNear.h_srcPinned);
+  gNear.h_dst = (int *)allocNearfieldStagingHost(ni * sizeof(int), &gNear.h_dstPinned);
+  gNear.h_k0 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k0Pinned);
+  gNear.h_k1 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k1Pinned);
+  gNear.h_k2 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k2Pinned);
+  gNear.h_k3 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k3Pinned);
   if (gNear.h_panels == NULL || gNear.h_src == NULL || gNear.h_dst == NULL ||
       gNear.h_k0 == NULL || gNear.h_k1 == NULL || gNear.h_k2 == NULL ||
       gNear.h_k3 == NULL) {
     setNearfieldLastError("host allocation for %.3f GiB nearfield streaming chunk failed",
                           bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
     return 0;
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield streaming staging: pinned=%d/6 chunk-host=%.3f GiB\n",
+           gNear.h_srcPinned + gNear.h_dstPinned + gNear.h_k0Pinned +
+           gNear.h_k1Pinned + gNear.h_k2Pinned + gNear.h_k3Pinned,
+           bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
   }
   if (!buildNearfieldPanelGeometry(sys)) return 0;
 
