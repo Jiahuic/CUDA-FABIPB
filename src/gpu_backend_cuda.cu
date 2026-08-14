@@ -96,6 +96,28 @@ struct NearfieldGpuCache {
   double *d_k3;
   double *d_sgm;
   double *d_pot;
+  /*
+   * Cache of the streaming path's touching/self ("special") classification.
+   *
+   * Which pairs are special, and their panelIA0 coefficients, depend only on
+   * the mesh -- not on sgm -- so the streaming path was recomputing an
+   * identical answer on every matvec. Measured on a 420k-panel mesh that was
+   * 78% of nearfield time single-threaded, and still 52% after threading.
+   *
+   * specialOffset holds one entry per chunk plus a terminator, so chunk c
+   * occupies [specialOffset[c], specialOffset[c+1]). Chunk boundaries depend
+   * only on geometry and chunkCapacity, so they repeat exactly every matvec.
+   */
+  int specialCacheEnabled;
+  int specialCacheValid;
+  long long specialCacheChunks;
+  std::vector<long long> *specialOffset;
+  std::vector<int> *cacheSrc;
+  std::vector<int> *cacheDst;
+  std::vector<double> *cacheK0;
+  std::vector<double> *cacheK1;
+  std::vector<double> *cacheK2;
+  std::vector<double> *cacheK3;
 };
 
 NearfieldGpuCache gNear = {};
@@ -354,7 +376,55 @@ __global__ void nearfieldDisjointQ1ApplyKernel(
     const double *sgm,
     double *pot);
 
+/* Bytes held per cached special pair: two indices plus four coefficients. */
+#define NEAR_SPECIAL_CACHE_BYTES_PER_PAIR (2U * sizeof(int) + 4U * sizeof(double))
+
+static void freeNearfieldSpecialCache(void) {
+  delete gNear.specialOffset;
+  delete gNear.cacheSrc;
+  delete gNear.cacheDst;
+  delete gNear.cacheK0;
+  delete gNear.cacheK1;
+  delete gNear.cacheK2;
+  delete gNear.cacheK3;
+  gNear.specialOffset = NULL;
+  gNear.cacheSrc = NULL;
+  gNear.cacheDst = NULL;
+  gNear.cacheK0 = NULL;
+  gNear.cacheK1 = NULL;
+  gNear.cacheK2 = NULL;
+  gNear.cacheK3 = NULL;
+  gNear.specialCacheValid = 0;
+  gNear.specialCacheChunks = 0;
+}
+
+/*
+ * Ceiling on the special cache, in bytes. Defaults to 32 GiB, which covers the
+ * 22.5 GiB the full virus mesh needs while leaving room for the GMRES
+ * workspace and the panel array on a 256 GiB host. Set
+ * FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB=0 to disable caching entirely and go
+ * back to reclassifying every matvec.
+ */
+static size_t nearfieldSpecialCacheBudget(void) {
+  const char *env = getenv("FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB");
+  double mib = 32.0 * 1024.0;
+
+  if (env != NULL && env[0] != '\0') {
+    char *endptr = NULL;
+    double v = strtod(env, &endptr);
+    if (endptr != env && *endptr == '\0' && v >= 0.0) {
+      mib = v;
+    } else {
+      fprintf(stderr,
+              "Warning: ignoring invalid FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB='%s'\n",
+              env);
+    }
+  }
+  return (size_t)(mib * 1024.0 * 1024.0);
+}
+
 void freeNearfieldCache() {
+  freeNearfieldSpecialCache();
   free(gNear.h_panels);
   free(gNear.h_src);
   free(gNear.h_dst);
@@ -900,6 +970,18 @@ int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions
   gNear.streaming = 1;
   gNear.nInteractions = totalInteractions;
   gNear.chunkCapacity = capacity;
+  freeNearfieldSpecialCache();
+  gNear.specialCacheEnabled = (nearfieldSpecialCacheBudget() > 0U) ? 1 : 0;
+  if (gNear.specialCacheEnabled) {
+    gNear.specialOffset = new std::vector<long long>();
+    gNear.cacheSrc = new std::vector<int>();
+    gNear.cacheDst = new std::vector<int>();
+    gNear.cacheK0 = new std::vector<double>();
+    gNear.cacheK1 = new std::vector<double>();
+    gNear.cacheK2 = new std::vector<double>();
+    gNear.cacheK3 = new std::vector<double>();
+    gNear.specialOffset->push_back(0);
+  }
   ni = (size_t)capacity;
   vecBytes = (size_t)(2 * sys->nPnls) * sizeof(double);
 
@@ -2697,13 +2779,22 @@ __global__ void l2pLeafKernel(
 }
 
 int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alpha,
-                                 long long *specialTotal) {
+                                 long long chunkIdx, long long *specialTotal) {
   const int blockSize = 256;
   int gridSize = (int)((count + blockSize - 1) / blockSize);
   long long specialCount = 0;
   size_t indexBytes = (size_t)count * sizeof(int);
   cudaError_t err;
   long long idx;
+  /* Replay a previously classified chunk instead of redoing the work. */
+  int useCache = (gNear.specialCacheEnabled && gNear.specialCacheValid &&
+                  chunkIdx < gNear.specialCacheChunks);
+  const int *upSrc;
+  const int *upDst;
+  const double *upK0;
+  const double *upK1;
+  const double *upK2;
+  const double *upK3;
 
   if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, indexBytes,
                            cudaMemcpyHostToDevice, "stream src") ||
@@ -2739,8 +2830,20 @@ int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alp
    * results are copied back at prefix-summed offsets. Output order matches the
    * serial version exactly, so the coefficients uploaded to the GPU are
    * identical.
+   *
+   * On matvecs after the first this is skipped entirely: the answer depends
+   * only on the mesh, so it is replayed from the cache populated below.
    */
-  {
+  if (useCache) {
+    long long lo = (*gNear.specialOffset)[(size_t)chunkIdx];
+    specialCount = (*gNear.specialOffset)[(size_t)chunkIdx + 1U] - lo;
+    upSrc = specialCount > 0 ? &(*gNear.cacheSrc)[(size_t)lo] : NULL;
+    upDst = specialCount > 0 ? &(*gNear.cacheDst)[(size_t)lo] : NULL;
+    upK0 = specialCount > 0 ? &(*gNear.cacheK0)[(size_t)lo] : NULL;
+    upK1 = specialCount > 0 ? &(*gNear.cacheK1)[(size_t)lo] : NULL;
+    upK2 = specialCount > 0 ? &(*gNear.cacheK2)[(size_t)lo] : NULL;
+    upK3 = specialCount > 0 ? &(*gNear.cacheK3)[(size_t)lo] : NULL;
+  } else {
     int nThreads = nearfieldBuildThreadCount((int)((count > (long long)INT_MAX)
                                                    ? (long long)INT_MAX : count));
     if (nThreads <= 1) {
@@ -2840,23 +2943,55 @@ int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alp
         workers[(size_t)t].join();
       }
     }
+
+    /*
+     * Record this chunk for the remaining matvecs. If the cache would exceed
+     * its budget, drop it and keep reclassifying rather than risk pushing the
+     * host into swap on a mesh where the solve itself is already large.
+     */
+    if (gNear.specialCacheEnabled && !gNear.specialCacheValid) {
+      size_t projected = (size_t)(gNear.cacheSrc->size() + (size_t)specialCount) *
+                         NEAR_SPECIAL_CACHE_BYTES_PER_PAIR;
+      if (projected > nearfieldSpecialCacheBudget()) {
+        if (sys->benchmarkMode > 0) {
+          printf("GPU nearfield special cache disabled: %.3f GiB exceeds budget %.3f GiB\n",
+                 bytesToGiB(projected), bytesToGiB(nearfieldSpecialCacheBudget()));
+        }
+        gNear.specialCacheEnabled = 0;
+        freeNearfieldSpecialCache();
+      } else {
+        gNear.cacheSrc->insert(gNear.cacheSrc->end(), gNear.h_src, gNear.h_src + specialCount);
+        gNear.cacheDst->insert(gNear.cacheDst->end(), gNear.h_dst, gNear.h_dst + specialCount);
+        gNear.cacheK0->insert(gNear.cacheK0->end(), gNear.h_k0, gNear.h_k0 + specialCount);
+        gNear.cacheK1->insert(gNear.cacheK1->end(), gNear.h_k1, gNear.h_k1 + specialCount);
+        gNear.cacheK2->insert(gNear.cacheK2->end(), gNear.h_k2, gNear.h_k2 + specialCount);
+        gNear.cacheK3->insert(gNear.cacheK3->end(), gNear.h_k3, gNear.h_k3 + specialCount);
+        gNear.specialOffset->push_back((long long)gNear.cacheSrc->size());
+      }
+    }
+    upSrc = gNear.h_src;
+    upDst = gNear.h_dst;
+    upK0 = gNear.h_k0;
+    upK1 = gNear.h_k1;
+    upK2 = gNear.h_k2;
+    upK3 = gNear.h_k3;
   }
 
   if (specialCount > 0) {
     size_t specialIndexBytes = (size_t)specialCount * sizeof(int);
     size_t specialCoeffBytes = (size_t)specialCount * sizeof(double);
     int specialGrid = (int)((specialCount + blockSize - 1) / blockSize);
-    if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, specialIndexBytes,
+    if (!cudaMemcpyNearfield(gNear.d_src, upSrc, specialIndexBytes,
                              cudaMemcpyHostToDevice, "stream special src") ||
-        !cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst, specialIndexBytes,
+        !cudaMemcpyNearfield(gNear.d_dst, upDst, specialIndexBytes,
                              cudaMemcpyHostToDevice, "stream special dst") ||
-        !cudaMemcpyNearfield(gNear.d_k0, gNear.h_k0, specialCoeffBytes,
+        !cudaMemcpyNearfield(gNear.d_k0, upK0, specialCoeffBytes,
                              cudaMemcpyHostToDevice, "stream special k0") ||
-        !cudaMemcpyNearfield(gNear.d_k1, gNear.h_k1, specialCoeffBytes,
+        !cudaMemcpyNearfield(gNear.d_k1, upK1, specialCoeffBytes,
                              cudaMemcpyHostToDevice, "stream special k1") ||
-        !cudaMemcpyNearfield(gNear.d_k2, gNear.h_k2, specialCoeffBytes,
+        !cudaMemcpyNearfield(gNear.d_k2, upK2, specialCoeffBytes,
                              cudaMemcpyHostToDevice, "stream special k2") ||
-        !cudaMemcpyNearfield(gNear.d_k3, gNear.h_k3, specialCoeffBytes,
+        !cudaMemcpyNearfield(gNear.d_k3, upK3, specialCoeffBytes,
                              cudaMemcpyHostToDevice, "stream special k3")) return 0;
     nearfieldApplyKernel<<<specialGrid, blockSize>>>(
         gNear.nPnls, specialCount, gNear.d_src, gNear.d_dst,
@@ -2907,7 +3042,7 @@ int applyNearfieldStreaming(const ssystem *sys, double alpha) {
         gNear.h_dst[count] = dstStart + i;
         count++;
         if (count == gNear.chunkCapacity) {
-          if (!applyNearfieldStreamingChunk(sys, count, alpha, &specialTotal)) return 0;
+          if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
           count = 0;
           chunks++;
         }
@@ -2915,8 +3050,23 @@ int applyNearfieldStreaming(const ssystem *sys, double alpha) {
     }
   }
   if (count > 0) {
-    if (!applyNearfieldStreamingChunk(sys, count, alpha, &specialTotal)) return 0;
+    if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
     chunks++;
+  }
+  /*
+   * The first matvec has now classified every chunk, so later ones can replay
+   * it. Chunk boundaries depend only on geometry and chunkCapacity, so the
+   * count recorded here stays valid for the rest of the solve.
+   */
+  if (gNear.specialCacheEnabled && !gNear.specialCacheValid) {
+    gNear.specialCacheChunks = chunks;
+    gNear.specialCacheValid = 1;
+    if (sys->benchmarkMode > 0) {
+      printf("GPU nearfield special cache: pairs=%lld host=%.3f GiB chunks=%lld\n",
+             (long long)gNear.cacheSrc->size(),
+             bytesToGiB((size_t)gNear.cacheSrc->size() * NEAR_SPECIAL_CACHE_BYTES_PER_PAIR),
+             chunks);
+    }
   }
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
