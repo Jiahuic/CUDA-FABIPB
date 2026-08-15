@@ -13,6 +13,8 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
+#include <unistd.h>
+#include <pthread.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gpu_backend.h"
@@ -29,6 +31,8 @@ double *panelIA0(panel *pnlX, panel *pnlY );
 
 double *calcMoments0(ssystem *sys, int order, cube *cb, int job);
 void transM2M(ssystem *sys, cube *cbIn, cube *cbOut);
+void transM2MWs(ssystem *sys, cube *cbIn, cube *cbOut, TransWorkspace *ws);
+void transL2LWs(ssystem *sys, cube *cbIn, cube *cbOut, TransWorkspace *ws);
 void transM2L(ssystem *sys, double *G0, double *Gk, cube *cbIn, cube *cbOut );
 void transL2L(ssystem *sys, cube *cbIn, cube *cbOut );
 void kernelDC0( double r, int p, double *G );
@@ -41,6 +45,185 @@ double paramEllip( panel *pnl, double x, double y, double *r, double *nrm );
 void dumpStats(ssystem *sys);
 int nrCommonVtx( panel *p, panel *q, int *idxX, int *idxY );
 
+
+/*
+ * Threaded upward (M2M) and downward (L2L) passes.
+ *
+ * Both were linked-list walks on one thread: 44.3 s and 33.1 s of the 1,297 s
+ * virus solve. Within a level the work is independent -- M2M has each parent
+ * accumulating only into its own moments, L2L has each parent writing only to
+ * its own children -- so cubes at a level can be split across threads. Levels
+ * stay sequential, since each depends on the one before.
+ *
+ * transM2M/transL2L shared file-scope scratch, so the threads call the
+ * workspace-taking variants with one buffer set each. Every thread writes a
+ * disjoint set of cubes, so the result does not depend on the thread count.
+ */
+typedef struct {
+  ssystem *sys;
+  int lev;
+  int begin;
+  int end;
+  int downward;             /* 0 = M2M (upward), 1 = L2L (downward) */
+  TransWorkspace *ws;
+} TransLevelTask;
+
+static int transThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_SETUP_THREADS");
+  long hc;
+  int threads;
+
+  if (env != NULL && env[0] != '\0') {
+    threads = atoi(env);
+  } else {
+    hc = sysconf(_SC_NPROCESSORS_ONLN);
+    threads = (hc > 0) ? (int)hc : 1;
+  }
+  if (threads < 1) threads = 1;
+  if (threads > nTasks) threads = nTasks;
+  if (threads > 64) threads = 64;
+  return threads;
+}
+
+static void freeTransWorkspace(TransWorkspace *ws) {
+  free(ws->fcn1); free(ws->fcn2); free(ws->fcn3);
+  free(ws->convR); free(ws->conv1); free(ws->conv2);
+  memset(ws, 0, sizeof(*ws));
+}
+
+static int allocTransWorkspace(ssystem *sys, TransWorkspace *ws) {
+  int order = sys->maxOrder;
+  int nMoments = sys->nMom[order];
+
+  ws->order = order;
+  ws->nMoments = nMoments;
+  ws->fcn1 = (double *)calloc((size_t)order + 1U, sizeof(double));
+  ws->fcn2 = (double *)calloc((size_t)order + 1U, sizeof(double));
+  ws->fcn3 = (double *)calloc((size_t)order + 1U, sizeof(double));
+  ws->convR = (double *)calloc((size_t)nMoments, sizeof(double));
+  ws->conv1 = (double *)calloc((size_t)nMoments, sizeof(double));
+  ws->conv2 = (double *)calloc((size_t)nMoments, sizeof(double));
+  return (ws->fcn1 && ws->fcn2 && ws->fcn3 && ws->convR && ws->conv1 && ws->conv2);
+}
+
+static void *transLevelWorker(void *arg) {
+  TransLevelTask *task = (TransLevelTask *)arg;
+  ssystem *sys = task->sys;
+  int i, nKid;
+
+  for (i = task->begin; i < task->end; i++) {
+    cube *cb = sys->fmmCubeByIdx[i];
+    for (nKid = 0; nKid < cb->nKids; nKid++) {
+      if (task->downward) {
+        transL2LWs(sys, cb, cb->kids[nKid], task->ws);
+      } else {
+        transM2MWs(sys, cb->kids[nKid], cb, task->ws);
+      }
+    }
+  }
+  return NULL;
+}
+
+static void transLevelSerial(ssystem *sys, int from, int to, int downward) {
+  int i, nKid;
+
+  for (i = from; i < to; i++) {
+    cube *cb = sys->fmmCubeByIdx[i];
+    for (nKid = 0; nKid < cb->nKids; nKid++) {
+      if (downward) transL2L(sys, cb, cb->kids[nKid]);
+      else          transM2M(sys, cb->kids[nKid], cb);
+    }
+  }
+}
+
+/*
+ * Runs one level of the upward or downward pass.
+ *
+ * Threading only pays when a level holds enough cubes to outweigh creating and
+ * joining the threads: each level is a separate fork/join and there are only a
+ * handful of levels, so a small tree is faster left alone. Measured on a
+ * 420k-panel mesh, where the busiest level is a few hundred cubes and a whole
+ * pass costs ~25 ms, threading it made the pass three times slower. The virus
+ * has 1.24M leaf cubes and passes costing hundreds of ms, which is the case
+ * this is for.
+ *
+ * Workspaces are allocated once and reused, since allocating six buffers per
+ * thread per level per matvec was itself a large part of the overhead.
+ */
+#define TRANS_MIN_CUBES_FOR_THREADS 8192
+
+static TransWorkspace *gTransWs = NULL;
+static int gTransWsCount = 0;
+
+static void runTransLevel(ssystem *sys, int lev, int downward) {
+  int start = sys->fmmLevelStart[lev];
+  int count = sys->fmmLevelCount[lev];
+  int nThreads, t, created = 0;
+  pthread_t *threads;
+  TransLevelTask *tasks;
+
+  if (count <= 0) {
+    return;
+  }
+  nThreads = transThreadCount(count);
+  if (nThreads <= 1 || count < TRANS_MIN_CUBES_FOR_THREADS) {
+    transLevelSerial(sys, start, start + count, downward);
+    return;
+  }
+
+  if (gTransWsCount < nThreads) {
+    TransWorkspace *grown = (TransWorkspace *)calloc((size_t)nThreads, sizeof(TransWorkspace));
+    if (grown == NULL) {
+      transLevelSerial(sys, start, start + count, downward);
+      return;
+    }
+    for (t = 0; t < gTransWsCount; t++) grown[t] = gTransWs[t];
+    for (t = gTransWsCount; t < nThreads; t++) {
+      if (!allocTransWorkspace(sys, &grown[t])) {
+        freeTransWorkspace(&grown[t]);
+        break;
+      }
+    }
+    if (t < nThreads) {
+      int u;
+      for (u = gTransWsCount; u < t; u++) freeTransWorkspace(&grown[u]);
+      free(grown);
+      transLevelSerial(sys, start, start + count, downward);
+      return;
+    }
+    free(gTransWs);
+    gTransWs = grown;
+    gTransWsCount = nThreads;
+  }
+
+  threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+  tasks = (TransLevelTask *)calloc((size_t)nThreads, sizeof(TransLevelTask));
+  if (threads == NULL || tasks == NULL) {
+    free(threads); free(tasks);
+    transLevelSerial(sys, start, start + count, downward);
+    return;
+  }
+
+  for (t = 0; t < nThreads; t++) {
+    tasks[t].sys = sys;
+    tasks[t].lev = lev;
+    tasks[t].downward = downward;
+    tasks[t].ws = &gTransWs[t];
+    tasks[t].begin = start + (int)(((long long)count * t) / nThreads);
+    tasks[t].end = start + (int)(((long long)count * (t + 1)) / nThreads);
+    if (pthread_create(&threads[t], NULL, transLevelWorker, &tasks[t]) != 0) break;
+    created++;
+  }
+  for (t = 0; t < created; t++) {
+    pthread_join(threads[t], NULL);
+  }
+  if (created < nThreads) {
+    int from = (created > 0) ? tasks[created - 1].end : start;
+    transLevelSerial(sys, from, start + count, downward);
+  }
+  free(tasks);
+  free(threads);
+}
 
 static double wall_seconds_local(void) {
   struct timeval tv;
@@ -118,11 +301,19 @@ static void buildFmmCubeLayout(ssystem *sys) {
   }
 
   CALLOC(sys->fmmCubeByIdx, sys->nFmmCubesFlat, cube *);
+  /* Cubes are laid out one level at a time, so each level owns a contiguous
+   * run. Recording where each run starts turns the upward and downward passes
+   * from linked-list walks into indexed loops, which can then be split across
+   * threads. */
+  CALLOC(sys->fmmLevelStart, depth + 1, int);
+  CALLOC(sys->fmmLevelCount, depth + 1, int);
   for (lev = depth; lev >= height; lev--) {
+    sys->fmmLevelStart[lev] = idx;
     for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next, idx++) {
       cb->flatIdx = idx;
       sys->fmmCubeByIdx[idx] = cb;
     }
+    sys->fmmLevelCount[lev] = idx - sys->fmmLevelStart[lev];
   }
   ASSERT(idx == sys->nFmmCubesFlat);
 }
@@ -441,11 +632,7 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   /* upward pass */
   time1 = wall_seconds_local();
   for ( lev=depth-1; lev>=height; lev-- ) {
-    for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
-      for ( nKid=0; nKid<cb->nKids; nKid++ ) {
-        transM2M(sys, cb->kids[nKid], cb);
-      }
-    }
+    runTransLevel(sys, lev, 0);
   }
   time2 = wall_seconds_local();
   fmmM2MTime += (time2 - time1);
@@ -478,11 +665,7 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   /* downward pass */
   time1 = wall_seconds_local();
   for ( lev=height; lev<depth; lev++ ) {
-    for ( cb=sys->cubeList[lev]; cb != NULL; cb=cb->next ) {
-      for ( nKid=0; nKid<cb->nKids; nKid++ ) {
-        transL2L(sys, cb, cb->kids[nKid]);
-      }
-    }
+    runTransLevel(sys, lev, 1);
   }
   time2 = wall_seconds_local();
   fmmL2LTime += (time2 - time1);

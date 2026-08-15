@@ -505,7 +505,7 @@ static void print_usage(const char *prog) {
   printf("  -d=<val>  backend-specific override: MSMS density or NanoShaper Grid_scale\n");
   printf("  -M=0|1    full solve or mesh-only calibration run (default: 0)\n");
   printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");
-  printf("  -Q=0|1    CPU-default or GPU-debug Q2M path (default: 0)\n");
+  printf("  -Q=0|1    CPU dgemv loop or GPU Q2M path (default: 1)\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
   printf("  -P=-1|0|1|2|3  disabled, original, cached-block, cached-LU, or diagonal/Jacobi preconditioner (default: 2)\n");
   printf("  -t=<lev>  tree depth\n");
@@ -982,7 +982,7 @@ int main(int nargs, char *argv[]){
   sys->debugCompareApply = 0;
   sys->debugComparePrecond = 0;
   sys->matvecMode = 0;
-  sys->gpuQ2MMode = 0;
+  sys->gpuQ2MMode = 1;
   sys->gpuNearfieldMode = 1;
   sys->precondCacheMode = 2;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2); // bulk_strength = 0.15
@@ -1129,7 +1129,7 @@ int main(int nargs, char *argv[]){
     printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline, 2=direct CPU baseline)\n",
            sys->matvecMode);
     if (sys->matvecMode == 0) {
-      printf("GPU Q2M mode=%d (0=CPU default, 1=GPU debug)\n", sys->gpuQ2MMode);
+      printf("GPU Q2M mode=%d (1=GPU, 0=CPU dgemv loop)\n", sys->gpuQ2MMode);
       printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
     }
     printf("Preconditioner mode=%d (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n", sys->precondCacheMode);

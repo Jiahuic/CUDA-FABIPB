@@ -339,12 +339,14 @@ void convL2L(int ordIn, int ordOut, double *a,
  * output moments are not computed exactly.
  * Note: transM2M is additive.
  */
-void transM2M(ssystem *sys, cube *cbIn, cube *cbOut) {
+void transM2MWs(ssystem *sys, cube *cbIn, cube *cbOut, TransWorkspace *ws) {
   int i, n, i1, i2, i3;
   int ordIn = sys->ordMom[cbIn->level], ordOut = sys->ordMom[cbOut->level];
   int nMomIn = sys->nMom[ordIn], nMomOut = sys->nMom[ordOut];
   double *momIn_pot = cbIn->mom_pot, *momOut_pot = cbOut->mom_pot;
   double *momIn_dpdn = cbIn->mom_dpdn, *momOut_dpdn = cbOut->mom_dpdn;
+  double *fcnBuf1 = ws->fcn1, *fcnBuf2 = ws->fcn2, *fcnBuf3 = ws->fcn3;
+  double *convVecR = ws->convR, *convVec1 = ws->conv1, *convVec2 = ws->conv2;
   double trns[3];
 
   for ( i=0; i<3; i++ ) trns[i] = cbIn->x[i] - cbOut->x[i];
@@ -377,6 +379,15 @@ void transM2M(ssystem *sys, cube *cbIn, cube *cbOut) {
   convM2M(ordOut, convVecR, convVec1, momOut_pot, convVec2, momOut_dpdn);
 
 
+} /* transM2MWs */
+
+/* Shared-buffer wrapper, for the single-threaded callers. */
+void transM2M(ssystem *sys, cube *cbIn, cube *cbOut) {
+  TransWorkspace ws;
+
+  ws.fcn1 = fcnBuf1; ws.fcn2 = fcnBuf2; ws.fcn3 = fcnBuf3;
+  ws.convR = convVecR; ws.conv1 = convVec1; ws.conv2 = convVec2;
+  transM2MWs(sys, cbIn, cbOut, &ws);
 } /* transM2M */
 
 
@@ -389,8 +400,10 @@ void transM2M(ssystem *sys, cube *cbIn, cube *cbOut) {
  * the higher order output coefficients are simply not computed
  * Note that transL2L is additive
  */
-void transL2L(ssystem *sys, cube *cbIn, cube *cbOut ) {
+void transL2LWs(ssystem *sys, cube *cbIn, cube *cbOut, TransWorkspace *ws) {
   int i, n, i1, i2, i3;
+  double *fcnBuf1 = ws->fcn1, *fcnBuf2 = ws->fcn2, *fcnBuf3 = ws->fcn3;
+  double *convVecR = ws->convR;
   int ordIn = sys->ordMom[cbIn->level], ordOut = sys->ordMom[cbOut->level];
   int nMomIn = sys->nMom[ordIn], nMomOut = sys->nMom[ordOut];
   double *lecInk1, *lecInk2, *lecInk3, *lecInk4;
@@ -406,8 +419,18 @@ void transL2L(ssystem *sys, cube *cbIn, cube *cbOut ) {
 
   /* setup convolution vectors */
 
+  /*
+   * Fill to ordIn, not ordOut: the convolution loop below runs over
+   * multi-indices of total degree up to ordIn, so i1 can reach ordIn. In
+   * variable-order mode coarser levels carry the higher order
+   * (ordM2L[lev] = ordM2L[lev+1]+1, see gkSetup.c), and L2L translates from
+   * the coarser parent to the finer child, so ordIn > ordOut is the normal
+   * case -- this loop used to stop short and the entries in (ordOut, ordIn]
+   * were read uninitialised. It went unnoticed because fcnBuf is file-scope
+   * scratch that still held plausible values from the previous call.
+   */
   fcnBuf1[0] = fcnBuf2[0] = fcnBuf3[0] = 1.0;
-  for ( i=1; i<=ordOut; i++ ) {
+  for ( i=1; i<=ordIn; i++ ) {
     fcnBuf1[i] = fcnBuf1[i-1]*trns[0];
     fcnBuf2[i] = fcnBuf2[i-1]*trns[1];
     fcnBuf3[i] = fcnBuf3[i-1]*trns[2];
@@ -426,6 +449,15 @@ void transL2L(ssystem *sys, cube *cbIn, cube *cbOut ) {
   convL2L(ordIn, ordOut, convVecR, lecInk1, lecInk2, lecInk3, lecInk4,
           lecOutk1, lecOutk2, lecOutk3, lecOutk4);
 
+} /* transL2LWs */
+
+/* Shared-buffer wrapper, for the single-threaded callers. */
+void transL2L(ssystem *sys, cube *cbIn, cube *cbOut ) {
+  TransWorkspace ws;
+
+  ws.fcn1 = fcnBuf1; ws.fcn2 = fcnBuf2; ws.fcn3 = fcnBuf3;
+  ws.convR = convVecR; ws.conv1 = convVec1; ws.conv2 = convVec2;
+  transL2LWs(sys, cbIn, cbOut, &ws);
 } /* transL2L */
 
 

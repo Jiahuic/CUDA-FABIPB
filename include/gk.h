@@ -84,7 +84,7 @@ struct ssystem {
   int debugCompareApply;    /* 0=off, >0 compare one CPU/GPU applyFMM call */
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
-  int gpuQ2MMode;           /* 0=CPU default, 1=enable GPU Q2M path for debugging */
+  int gpuQ2MMode;           /* 1=GPU Q2M (default), 0=force the CPU dgemv loop */
   int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
   int precondCacheMode;     /* 0=original, 1=cached local blocks, 2=cached LU (preferred) */
   int nLeafCubesFlat;       /* flattened finest-level cube count */
@@ -104,6 +104,8 @@ struct ssystem {
   int *m2lDstGroupCount;    /* interaction count of each destination-grouped M2L range */
   panel **panelByIdx;       /* direct panel lookup by contiguous index */
   double *panelArea;        /* pnl->area by contiguous index; see buildPanelIndex */
+  int *fmmLevelStart;       /* first fmmCubeByIdx entry of each level */
+  int *fmmLevelCount;       /* cube count of each level */
   int maxlevCudes;          /* max cubes at finest level */
   int maxlevnPnls;          /* max panels in a cube at finest level */
   panel *pnlLst;            /* linked list of panels (Contiguous wn cubes) */
@@ -122,6 +124,23 @@ typedef struct {
   double **dg0;
   double **dgk;
 } RhsTreeWorkspace;
+
+/*
+ * Per-thread scratch for transM2M/transL2L.
+ *
+ * Both used only the file-scope buffers fcnBuf1/2/3 (moments.c) and
+ * convVecR/convVec1/convVec2 (expan.c), which made them unsafe to run on more
+ * than one thread. The workspace-taking variants take these explicitly so the
+ * upward and downward passes can be split across cubes; the original
+ * signatures remain as wrappers over the shared buffers for the single-threaded
+ * callers in moments.c and chargeTree.c.
+ */
+typedef struct {
+  int order;                /* fcn buffers hold order+1 entries */
+  int nMoments;             /* conv vectors hold nMoments entries */
+  double *fcn1, *fcn2, *fcn3;
+  double *convR, *conv1, *conv2;
+} TransWorkspace;
 
 typedef void (*KernelFn)(double *x, double *y);
 typedef void (*KernelDerivFn)(double r, int p, double *G);
