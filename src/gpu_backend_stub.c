@@ -64,3 +64,8 @@ int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
   (void)block;
   return 0;
 }
+
+int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
+  (void)sys; (void)sgm; (void)pot;
+  return 0;
+}

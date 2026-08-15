@@ -16,6 +16,8 @@
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
 extern "C" int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
+extern "C" int rhsChargeExpansionOrder(ssystem *sys, int level);
+extern "C" int ***idx3;
 extern "C" void kernelKER4(double *x, double *y);
 extern "C" void (*kernel)(double *x, double *y);
 extern "C" void setupDerivs(int order, double *x);
@@ -4002,3 +4004,586 @@ int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
   }
   return 1;
 }
+
+/* ===================================================================
+ * GPU charge-tree energy evaluator
+ *
+ * The post-solve energy walks the charge tree once per panel: accept a
+ * cluster if it is far enough (eRad < theta*dist) and evaluate its multipole
+ * expansion, otherwise descend, and sum charges directly in the leaves. On the
+ * virus that was the single largest stage of the solve (445 s of ~983 s) and
+ * the largest piece still on the CPU.
+ *
+ * The tree is flattened once into contiguous arrays. The traversal itself uses
+ * an explicit stack rather than recursion.
+ *
+ * One WARP handles one panel, not one thread. The screened-derivative
+ * recurrence needs a scratch tensor per target -- about 2 KB at the order 4
+ * that most accepted nodes use -- which is far too much to give every thread,
+ * but fits comfortably in shared memory once per warp. The warp also splits
+ * the moment sum and the leaf charge sum across its lanes.
+ * =================================================================== */
+
+#define CTE_MAX_STACK 64
+#define CTE_WARP 32
+
+struct ChargeTreeGpu {
+  const ssystem *sys;
+  int nNodes;
+  int nCharges;
+  int nPanels;
+  int derivOrderMax;        /* largest order+1 used by any accepted node */
+  int idxDim;               /* idx3 flattened as idxDim^3 */
+  int nMomMax;              /* nMom[derivOrderMax] */
+  /* node arrays */
+  double *d_nodeCtr;        /* 3 per node */
+  double *d_nodeRad;
+  int *d_nodeLevel;
+  int *d_nodeKidStart;
+  int *d_nodeKidCount;
+  int *d_nodeChgStart;
+  int *d_nodeChgCount;
+  int *d_nodeMomOff;
+  int *d_nodeOrder;         /* rhsChargeExpansionOrder for this node's level */
+  int *d_kidIdx;
+  int *d_chgIdx;
+  double *d_moments;
+  /* charges and panels */
+  double *d_pos;
+  double *d_chr;
+  NearPanelGeom *d_panels;
+  /* small tables */
+  int *d_idx3;
+  int *d_sgn3;
+  int *d_nMom;
+  /* results */
+  double *d_out;            /* 2 per panel: y0, y1 */
+};
+
+static ChargeTreeGpu gCTE = {};
+
+static void freeChargeTreeGpu(void) {
+  cudaFree(gCTE.d_nodeCtr);      cudaFree(gCTE.d_nodeRad);
+  cudaFree(gCTE.d_nodeLevel);    cudaFree(gCTE.d_nodeKidStart);
+  cudaFree(gCTE.d_nodeKidCount); cudaFree(gCTE.d_nodeChgStart);
+  cudaFree(gCTE.d_nodeChgCount); cudaFree(gCTE.d_nodeMomOff);
+  cudaFree(gCTE.d_nodeOrder);    cudaFree(gCTE.d_kidIdx);
+  cudaFree(gCTE.d_chgIdx);       cudaFree(gCTE.d_moments);
+  cudaFree(gCTE.d_pos);          cudaFree(gCTE.d_chr);
+  cudaFree(gCTE.d_panels);       cudaFree(gCTE.d_idx3);
+  cudaFree(gCTE.d_sgn3);         cudaFree(gCTE.d_nMom);
+  cudaFree(gCTE.d_out);
+  memset(&gCTE, 0, sizeof(gCTE));
+}
+
+/* Depth-first flatten of the charge tree into contiguous arrays. */
+static int buildChargeTreeGpu(const ssystem *sys) {
+  std::vector<const cube *> order;
+  std::vector<int> nodeOf;           /* scratch: index of each visited node */
+  std::vector<double> ctr, rad, mom;
+  std::vector<int> lev, kidStart, kidCount, chgStart, chgCount, momOff, nodeOrd;
+  std::vector<int> kidIdx, chgIdx;
+  std::vector<const cube *> stack;
+  size_t i;
+  int derivMax = 0;
+
+  if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) {
+    setNearfieldLastError("charge tree not built");
+    return 0;
+  }
+
+  /* First pass: assign an index to every node, breadth-first from the root. */
+  order.push_back(sys->chgCubeList[0]);
+  for (i = 0; i < order.size(); i++) {
+    const cube *cb = order[i];
+    int k;
+    for (k = 0; k < cb->nKids; k++) {
+      order.push_back(cb->kids[k]);
+    }
+  }
+
+  /* Map each node pointer to its index so kid lists can be flattened. */
+  {
+    std::vector<std::pair<const cube *, int> > lookup;
+    lookup.reserve(order.size());
+    for (i = 0; i < order.size(); i++) lookup.push_back(std::make_pair(order[i], (int)i));
+    std::sort(lookup.begin(), lookup.end());
+
+    for (i = 0; i < order.size(); i++) {
+      const cube *cb = order[i];
+      int ordHere = rhsChargeExpansionOrder((ssystem *)sys, cb->level);
+      int nMomHere = sys->nMom[ordHere];
+      int k;
+
+      ctr.push_back(cb->x[0]); ctr.push_back(cb->x[1]); ctr.push_back(cb->x[2]);
+      rad.push_back(cb->eRad);
+      lev.push_back(cb->level);
+      nodeOrd.push_back(ordHere);
+      if (ordHere + 1 > derivMax) derivMax = ordHere + 1;
+
+      kidStart.push_back((int)kidIdx.size());
+      kidCount.push_back(cb->nKids);
+      for (k = 0; k < cb->nKids; k++) {
+        std::pair<const cube *, int> probe(cb->kids[k], 0);
+        std::vector<std::pair<const cube *, int> >::iterator it =
+            std::lower_bound(lookup.begin(), lookup.end(), probe);
+        if (it == lookup.end() || it->first != cb->kids[k]) {
+          setNearfieldLastError("charge tree flatten: child not found");
+          return 0;
+        }
+        kidIdx.push_back(it->second);
+      }
+
+      chgStart.push_back((int)chgIdx.size());
+      if (cb->level == sys->chgDepth && cb->chgIdx != NULL) {
+        chgCount.push_back(cb->nChgs);
+        for (k = 0; k < cb->nChgs; k++) chgIdx.push_back(cb->chgIdx[k]);
+      } else {
+        chgCount.push_back(0);
+      }
+
+      momOff.push_back((int)mom.size());
+      if (cb->mom_chr != NULL) {
+        for (k = 0; k < nMomHere; k++) mom.push_back(cb->mom_chr[k]);
+      } else {
+        for (k = 0; k < nMomHere; k++) mom.push_back(0.0);
+      }
+    }
+  }
+
+  gCTE.nNodes = (int)order.size();
+  gCTE.nCharges = sys->nChar;
+  gCTE.nPanels = sys->nPnls;
+  gCTE.derivOrderMax = derivMax;
+  gCTE.nMomMax = sys->nMom[derivMax];
+  /* idx3 was allocated by mkIndex(maxOrder+1), so its valid extent is
+   * maxOrder+2 per dimension. The kernel reads it at i1+1 with
+   * i1+i2+i3 <= order <= maxOrder, so maxOrder+1 is the largest index needed
+   * and that extent is exactly right. Deriving the dimension from derivMax
+   * instead would read past the table. */
+  gCTE.idxDim = sys->maxOrder + 2;
+
+  /* Flatten idx3 and sgn3 for the device. */
+  {
+    int D = gCTE.idxDim;
+    std::vector<int> fidx((size_t)D * D * D, 0);
+    std::vector<int> fsgn((size_t)gCTE.nMomMax, 0);
+    int a, b, c;
+    for (a = 0; a < D; a++)
+      for (b = 0; b < D; b++)
+        for (c = 0; c < D; c++)
+          if (a + b + c <= sys->maxOrder + 1) fidx[((size_t)a * D + b) * D + c] = idx3[a][b][c];
+    for (a = 0; a < gCTE.nMomMax; a++) fsgn[a] = sgn3[a];
+
+    std::vector<int> fnmom((size_t)derivMax + 2, 0);
+    for (a = 0; a <= derivMax + 1; a++) fnmom[a] = sys->nMom[a];
+
+    if (!cudaMallocNearfield((void **)&gCTE.d_idx3, fidx.size() * sizeof(int), "cte idx3") ||
+        !cudaMallocNearfield((void **)&gCTE.d_sgn3, fsgn.size() * sizeof(int), "cte sgn3") ||
+        !cudaMallocNearfield((void **)&gCTE.d_nMom, fnmom.size() * sizeof(int), "cte nMom") ||
+        !cudaMemcpyNearfield(gCTE.d_idx3, &fidx[0], fidx.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte idx3") ||
+        !cudaMemcpyNearfield(gCTE.d_sgn3, &fsgn[0], fsgn.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte sgn3") ||
+        !cudaMemcpyNearfield(gCTE.d_nMom, &fnmom[0], fnmom.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte nMom")) return 0;
+  }
+
+#define CTE_UP(dst, vec, type, tag)                                              \
+  do {                                                                           \
+    if (!cudaMallocNearfield((void **)&(dst), (vec).size() * sizeof(type), tag) ||\
+        !cudaMemcpyNearfield((dst), &(vec)[0], (vec).size() * sizeof(type),       \
+                             cudaMemcpyHostToDevice, tag)) return 0;              \
+  } while (0)
+
+  CTE_UP(gCTE.d_nodeCtr, ctr, double, "cte ctr");
+  CTE_UP(gCTE.d_nodeRad, rad, double, "cte rad");
+  CTE_UP(gCTE.d_nodeLevel, lev, int, "cte lev");
+  CTE_UP(gCTE.d_nodeKidStart, kidStart, int, "cte kidStart");
+  CTE_UP(gCTE.d_nodeKidCount, kidCount, int, "cte kidCount");
+  CTE_UP(gCTE.d_nodeChgStart, chgStart, int, "cte chgStart");
+  CTE_UP(gCTE.d_nodeChgCount, chgCount, int, "cte chgCount");
+  CTE_UP(gCTE.d_nodeMomOff, momOff, int, "cte momOff");
+  CTE_UP(gCTE.d_nodeOrder, nodeOrd, int, "cte order");
+  CTE_UP(gCTE.d_moments, mom, double, "cte moments");
+  if (!kidIdx.empty()) CTE_UP(gCTE.d_kidIdx, kidIdx, int, "cte kidIdx");
+  if (!chgIdx.empty()) CTE_UP(gCTE.d_chgIdx, chgIdx, int, "cte chgIdx");
+#undef CTE_UP
+
+  /* charges */
+  if (!cudaMallocNearfield((void **)&gCTE.d_pos, (size_t)3 * sys->nChar * sizeof(double), "cte pos") ||
+      !cudaMallocNearfield((void **)&gCTE.d_chr, (size_t)sys->nChar * sizeof(double), "cte chr") ||
+      !cudaMemcpyNearfield(gCTE.d_pos, sys->pos, (size_t)3 * sys->nChar * sizeof(double),
+                           cudaMemcpyHostToDevice, "cte pos") ||
+      !cudaMemcpyNearfield(gCTE.d_chr, sys->chr, (size_t)sys->nChar * sizeof(double),
+                           cudaMemcpyHostToDevice, "cte chr")) return 0;
+
+  /* panel geometry: same layout the nearfield already uses */
+  {
+    std::vector<NearPanelGeom> geom((size_t)sys->nPnls);
+    panel *pnl;
+    int idx, k;
+    for (idx = 0, pnl = sys->pnlLst; pnl != NULL && idx < sys->nPnls; pnl = pnl->nextC, idx++) {
+      for (k = 0; k < 3; k++) {
+        geom[(size_t)idx].vtx[0][k] = pnl->vtx[0][k];
+        geom[(size_t)idx].a0[k] = pnl->a[0][k];
+        geom[(size_t)idx].a2[k] = pnl->a[2][k];
+        geom[(size_t)idx].normal[k] = pnl->normal[k];
+      }
+      geom[(size_t)idx].area = pnl->area;
+    }
+    if (!cudaMallocNearfield((void **)&gCTE.d_panels,
+                             (size_t)sys->nPnls * sizeof(NearPanelGeom), "cte panels") ||
+        !cudaMemcpyNearfield(gCTE.d_panels, &geom[0],
+                             (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                             cudaMemcpyHostToDevice, "cte panels")) return 0;
+  }
+
+  if (!cudaMallocNearfield((void **)&gCTE.d_out,
+                           (size_t)2 * sys->nPnls * sizeof(double), "cte out")) return 0;
+
+  gCTE.sys = sys;
+  if (sys->benchmarkMode > 0) {
+    printf("GPU charge-tree energy: nodes=%d charges=%d panels=%d derivMax=%d "
+           "moments=%.3f GiB\n",
+           gCTE.nNodes, gCTE.nCharges, gCTE.nPanels, gCTE.derivOrderMax,
+           bytesToGiB(mom.size() * sizeof(double)));
+  }
+  return 1;
+}
+
+/* Radial derivatives of G0 and Gk; port of kernelDG0DGk() in kernel.c. */
+__device__ __forceinline__ void cteRadialDerivs(double r, int p, double kap,
+                                                double fourPiIv,
+                                                double *G0, double *Gk) {
+  double kappa2 = kap * kap;
+  double rexp = exp(-kap * r);
+  double r1 = 1.0 / r;
+  double r2 = r1 * r1;
+  double nr2 = -r2;
+  int k;
+
+  G0[0] = r1 * fourPiIv;
+  Gk[0] = rexp * G0[0];
+  G0[1] = nr2 * G0[0];
+  Gk[1] = -Gk[0] * (r2 + kap * r1);
+  for (k = 1; k < p; k++) {
+    G0[k + 1] = (2 * k + 1) * nr2 * G0[k];
+    Gk[k + 1] = r2 * (kappa2 * Gk[k - 1] - (2 * k + 1) * Gk[k]);
+  }
+}
+
+/*
+ * Cartesian derivative tensors of G0/Gk about a cluster centre; port of
+ * setupScreenedDerivsLocal() in treecode.c. Lane 0 of the warp drives the
+ * recurrence: each order p is built from p+1, so the levels are sequential,
+ * and the per-level work is far too small to be worth splitting across lanes.
+ */
+__device__ void cteSetupDerivsStrided(int order, const double *x,
+                               double kap, double fourPiIv,
+                               const int *fidx3, int D,
+                               double *gv0, double *gvk,
+                               double **dg0, double **dgk, long long S) {
+  int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2;
+  double r = sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+
+  cteRadialDerivs(r, order, kap, fourPiIv, gv0, gvk);
+  for (p = 0; p <= order; p++) { dg0[p][(long long)(0) * S] = gv0[p]; dgk[p][(long long)(0) * S] = gvk[p]; }
+  for (p = 0; p < order; p++) {
+    p1 = p + 1;
+    dg0[p][(long long)(1) * S] = dg0[p1][(long long)(0) * S] * x[2];  dg0[p][(long long)(2) * S] = dg0[p1][(long long)(0) * S] * x[1];  dg0[p][(long long)(3) * S] = dg0[p1][(long long)(0) * S] * x[0];
+    dgk[p][(long long)(1) * S] = dgk[p1][(long long)(0) * S] * x[2];  dgk[p][(long long)(2) * S] = dgk[p1][(long long)(0) * S] * x[1];  dgk[p][(long long)(3) * S] = dgk[p1][(long long)(0) * S] * x[0];
+  }
+#define CTE_IDX(a,b,c) fidx3[(((a) * D) + (b)) * D + (c)]
+  for (iRow = 2; iRow <= order; iRow++) {
+    for (p = 0; p <= order - iRow; p++) {
+      p1 = p + 1;
+      idx = CTE_IDX(0, 0, iRow);
+      iRow1 = iRow - 1;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      idx2 = CTE_IDX(0, 0, iRow - 2);
+      dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[2] + dg0[p1][(long long)(idx2) * S] * iRow1;
+      dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[2] + dgk[p1][(long long)(idx2) * S] * iRow1;
+      idx++;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[1];
+      dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[1];
+      idx++;
+      for (i2 = 2; i2 <= iRow; i2++, idx++) {
+        i3 = iRow - i2;
+        idx1 = CTE_IDX(0, i2 - 1, i3);
+        idx2 = CTE_IDX(0, i2 - 2, i3);
+        dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[1] + dg0[p1][(long long)(idx2) * S] * (i2 - 1);
+        dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[1] + dgk[p1][(long long)(idx2) * S] * (i2 - 1);
+      }
+      for (i2 = 0; i2 <= iRow1; i2++, idx++) {
+        i3 = iRow1 - i2;
+        idx1 = CTE_IDX(0, i2, i3);
+        dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[0];
+        dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[0];
+      }
+      for (i1 = 2; i1 <= iRow; i1++) {
+        for (i2 = 0; i2 <= iRow - i1; i2++, idx++) {
+          i3 = iRow - i1 - i2;
+          idx1 = CTE_IDX(i1 - 1, i2, i3);
+          idx2 = CTE_IDX(i1 - 2, i2, i3);
+          dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[0] + dg0[p1][(long long)(idx2) * S] * (i1 - 1);
+          dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[0] + dgk[p1][(long long)(idx2) * S] * (i1 - 1);
+        }
+      }
+    }
+  }
+#undef CTE_IDX
+}
+
+/*
+ * One thread per panel, grid-stride.
+ *
+ * The first version gave a warp to each panel with the derivative scratch in
+ * shared memory. That was correct but 5.6x slower than 72 CPU threads: all 32
+ * lanes walked the same tree redundantly, lane 0 ran the derivative recurrence
+ * alone while the rest idled, and 43 KB of shared memory per block held
+ * occupancy to a single block per SM.
+ *
+ * Here each thread owns a panel and its own scratch slab in global memory. The
+ * slabs are interleaved -- entry i of thread t lives at [i * stride + t] -- so
+ * lanes touching the same tensor entry hit consecutive addresses. Concurrency
+ * is capped and panels are taken in a grid-stride loop, which bounds the
+ * scratch: the whole point is that it is proportional to the number of resident
+ * threads, not to the panel count.
+ *
+ * Per-level sizes follow the CPU: level p holds nMom[derivMax - p] entries,
+ * which the recurrence never exceeds because p + iRow <= order <= derivMax.
+ */
+__global__ void chargeTreeEnergyKernel(
+    int nPanels, int derivMax, int idxDim, int chgDepth, int height,
+    double theta, double kap, double eps, double fourPiIv,
+    const NearPanelGeom *panels,
+    const double *nodeCtr, const double *nodeRad, const int *nodeLevel,
+    const int *nodeKidStart, const int *nodeKidCount,
+    const int *nodeChgStart, const int *nodeChgCount,
+    const int *nodeMomOff, const int *nodeOrder,
+    const int *kidIdx, const int *chgIdx, const double *moments,
+    const double *pos, const double *chr,
+    const int *fidx3, const int *sgn3d, const int *levOff,
+    double *scratch, long long stride,
+    double *out) {
+  const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
+  double *dg0[16];
+  double *dgk[16];
+  double gv0[18], gvk[18];
+  int p;
+  int panelIdx;
+
+  if (tid >= stride) return;
+  for (p = 0; p <= derivMax && p < 16; p++) {
+    dg0[p] = scratch + (long long)levOff[p] * stride + tid;
+    dgk[p] = scratch + ((long long)levOff[derivMax + 1] + levOff[p]) * stride + tid;
+  }
+
+  for (panelIdx = (int)tid; panelIdx < nPanels; panelIdx += (int)nThreadsTotal) {
+    const NearPanelGeom *pn = &panels[panelIdx];
+    double qpt[3], nrm[3];
+    double y0 = 0.0, y1 = 0.0;
+    int stack[CTE_MAX_STACK];
+    int sp = 0;
+    int k;
+
+    for (k = 0; k < 3; k++) {
+      qpt[k] = pn->vtx[0][k] + 0.5 * (pn->a2[k] + 0.5 * pn->a0[k]);
+      nrm[k] = pn->normal[k];
+    }
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+      int node = stack[--sp];
+      double r[3], dist;
+      for (k = 0; k < 3; k++) r[k] = qpt[k] - nodeCtr[3 * node + k];
+      dist = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+
+      if (nodeRad[node] < theta * dist && nodeLevel[node] >= height) {
+        int ordHere = nodeOrder[node];
+        const double *mom = &moments[nodeMomOff[node]];
+        int i, i1, i2, n;
+
+        cteSetupDerivsStrided(ordHere + 1, r, kap, fourPiIv, fidx3, idxDim,
+                              gv0, gvk, dg0, dgk, stride);
+        i = 0;
+        for (n = 0; n <= ordHere; n++) {
+          for (i1 = 0; i1 <= n; i1++) {
+            for (i2 = 0; i2 <= n - i1; i2++, i++) {
+              int i3 = n - i1 - i2;
+              double dnG0, dnGk;
+#define CTE_IDX(a,b,c) fidx3[(((a) * idxDim) + (b)) * idxDim + (c)]
+              dnG0 = nrm[0] * dg0[0][(long long)CTE_IDX(i1 + 1, i2, i3) * stride]
+                   + nrm[1] * dg0[0][(long long)CTE_IDX(i1, i2 + 1, i3) * stride]
+                   + nrm[2] * dg0[0][(long long)CTE_IDX(i1, i2, i3 + 1) * stride];
+              dnGk = nrm[0] * dgk[0][(long long)CTE_IDX(i1 + 1, i2, i3) * stride]
+                   + nrm[1] * dgk[0][(long long)CTE_IDX(i1, i2 + 1, i3) * stride]
+                   + nrm[2] * dgk[0][(long long)CTE_IDX(i1, i2, i3 + 1) * stride];
+#undef CTE_IDX
+              y0 += sgn3d[i] * mom[i] * (dg0[0][(long long)i * stride] -
+                                         dgk[0][(long long)i * stride]);
+              y1 += sgn3d[i] * mom[i] * (eps * dnGk - dnG0);
+            }
+          }
+        }
+        continue;
+      }
+
+      if (nodeLevel[node] == chgDepth) {
+        int start = nodeChgStart[node];
+        int cnt = nodeChgCount[node];
+        int i;
+        for (i = 0; i < cnt; i++) {
+          int j = chgIdx[start + i];
+          double x[3], r2, rn, G0, Gk, coef, ip, dG0dn, dGkdn;
+          for (k = 0; k < 3; k++) x[k] = qpt[k] - pos[3 * j + k];
+          r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+          rn = sqrt(r2);
+          G0 = fourPiIv / rn;
+          Gk = exp(-kap * rn) * G0;
+          coef = (kap * rn + 1.0) * exp(-kap * rn);
+          ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
+          dG0dn = -ip * G0 / r2;
+          dGkdn = coef * dG0dn;
+          y0 += chr[j] * (G0 - Gk);
+          y1 += chr[j] * (eps * dGkdn - dG0dn);
+        }
+        continue;
+      }
+
+      {
+        int ks = nodeKidStart[node];
+        int kc = nodeKidCount[node];
+        int i;
+        for (i = 0; i < kc && sp < CTE_MAX_STACK; i++) stack[sp++] = kidIdx[ks + i];
+      }
+    }
+
+    /* qOrd==1: weight 0.5 then the 2*area factor, so net = area. */
+    out[2 * panelIdx] = y0 * pn->area;
+    out[2 * panelIdx + 1] = y1 * pn->area;
+  }
+}
+
+extern "C" double energyTreeTheta(void);
+
+int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
+  int blockSize = 128, gridSize;
+  long long stride, slabDoubles;
+  size_t scratchBytes;
+  cudaError_t err;
+  std::vector<double> host;
+  std::vector<int> levOff;
+  double total = 0.0;
+  int p, i;
+  static double *d_scratch = NULL;
+  static int *d_levOff = NULL;
+  static long long scratchStride = 0;
+
+  if (sys == NULL || sgm == NULL || pot == NULL) return 0;
+  if (!gpuBackendAvailable()) return 0;
+  if (sys->maxQuadOrder != 1) return 0;   /* kernel assumes the 1-point rule */
+  if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) return 0;
+
+  if (gCTE.sys != sys) {
+    freeChargeTreeGpu();
+    cudaFree(d_scratch); d_scratch = NULL;
+    cudaFree(d_levOff);  d_levOff = NULL;
+    scratchStride = 0;
+    if (!buildChargeTreeGpu(sys)) { freeChargeTreeGpu(); return 0; }
+  }
+  if (gCTE.derivOrderMax + 1 >= 16) return 0;   /* fixed pointer arrays */
+
+  /* Level p holds nMom[derivMax - p] entries, as on the CPU. levOff[derivMax+1]
+   * is the total, which also separates the dg0 half from the dgk half. */
+  levOff.resize((size_t)gCTE.derivOrderMax + 2);
+  levOff[0] = 0;
+  for (p = 0; p <= gCTE.derivOrderMax; p++) {
+    levOff[(size_t)p + 1] = levOff[(size_t)p] + sys->nMom[gCTE.derivOrderMax - p];
+  }
+  slabDoubles = 2LL * levOff[(size_t)gCTE.derivOrderMax + 1];
+
+  /* Cap concurrency so the scratch stays bounded; panels are then taken in a
+   * grid-stride loop. Budget is configurable for tight-memory machines. */
+  {
+    const char *env = getenv("FABIPB_ENERGY_GPU_SCRATCH_MIB");
+    /* Not "as much as fits": the kernel is bound by how much of the scratch
+     * stays in L2, not by thread count. Measured on 7A6A (420k panels, 12
+     * matvecs): 64 MiB -> 11.66 s, 256 MiB -> 9.72 s, 1 GiB -> 16.87 s,
+     * 4 GiB -> 15.93 s, against 10.84 s for the 72-thread CPU evaluator. The
+     * optimum is where the working set still fits the cache. Tuned on one mesh
+     * and one card, so it is exposed as a knob. */
+    double budgetMiB = 256.0;
+    if (env != NULL && env[0] != '\0') {
+      char *e2 = NULL; double v = strtod(env, &e2);
+      if (e2 != env && *e2 == '\0' && v > 0.0) budgetMiB = v;
+    }
+    stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
+                         ((double)slabDoubles * sizeof(double)));
+    if (stride < blockSize) stride = blockSize;
+    if (stride > gCTE.nPanels) stride = gCTE.nPanels;
+    stride = ((stride + blockSize - 1) / blockSize) * blockSize;
+  }
+  scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
+
+  if (scratchStride != stride) {
+    cudaFree(d_scratch); d_scratch = NULL;
+    if (!cudaMallocNearfield((void **)&d_scratch, scratchBytes, "cte scratch")) {
+      scratchStride = 0;
+      return 0;
+    }
+    scratchStride = stride;
+  }
+  if (d_levOff == NULL) {
+    if (!cudaMallocNearfield((void **)&d_levOff, levOff.size() * sizeof(int), "cte levOff") ||
+        !cudaMemcpyNearfield(d_levOff, &levOff[0], levOff.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte levOff")) return 0;
+  }
+
+  gridSize = (int)(stride / blockSize);
+  chargeTreeEnergyKernel<<<gridSize, blockSize>>>(
+      gCTE.nPanels, gCTE.derivOrderMax, gCTE.idxDim, sys->chgDepth, sys->height,
+      energyTreeTheta(), kappa, epsilon, fourPiI,
+      gCTE.d_panels,
+      gCTE.d_nodeCtr, gCTE.d_nodeRad, gCTE.d_nodeLevel,
+      gCTE.d_nodeKidStart, gCTE.d_nodeKidCount,
+      gCTE.d_nodeChgStart, gCTE.d_nodeChgCount,
+      gCTE.d_nodeMomOff, gCTE.d_nodeOrder,
+      gCTE.d_kidIdx, gCTE.d_chgIdx, gCTE.d_moments,
+      gCTE.d_pos, gCTE.d_chr,
+      gCTE.d_idx3, gCTE.d_sgn3, d_levOff,
+      d_scratch, stride,
+      gCTE.d_out);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("charge-tree energy launch failed: %s", cudaGetErrorString(err));
+    return 0;
+  }
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("charge-tree energy kernel failed: %s", cudaGetErrorString(err));
+    return 0;
+  }
+
+  host.resize((size_t)2 * gCTE.nPanels);
+  if (!cudaMemcpyNearfield(&host[0], gCTE.d_out,
+                           (size_t)2 * gCTE.nPanels * sizeof(double),
+                           cudaMemcpyDeviceToHost, "cte out")) return 0;
+
+  /* Same combination as panelEnergyWorker(): entry i is panelByIdx[i], whose
+   * own idx selects the solution components. */
+  for (i = 0; i < gCTE.nPanels; i++) {
+    panel *pnl = sys->panelByIdx[i];
+    total += host[2 * i] * sgm[pnl->idx + sys->nPnls] + host[2 * i + 1] * sgm[pnl->idx];
+  }
+  *pot = total;
+  if (sys->benchmarkMode > 0) {
+    printf("GPU charge-tree energy: threads=%lld grid=%d scratch=%.3f GiB slab=%lld doubles\n",
+           stride, gridSize, bytesToGiB(scratchBytes), slabDoubles);
+  }
+  return 1;
+}
+

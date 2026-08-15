@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include "gkGlobal.h"
 #include "gk.h"
+#include "gpu_backend.h"
 
 /* blas: matrix times vector */
 void dgemv_(char *tr, int *m, int *n, double *alpha, double *A, int *lda,
@@ -709,6 +710,23 @@ void applyPanelChargeTreeEnergy( ssystem *sys, double *sgm, double *pot ) {
   *pot = 0.0;
   if (sys->nPnls <= 0) {
     return;
+  }
+
+  /*
+   * Try the device first. It walks the same tree with the same acceptance
+   * rule, one warp per panel; if it is unavailable, or the quadrature order is
+   * not the single-point rule it assumes, it reports failure and the threaded
+   * CPU evaluator below runs instead.
+   */
+  {
+    /* FABIPB_ENERGY_GPU=0 forces the CPU evaluator while leaving the rest of
+     * the solve on the GPU, so the two evaluators can be compared on one
+     * identical solution vector. */
+    const char *envGpu = getenv("FABIPB_ENERGY_GPU");
+    int wantGpu = !(envGpu != NULL && atoi(envGpu) == 0);
+    if (wantGpu && sys->gpuMode > 0 && gpuPanelChargeTreeEnergy(sys, sgm, pot)) {
+      return;
+    }
   }
 
   panels = panelEnergyArray(sys, &ownPanels);
