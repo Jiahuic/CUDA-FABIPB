@@ -1342,9 +1342,14 @@ int MtVmain(double *alpha, double *sgm, double *beta, double *pot) {
     applyFMM(sys, alpha, sgm, &inv_beta, pot);
   }
   applyEnd = wall_seconds();
-  for (  i=0, pnl=sys->pnlLst; pnl!=NULL; pnl=pnl->nextC, i++ ) {
-    pot[i] = (scale1*pnl->area*sgm[i]-pot[i]);
-    pot[i+nPnls] = scale2*pnl->area*sgm[i+nPnls]-pot[i+nPnls];
+  /* Indexed over the contiguous area array rather than walking the panel list;
+   * see buildPanelIndex() in fmm.c. */
+  {
+    const double *area = sys->panelArea;
+    for ( i = 0; i < nPnls; i++ ) {
+      pot[i] = (scale1*area[i]*sgm[i]-pot[i]);
+      pot[i+nPnls] = scale2*area[i]*sgm[i+nPnls]-pot[i+nPnls];
+    }
   }
   callEnd = wall_seconds();
 

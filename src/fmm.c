@@ -79,14 +79,27 @@ static void buildApplyLayout(ssystem *sys) {
   }
 }
 
+/*
+ * Index the panels, and copy their areas into a contiguous array.
+ *
+ * MtVmain and the diagonal preconditioner both need nothing from a panel but
+ * its area, yet each used to walk the whole linked list to get it -- chasing
+ * 10.2M pointers through 320-byte structs, roughly 3 GB of traffic, twice per
+ * GMRES iteration. On the full virus that was 90 s in MtVmain and another 90 s
+ * in psolve, about 14% of the solve, purely to read one double per panel.
+ * A 78 MB array of areas replaces both walks and lets those loops be indexed
+ * (and so parallelised) instead of pointer-chased.
+ */
 static void buildPanelIndex(ssystem *sys) {
   int idx;
   panel *pnl;
 
   CALLOC(sys->panelByIdx, sys->nPnls, panel *);
+  CALLOC(sys->panelArea, sys->nPnls, double);
   for (idx = 0, pnl = sys->pnlLst; pnl != NULL; pnl = pnl->nextC, idx++) {
     ASSERT(idx < sys->nPnls);
     sys->panelByIdx[idx] = pnl;
+    sys->panelArea[idx] = pnl->area;
   }
   ASSERT(idx == sys->nPnls);
 }

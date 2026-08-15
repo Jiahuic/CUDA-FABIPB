@@ -60,6 +60,29 @@ typedef struct {
   int failedIdx;
 } PrecondApplyTask;
 
+typedef struct {
+  double *pot;
+  const double *sgm;
+  const double *area;
+  int nPnls;
+  int begin;
+  int end;
+  double scale1;
+  double scale2;
+} DiagPrecondTask;
+
+static void *diagPrecondWorker(void *arg) {
+  DiagPrecondTask *task = (DiagPrecondTask *)arg;
+  int nPnls = task->nPnls;
+  int i;
+
+  for (i = task->begin; i < task->end; i++) {
+    task->pot[i] = task->sgm[i] / (task->scale1 * task->area[i]);
+    task->pot[nPnls + i] = task->sgm[nPnls + i] / (task->scale2 * task->area[i]);
+  }
+  return NULL;
+}
+
 static double wall_seconds_pc(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -405,12 +428,63 @@ int PtVfmmDiagonal(double *pot, double *sgm) {
   int nPnls = sys->nPnls;
   double scale1 = (1.0 + epsilon) / 2.0;
   double scale2 = (1.0 + 1.0 / epsilon) / 2.0;
-  panel *pnl;
+  const double *area = sys->panelArea;
   int i;
 
-  for (pnl = sys->pnlLst, i = 0; pnl != NULL; pnl = pnl->nextC, i++) {
-    pot[i] = sgm[i] / (scale1 * pnl->area);
-    pot[nPnls + i] = sgm[nPnls + i] / (scale2 * pnl->area);
+  /* Indexed over the contiguous area array rather than walking the panel list;
+   * see buildPanelIndex() in fmm.c. Entries are independent, so the loop is
+   * split across threads with disjoint output ranges -- the result does not
+   * depend on the thread count. */
+  {
+    int nThreads = applyThreadCountPc(nPnls);
+    if (nThreads <= 1) {
+      for (i = 0; i < nPnls; i++) {
+        pot[i] = sgm[i] / (scale1 * area[i]);
+        pot[nPnls + i] = sgm[nPnls + i] / (scale2 * area[i]);
+      }
+    } else {
+      pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+      DiagPrecondTask *tasks =
+          (DiagPrecondTask *)calloc((size_t)nThreads, sizeof(DiagPrecondTask));
+      int t, created = 0;
+
+      if (threads == NULL || tasks == NULL) {
+        free(threads);
+        free(tasks);
+        for (i = 0; i < nPnls; i++) {
+          pot[i] = sgm[i] / (scale1 * area[i]);
+          pot[nPnls + i] = sgm[nPnls + i] / (scale2 * area[i]);
+        }
+        return 0;
+      }
+      for (t = 0; t < nThreads; t++) {
+        tasks[t].pot = pot;
+        tasks[t].sgm = sgm;
+        tasks[t].area = area;
+        tasks[t].nPnls = nPnls;
+        tasks[t].scale1 = scale1;
+        tasks[t].scale2 = scale2;
+        tasks[t].begin = (int)(((long long)nPnls * t) / nThreads);
+        tasks[t].end = (int)(((long long)nPnls * (t + 1)) / nThreads);
+        if (pthread_create(&threads[t], NULL, diagPrecondWorker, &tasks[t]) != 0) {
+          break;
+        }
+        created++;
+      }
+      for (t = 0; t < created; t++) {
+        pthread_join(threads[t], NULL);
+      }
+      if (created < nThreads) {
+        /* Cover whatever the unstarted threads would have done. */
+        int from = (created > 0) ? tasks[created - 1].end : 0;
+        for (i = from; i < nPnls; i++) {
+          pot[i] = sgm[i] / (scale1 * area[i]);
+          pot[nPnls + i] = sgm[nPnls + i] / (scale2 * area[i]);
+        }
+      }
+      free(tasks);
+      free(threads);
+    }
   }
 
   return 0;

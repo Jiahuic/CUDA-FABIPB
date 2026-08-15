@@ -103,6 +103,7 @@ struct ssystem {
   int *m2lDstGroupStart;    /* start offset of each destination-grouped M2L range */
   int *m2lDstGroupCount;    /* interaction count of each destination-grouped M2L range */
   panel **panelByIdx;       /* direct panel lookup by contiguous index */
+  double *panelArea;        /* pnl->area by contiguous index; see buildPanelIndex */
   int maxlevCudes;          /* max cubes at finest level */
   int maxlevnPnls;          /* max panels in a cube at finest level */
   panel *pnlLst;            /* linked list of panels (Contiguous wn cubes) */
