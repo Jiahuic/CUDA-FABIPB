@@ -31,11 +31,24 @@ fabipb_timeout="${FABIPB_TIMEOUT:-}"
 live_log="${LIVE_LOG:-1}"
 rhs_threads="${FABIPB_RHS_THREADS:-${FMM_RHS_THREADS:-$(nproc)}}"
 energy_threads="${FABIPB_ENERGY_THREADS:-${FMM_ENERGY_THREADS:-$(nproc)}}"
+# FABIPB's own worker pools. These have to be passed explicitly: the command
+# below runs through with_benchmark_env.sh, which otherwise pins every pool to
+# a single thread for benchmark reproducibility. That is the right default when
+# comparing runs, but it is not what a production solve wants -- these pools
+# partition their loops into disjoint output slots, so the result is identical
+# at any thread count and the pinning only costs time.
+worker_threads="${FABIPB_WORKER_THREADS:-$(nproc)}"
 rhs_tree_theta="${FABIPB_RHS_TREE_THETA:-${FMM_RHS_TREE_THETA:-0.3}}"
 rhs_sample_stride="${FABIPB_RHS_SAMPLE_STRIDE:-${RHS_SAMPLE_STRIDE:-1000}}"
 m2l_chunk_mib="${FABIPB_GPU_M2L_CHUNK_MIB:-512}"
 nearfield_chunk_mib="${FABIPB_GPU_NEARFIELD_CHUNK_MIB:-512}"
-energy_mode="${FABIPB_ENERGY_MODE:-charge-tree}"
+# panel-tree by default: on the full virus it evaluated the energy in 445 s
+# against 1279 s for charge-tree, and it is also the more accurate of the two.
+# Against the theta->0 limit the charge-tree evaluator is off by 1.1e-3 on 1a63
+# because it hardcodes theta=0.2, where panel-tree is off by 7.2e-6. Set
+# FABIPB_ENERGY_MODE=charge-tree to reproduce pre-2026-08 energies exactly, or
+# =compare to run both and print the difference.
+energy_mode="${FABIPB_ENERGY_MODE:-panel-tree}"
 
 nanoshaper_bin="${FABIPB_NANOSHAPER_BIN:-}"
 if [[ -z "$nanoshaper_bin" ]]; then
@@ -93,6 +106,7 @@ sdie=$sdie
 force_tree_rhs=1
 rhs_threads=$rhs_threads
 energy_threads=$energy_threads
+worker_threads=$worker_threads
 rhs_tree_theta=$rhs_tree_theta
 rhs_summary_path=$rhs_summary_path
 rhs_sample_path=$rhs_sample_path
@@ -111,6 +125,10 @@ env_args=(
   FABIPB_FORCE_TREE_RHS=1
   FABIPB_RHS_THREADS="$rhs_threads"
   FABIPB_ENERGY_THREADS="$energy_threads"
+  FABIPB_NEARFIELD_BUILD_THREADS="$worker_threads"
+  FABIPB_SETUP_THREADS="$worker_threads"
+  FABIPB_PRECOND_APPLY_THREADS="$worker_threads"
+  FABIPB_DIRECT_THREADS="$worker_threads"
   FABIPB_RHS_TREE_THETA="$rhs_tree_theta"
   FABIPB_RHS_SUMMARY_PATH="$rhs_summary_path"
   FABIPB_RHS_SAMPLE_PATH="$rhs_sample_path"

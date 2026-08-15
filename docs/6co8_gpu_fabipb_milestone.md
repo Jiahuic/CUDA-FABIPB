@@ -76,6 +76,12 @@ code default. Relative to `theta=0.2`, sampled full-virus RHS differences were
 0.0136% for component 0 and 0.1288% for component 1. On `1a63`, the component
 errors against direct RHS were 5.10e-4 and 2.39e-3 at `theta=0.3`.
 
+That RHS ratio applies only to the RHS. The post-solve energy treecode has its
+own `FABIPB_ENERGY_TREE_THETA` (default 0.2), deliberately separate: loosening
+the RHS to 0.3 is a reasonable trade because setupRHS runs once per solve, but
+applying the same 0.3 to the energy cost 70x accuracy on `1a63` (7.2e-6 ->
+5.2e-4 against the theta->0 limit) for a stage that also runs only once.
+
 ## What Made The Full Solve Possible
 
 1. **Zenodo PQR handling.** Zero-radius atoms are retained in the charge list
@@ -165,6 +171,68 @@ should target nearfield throughput and the post-solve energy treecode, while
 the next accuracy work should compare the panel-Galerkin and TABI nodepatch
 representations on one byte-identical mesh.
 
+## Optimized Rerun (2026-08-15)
+
+The nearfield and energy work described below was applied and the `sdens=1`
+case rerun on the saved mesh with the same settings (`-a=20`, `-t=8`, `-P=3`,
+`eps1=4`, `eps2=80`, tolerance `1e-4`, `theta=0.3`).
+
+**The result is unchanged to every digit**: `-123,418.693595`, `info=1`, 100
+iterations, final residual `1.509927e-4`. That is the intended outcome -- none
+of the changes were meant to alter the discretization, only to stop
+recomputing and re-transferring geometry that does not change between matvecs.
+
+| Stage | Recorded | Optimized | Speedup |
+|---|---:|---:|---:|
+| Total | 4,429.31 s | 2,576.49 s | 1.72x |
+| Load panels | 23.97 s | 8.85 s | 2.71x |
+| Set up RHS | 129.80 s | 126.67 s | 1.02x |
+| GMRES | 2,994.99 s | 702.86 s | 4.26x |
+| Energy treecode | 1,267.42 s | 1,724.50 s | see below |
+
+Inside GMRES:
+
+| | Recorded | Optimized | Speedup |
+|---|---:|---:|---:|
+| Nearfield | 2,430.67 s | 141.39 s | 17.19x |
+| Nearfield GPU timer | 2,425.41 s | 135.70 s | 17.87x |
+| Matvec total | 2,851.33 s | 559.00 s | 5.10x |
+| M2L | 144.65 s | 144.17 s | 1.00x |
+
+The rerun used `FABIPB_ENERGY_MODE=compare`, so its energy stage ran **both**
+evaluators and is not comparable as printed: charge-tree took 1,279.22 s
+(matching the 1,267.42 s recorded) and panel-tree 445.28 s. With panel-tree
+alone -- now the runner default -- the total is **1,297 s, a 3.41x overall
+speedup**.
+
+Both evaluators at full scale:
+
+```text
+charge-tree  -59.151987570322532   1279.22 s
+panel-tree   -59.154442436439652    445.28 s   (rel-diff 4.15e-5)
+```
+
+The panel-tree value is the more accurate of the two; see the theta->0
+convergence check in the source comment on `energyTreeTheta()`.
+
+New machinery, at scale, all within budget:
+
+```text
+special-pair cache   138,366,798 pairs   5.155 GiB host   168 chunks
+leaf-pair table       25,529,703 pairs   0.476 GiB device
+pinned staging        6/6 buffers        0.500 GiB host
+```
+
+M2L is now the largest single matvec cost (144 s of 559 s) and the energy
+treecode the largest stage overall (445 s of 1,297 s). Note the M2L
+coefficient rebuild is the same class of redundant per-matvec work that the
+nearfield cache removed, and has not been addressed.
+
+`sdens=2` has not been rerun. Its cache would need roughly 21 GiB against the
+32 GiB default budget, and its leaf-pair table is about four times larger, so
+the binary search in the index-generating kernel runs a couple of levels
+deeper.
+
 ## Result Locations
 
 Raw result directories are intentionally ignored by Git:
@@ -172,7 +240,27 @@ Raw result directories are intentionally ignored by Git:
 ```text
 results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_full/
 results/fmm/6co8_fabipb_sdens2/zenodo_R05_rhs/
+results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_optimized/
 results/debug/tabi_fmm_normal_component1/zenodo_sdens1_gpu_streaming/
+```
+
+The optimized rerun reused the saved mesh from the original `sdens=1`
+directory by hard-linking `input.face`, `input.vert` and `input.xyzr` into the
+new output directory, so NanoShaper never ran and both solves are on a
+byte-identical surface:
+
+```sh
+SRC=results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_full
+OUT=results/fmm/6co8_fabipb_sdens1/zenodo_R1_depth8_optimized
+mkdir -p "$OUT"
+for f in input.face input.vert input.xyzr; do ln "$SRC/$f" "$OUT/$f"; done
+
+ALLOW_EXISTING_OUT_DIR=1 \
+FMM_R=1 FMM_DEPTH=8 FMM_GPU=1 FMM_PRECONDITIONER=3 \
+GMRES_INITIAL=zero GMRES_RESTART=20 GMRES_MAX_ITER=100 GMRES_TOLERANCE=1e-4 \
+FABIPB_RHS_TREE_THETA=0.3 FABIPB_ENERGY_MODE=compare \
+FABIPB_TIMEOUT=12h LIVE_LOG=1 OUT_DIR="$OUT" \
+scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
 ```
 
 The compact numerical record in this document is the version-controlled
