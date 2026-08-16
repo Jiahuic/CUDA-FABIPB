@@ -89,16 +89,31 @@ struct ssystem {
   /*
    * 0=original, 1=cached local blocks, 2=cached LU, 3=diagonal/Jacobi.
    *
-   * There is no single best mode; it flips with problem size, so the default
-   * of 2 is right only for small and moderate cases. Measured iteration counts
-   * at tol 1e-4: on 1a63, mode 2 takes 29 and mode 3 takes 83, and mode 2 also
-   * wins on 1cbn and 1ajj (8 against 9). On the 6CO8 capsid it inverts hard --
-   * at sdens=2 mode 2 needed 51 iterations and 356.7 s of psolve against mode
-   * 3's 37 iterations and 0.34 s, and at sdens=1 mode 2 stalled at the
-   * 100-iteration cap with residual 1.24e-1 where mode 3 converged in 87.
-   * run_6co8_fabipb_fast.sh therefore passes -P=3, and any capsid-scale run
-   * should. (The capsid mode-2 figures predate the transL2L fix and several
-   * other changes; the direction is clear but the exact numbers are stale.)
+   * Mode 3 is faster than mode 2 in nearly everything measured, despite
+   * usually costing one more iteration: mode 2's setup and heavier solve
+   * outweigh the better convergence. Wall clock at tol 1e-4, R=1.0, q=1,
+   * a=30, mode 2 against mode 3:
+   *
+   *   1cbn eps1=1   8 its 0.381 s  |  9 its 0.326 s
+   *   1cbn eps1=4   8 its 0.505 s  |  9 its 0.381 s
+   *   1ajj eps1=1   8 its 0.478 s  |  9 its 0.371 s
+   *   1ajj eps1=4   8 its 0.486 s  |  9 its 0.360 s
+   *   1a63 eps1=1  29 its 1.047 s  | 83 its 1.359 s   <- the one mode-2 win
+   *   1a63 eps1=4  20 its 0.949 s  | 20 its 0.757 s
+   *
+   * The exception is driven by dielectric contrast, not problem size: at
+   * eps1=1/eps2=80 the diagonal preconditioner needs 83 iterations on 1a63,
+   * and at eps1=4/eps2=80 it needs 20, the same as mode 2. Since the capsid
+   * runs use eps1=4, that regime is the relevant one, and there mode 2 is
+   * strictly worse -- at sdens=2 it needed 51 iterations and 356.7 s of
+   * preconditioner solve against mode 3's 37 and 0.34 s, and at sdens=1 it
+   * stalled at the 100-iteration cap with residual 1.24e-1 where mode 3
+   * converged in 87. (Those capsid figures predate the transL2L fix and other
+   * changes; the direction is solid, the numbers are stale.)
+   *
+   * The default is left at 2 only because changing it shifts every existing
+   * small-case baseline; on this evidence 3 would be the better default for
+   * anything but a high-contrast dielectric.
    */
   int precondCacheMode;
   int nLeafCubesFlat;       /* flattened finest-level cube count */

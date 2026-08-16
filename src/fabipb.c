@@ -508,8 +508,9 @@ static void print_usage(const char *prog) {
   printf("  -Q=0|1    CPU dgemv loop or GPU Q2M path (default: 1)\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
   printf("  -P=-1|0|1|2|3  disabled, original, cached-block, cached-LU, or diagonal/Jacobi preconditioner (default: 2)\n");
-  printf("                 2 converges fastest on small and moderate cases; use 3 at capsid scale,\n");
-  printf("                 where 2 costs far more preconditioner-solve time and can stall.\n");
+  printf("                 3 is faster than 2 in most measured cases and is required at capsid\n");
+  printf("                 scale, where 2 costs far more preconditioner-solve time and can stall;\n");
+  printf("                 2 wins mainly at high dielectric contrast (eps1=1 against eps2=80).\n");
   printf("  -t=<lev>  tree depth\n");
   printf("  -H=<lev>  coarsest active FMM level (default: 2)\n");
   printf("  -q=<ord>  panel quadrature order\n");
