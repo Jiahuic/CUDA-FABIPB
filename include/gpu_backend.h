@@ -22,6 +22,8 @@ int gpuSetupRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
  * to fall back to the threaded CPU evaluator.
  */
 int gpuPanelChargeTreeEnergy(struct ssystem *sys, const double *sgm, double *pot);
+/* setupRHS via the same charge-tree walk on the device. 0 => use the CPU path. */
+int gpuChargeTreeRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
 int gpuBuildPrecondDisjointBlock(struct panel **panels, int nPanels,
                                  const int *dstLocal, const int *srcLocal,
                                  int nPairs, double *block);

@@ -69,3 +69,8 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   (void)sys; (void)sgm; (void)pot;
   return 0;
 }
+
+int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
+  (void)sys; (void)qOrder; (void)fac; (void)sgm;
+  return 0;
+}

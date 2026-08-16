@@ -4572,10 +4572,14 @@ __global__ void chargeTreeEnergyKernel(
       }
 
       {
+        /* Push children in reverse so they pop in ascending order, matching the
+         * order the CPU recursion visits them. Without this the subtrees are
+         * summed back-to-front and the result differs at roundoff (4.2e-12
+         * measured on the virus RHS) for no reason. */
         int ks = nodeKidStart[node];
         int kc = nodeKidCount[node];
         int i;
-        for (i = 0; i < kc && sp < CTE_MAX_STACK; i++) stack[sp++] = kidIdx[ks + i];
+        for (i = kc - 1; i >= 0 && sp < CTE_MAX_STACK; i--) stack[sp++] = kidIdx[ks + i];
       }
     }
 
@@ -4704,3 +4708,293 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   return 1;
 }
 
+
+/* Coulomb-only derivative tensor; port of setupCoulombDerivsLocal(). Half the
+ * work and half the scratch of the screened version -- no Gk half. */
+__device__ void cteSetupCoulombDerivsStrided(int order, const double *x,
+                                             double fourPiIv,
+                                             const int *fidx3, int D,
+                                             double *gv0, double **dg0,
+                                             long long S) {
+  int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2, k;
+  double r = sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+  double r2;
+
+  gv0[0] = fourPiIv / r;
+  r2 = -1.0 / (r * r);
+  for (k = 0; k < order; k++) gv0[k + 1] = (2 * k + 1) * r2 * gv0[k];
+  for (p = 0; p <= order; p++) dg0[p][0] = gv0[p];
+  for (p = 0; p < order; p++) {
+    p1 = p + 1;
+    dg0[p][(long long)1 * S] = dg0[p1][0] * x[2];
+    dg0[p][(long long)2 * S] = dg0[p1][0] * x[1];
+    dg0[p][(long long)3 * S] = dg0[p1][0] * x[0];
+  }
+#define CTE_IDX(a,b,c) fidx3[(((a) * D) + (b)) * D + (c)]
+  for (iRow = 2; iRow <= order; iRow++) {
+    for (p = 0; p <= order - iRow; p++) {
+      p1 = p + 1;
+      idx = CTE_IDX(0, 0, iRow);
+      iRow1 = iRow - 1;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      idx2 = CTE_IDX(0, 0, iRow - 2);
+      dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[2]
+                                 + dg0[p1][(long long)idx2 * S] * iRow1;
+      idx++;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[1];
+      idx++;
+      for (i2 = 2; i2 <= iRow; i2++, idx++) {
+        i3 = iRow - i2;
+        idx1 = CTE_IDX(0, i2 - 1, i3);
+        idx2 = CTE_IDX(0, i2 - 2, i3);
+        dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[1]
+                                   + dg0[p1][(long long)idx2 * S] * (i2 - 1);
+      }
+      for (i2 = 0; i2 <= iRow1; i2++, idx++) {
+        i3 = iRow1 - i2;
+        idx1 = CTE_IDX(0, i2, i3);
+        dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[0];
+      }
+      for (i1 = 2; i1 <= iRow; i1++) {
+        for (i2 = 0; i2 <= iRow - i1; i2++, idx++) {
+          i3 = iRow - i1 - i2;
+          idx1 = CTE_IDX(i1 - 1, i2, i3);
+          idx2 = CTE_IDX(i1 - 2, i2, i3);
+          dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[0]
+                                     + dg0[p1][(long long)idx2 * S] * (i1 - 1);
+        }
+      }
+    }
+  }
+#undef CTE_IDX
+}
+
+/*
+ * setupRHS's charge-tree walk. Same traversal as the energy kernel, but the
+ * Coulomb-only kernel: no screening, no epsilon, and half the scratch, so more
+ * of the working set stays in cache.
+ */
+__global__ void chargeTreeRhsKernel(
+    int nPanels, int derivMax, int idxDim, int chgDepth, int height,
+    double theta, double fourPiIv, double fac,
+    const NearPanelGeom *panels,
+    const double *nodeCtr, const double *nodeRad, const int *nodeLevel,
+    const int *nodeKidStart, const int *nodeKidCount,
+    const int *nodeChgStart, const int *nodeChgCount,
+    const int *nodeMomOff, const int *nodeOrder,
+    const int *kidIdx, const int *chgIdx, const double *moments,
+    const double *pos, const double *chr,
+    const int *fidx3, const int *sgn3d, const int *levOff,
+    double *scratch, long long stride,
+    double *out) {
+  const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
+  double *dg0[16];
+  double gv0[18];
+  int p, panelIdx;
+
+  if (tid >= stride) return;
+  for (p = 0; p <= derivMax && p < 16; p++) {
+    dg0[p] = scratch + (long long)levOff[p] * stride + tid;
+  }
+
+  for (panelIdx = (int)tid; panelIdx < nPanels; panelIdx += (int)nThreadsTotal) {
+    const NearPanelGeom *pn = &panels[panelIdx];
+    double qpt[3], nrm[3];
+    double y0 = 0.0, y1 = 0.0;
+    int stack[CTE_MAX_STACK];
+    int sp = 0;
+    int k;
+
+    for (k = 0; k < 3; k++) {
+      qpt[k] = pn->vtx[0][k] + 0.5 * (pn->a2[k] + 0.5 * pn->a0[k]);
+      nrm[k] = pn->normal[k];
+    }
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+      int node = stack[--sp];
+      double r[3], dist;
+      for (k = 0; k < 3; k++) r[k] = qpt[k] - nodeCtr[3 * node + k];
+      dist = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+
+      if (nodeRad[node] < theta * dist && nodeLevel[node] >= height) {
+        int ordHere = nodeOrder[node];
+        const double *mom = &moments[nodeMomOff[node]];
+        double c0 = 0.0, c1 = 0.0;
+        int i, i1, i2, n;
+
+        cteSetupCoulombDerivsStrided(ordHere + 1, r, fourPiIv, fidx3, idxDim,
+                                     gv0, dg0, stride);
+        i = 0;
+        for (n = 0; n <= ordHere; n++) {
+          for (i1 = 0; i1 <= n; i1++) {
+            for (i2 = 0; i2 <= n - i1; i2++, i++) {
+              int i3 = n - i1 - i2;
+              double dn;
+#define CTE_IDX(a,b,c) fidx3[(((a) * idxDim) + (b)) * idxDim + (c)]
+              dn = nrm[0] * dg0[0][(long long)CTE_IDX(i1 + 1, i2, i3) * stride]
+                 + nrm[1] * dg0[0][(long long)CTE_IDX(i1, i2 + 1, i3) * stride]
+                 + nrm[2] * dg0[0][(long long)CTE_IDX(i1, i2, i3 + 1) * stride];
+#undef CTE_IDX
+              c0 += sgn3d[i] * mom[i] * dg0[0][(long long)i * stride];
+              c1 += sgn3d[i] * mom[i] * dn;
+            }
+          }
+        }
+        /* chgClusterEvalLocal divides both components by fourPiI */
+        y0 += c0 / fourPiIv;
+        y1 += c1 / fourPiIv;
+        continue;
+      }
+
+      if (nodeLevel[node] == chgDepth) {
+        int start = nodeChgStart[node];
+        int cnt = nodeChgCount[node];
+        int i;
+        for (i = 0; i < cnt; i++) {
+          int j = chgIdx[start + i];
+          double x[3], r2, ri, r3i, ip;
+          for (k = 0; k < 3; k++) x[k] = qpt[k] - pos[3 * j + k];
+          r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+          ri = 1.0 / sqrt(r2);
+          r3i = ri / r2;
+          ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
+          y0 += chr[j] * ri;
+          y1 += chr[j] * (-ip * r3i);
+        }
+        continue;
+      }
+
+      {
+        /* Push children in reverse so they pop in ascending order, matching the
+         * order the CPU recursion visits them. Without this the subtrees are
+         * summed back-to-front and the result differs at roundoff (4.2e-12
+         * measured on the virus RHS) for no reason. */
+        int ks = nodeKidStart[node];
+        int kc = nodeKidCount[node];
+        int i;
+        for (i = kc - 1; i >= 0 && sp < CTE_MAX_STACK; i--) stack[sp++] = kidIdx[ks + i];
+      }
+    }
+
+    /* qOrd==1: weight 0.5 then 2*area gives area; setupRHS then applies fac. */
+    out[panelIdx] = y0 * pn->area * fac;
+    out[nPanels + panelIdx] = y1 * pn->area * fac;
+  }
+}
+
+extern "C" double rhsTreeTheta(void);
+
+int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
+  int blockSize = 128, gridSize;
+  long long stride, slabDoubles;
+  size_t scratchBytes;
+  cudaError_t err;
+  std::vector<double> host;
+  std::vector<int> levOff;
+  int p, i;
+  static double *d_scratch = NULL;
+  static int *d_levOff = NULL;
+  static long long scratchStride = 0;
+  static const ssystem *scratchSys = NULL;
+
+  if (sys == NULL || sgm == NULL) return 0;
+  if (!gpuBackendAvailable()) return 0;
+  if (qOrder != 1) return 0;              /* kernel assumes the 1-point rule */
+  if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) return 0;
+  if (envFlagEnabled("FABIPB_RHS_GPU_DISABLE")) return 0;
+
+  if (gCTE.sys != sys) {
+    freeChargeTreeGpu();
+    if (!buildChargeTreeGpu(sys)) { freeChargeTreeGpu(); return 0; }
+  }
+  if (gCTE.derivOrderMax + 1 >= 16) return 0;
+
+  if (scratchSys != sys) {
+    cudaFree(d_scratch); d_scratch = NULL;
+    cudaFree(d_levOff);  d_levOff = NULL;
+    scratchStride = 0;
+    scratchSys = sys;
+  }
+
+  /* Only the Coulomb half is needed here, so the slab is half the energy
+   * kernel's and more of it stays resident. */
+  levOff.resize((size_t)gCTE.derivOrderMax + 2);
+  levOff[0] = 0;
+  for (p = 0; p <= gCTE.derivOrderMax; p++) {
+    levOff[(size_t)p + 1] = levOff[(size_t)p] + sys->nMom[gCTE.derivOrderMax - p];
+  }
+  slabDoubles = levOff[(size_t)gCTE.derivOrderMax + 1];
+
+  {
+    const char *env = getenv("FABIPB_RHS_GPU_SCRATCH_MIB");
+    double budgetMiB = 256.0;   /* same reasoning as the energy evaluator */
+    if (env != NULL && env[0] != '\0') {
+      char *e2 = NULL; double v = strtod(env, &e2);
+      if (e2 != env && *e2 == '\0' && v > 0.0) budgetMiB = v;
+    }
+    stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
+                         ((double)slabDoubles * sizeof(double)));
+    if (stride < blockSize) stride = blockSize;
+    if (stride > gCTE.nPanels) stride = gCTE.nPanels;
+    stride = ((stride + blockSize - 1) / blockSize) * blockSize;
+  }
+  scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
+
+  if (scratchStride != stride) {
+    cudaFree(d_scratch); d_scratch = NULL;
+    if (!cudaMallocNearfield((void **)&d_scratch, scratchBytes, "rhs scratch")) {
+      scratchStride = 0; return 0;
+    }
+    scratchStride = stride;
+  }
+  if (d_levOff == NULL) {
+    if (!cudaMallocNearfield((void **)&d_levOff, levOff.size() * sizeof(int), "rhs levOff") ||
+        !cudaMemcpyNearfield(d_levOff, &levOff[0], levOff.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "rhs levOff")) return 0;
+    }
+
+  gridSize = (int)(stride / blockSize);
+  chargeTreeRhsKernel<<<gridSize, blockSize>>>(
+      gCTE.nPanels, gCTE.derivOrderMax, gCTE.idxDim, sys->chgDepth, sys->height,
+      rhsTreeTheta(), fourPiI, fac,
+      gCTE.d_panels,
+      gCTE.d_nodeCtr, gCTE.d_nodeRad, gCTE.d_nodeLevel,
+      gCTE.d_nodeKidStart, gCTE.d_nodeKidCount,
+      gCTE.d_nodeChgStart, gCTE.d_nodeChgCount,
+      gCTE.d_nodeMomOff, gCTE.d_nodeOrder,
+      gCTE.d_kidIdx, gCTE.d_chgIdx, gCTE.d_moments,
+      gCTE.d_pos, gCTE.d_chr,
+      gCTE.d_idx3, gCTE.d_sgn3, d_levOff,
+      d_scratch, stride,
+      gCTE.d_out);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("charge-tree RHS launch failed: %s", cudaGetErrorString(err));
+    return 0;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    setNearfieldLastError("charge-tree RHS kernel failed");
+    return 0;
+  }
+
+  /* d_out is sized 2*nPanels, which is exactly the RHS layout. */
+  host.resize((size_t)2 * gCTE.nPanels);
+  if (!cudaMemcpyNearfield(&host[0], gCTE.d_out,
+                           (size_t)2 * gCTE.nPanels * sizeof(double),
+                           cudaMemcpyDeviceToHost, "rhs out")) return 0;
+
+  /* The kernel indexes panels in pnlLst order; sgm is indexed by pnl->idx. */
+  for (i = 0; i < gCTE.nPanels; i++) {
+    panel *pnl = sys->panelByIdx[i];
+    sgm[pnl->idx] = host[i];
+    sgm[pnl->idx + sys->nPnls] = host[gCTE.nPanels + i];
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU charge-tree RHS: threads=%lld scratch=%.3f GiB slab=%lld doubles theta=%g\n",
+           stride, bytesToGiB(scratchBytes), slabDoubles, rhsTreeTheta());
+  }
+  return 1;
+}

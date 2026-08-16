@@ -885,6 +885,12 @@ static void setupRHSTreeParallel(ssystem *sys, int qOrder, double fac, double *s
 
 static void setupRHSTree(ssystem *sys, int qOrder, double fac, double *sgm) {
   ensureChargeTreeBuilt(sys);
+  /* Same walk as the threaded CPU path below, on the device. Falls back
+   * whenever the GPU is unavailable or the quadrature order is not the
+   * single-point rule the kernel assumes. */
+  if (sys->gpuMode > 0 && gpuChargeTreeRHS(sys, qOrder, fac, sgm)) {
+    return;
+  }
   setupRHSTreeParallel(sys, qOrder, fac, sgm);
 }
 
