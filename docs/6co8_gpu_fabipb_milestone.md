@@ -298,18 +298,54 @@ would cut the footprint 3.09x at `derivMax=9`, to about 80 MiB. Interpolating
 the table, that is worth roughly 1.9-2.0x on the energy stage. Not yet
 implemented.
 
+### Rolling derivative scratch in the energy kernel
+
+The pyramid materialised every level when the contraction only reads level 0;
+two rows per level suffice, with the level-0 contraction fused into the row
+loop. Slab per array goes from sum_m nMom[m] to 2*nMom[derivMax]. The smaller
+slab also invalidated the flat per-SM thread count: measured optima are
+(slab 224 -> 32,768), (480 -> 22,784), (880 -> 16,384), where threads*sqrt(slab)
+is constant to 3%, so that is the rule now used.
+
+Energy stage, before -> after:
+
+| Case | derivMax | Slab | Before | After | Speedup |
+|---|---:|---:|---:|---:|---:|
+| 7A6A `-p=4` | 5 | 252 -> 224 | 2.921 s | 2.518 s | 1.16x |
+| 7A6A `-p=6` | 7 | 660 -> 480 | 14.816 s | 8.401 s | 1.76x |
+| 7A6A `-p=8` | 9 | 1430 -> 880 | 37.227 s | 26.275 s | 1.42x |
+| capsid `sdens=2` | 9 | 1430 -> 880 | 1,548.73 s | 1,223.75 s | 1.27x |
+| capsid `sdens=1` | 8 | 990 -> 660 | 233.10 s | 226.13 s | 1.03x |
+
+**The gain is highly configuration-dependent and falls off on the real capsid.**
+It is largest where the cluster expansions dominate the walk; the leaf-charge
+direct summation is untouched by the scratch change, and where it takes a bigger
+share -- as at `sdens=1` -- there is almost nothing to win. Forward projections
+from the footprint probe overestimated this stage twice (1.9-2.0x predicted,
+then 1.42x measured on 7A6A, then 1.27x and 1.03x on the capsid); the probe
+varies allocation and touched set together, while the rolling window shrinks
+them by different amounts.
+
+Correctness held at every scale. Energies match the pyramid version to every
+printed digit at all three orders on 7A6A and at every thread count swept, and
+on the capsid both densities reproduced their previous energies exactly --
+`-114,082.750614` at `sdens=2` over 41,668,120 panels and `-123,425.979217` at
+`sdens=1`, with identical iteration counts and residuals. Arithmetic and its
+order are unchanged; only the storage location moved.
+
 ### sdens=2
 
 | Stage | Recorded | Optimized | Speedup |
 |---|---:|---:|---:|
-| Total | 7,619.25 s | **2,930.54 s** | **2.60x** |
-| GMRES | 4,961.18 s | 934.87 s | 5.31x |
-| Nearfield | 3,354.73 s | 267.60 s | 12.54x |
-| M2M | 74.63 s | 3.50 s | 21.32x |
-| L2L | 57.91 s | 3.28 s | 17.65x |
-| Energy treecode | 1,890 s | 1,548.73 s | 1.22x |
-| Set up RHS | 684.16 s | 320.55 s | 2.13x |
-| M2L | 941.25 s | 446.61 s | 2.11x |
+| Total | 7,619.25 s | **2,524.93 s** | **3.02x** |
+| GMRES | 4,961.18 s | 852.75 s | 5.82x |
+| Nearfield | 3,354.73 s | 266.66 s | 12.58x |
+| M2M | 74.63 s | 3.52 s | 21.20x |
+| L2L | 57.91 s | 3.27 s | 17.71x |
+| Energy treecode | 1,890 s | 1,223.75 s | 1.54x |
+| Set up RHS | 684.16 s | 324.06 s | 2.11x |
+| M2L | 941.25 s | 445.93 s | 2.11x |
+| GMRES basis | -- | 18.33 s | 5.39x vs serial |
 
 The M2L figure validated the 2.13x projected from a forced-streaming 7A6A case,
 and Q2M went 98.5 s -> 30.3 s (3.24x) once the runner stopped overriding the
