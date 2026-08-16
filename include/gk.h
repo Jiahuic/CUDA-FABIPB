@@ -86,7 +86,21 @@ struct ssystem {
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
   int gpuQ2MMode;           /* 1=GPU Q2M (default), 0=force the CPU dgemv loop */
   int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
-  int precondCacheMode;     /* 0=original, 1=cached local blocks, 2=cached LU (preferred) */
+  /*
+   * 0=original, 1=cached local blocks, 2=cached LU, 3=diagonal/Jacobi.
+   *
+   * There is no single best mode; it flips with problem size, so the default
+   * of 2 is right only for small and moderate cases. Measured iteration counts
+   * at tol 1e-4: on 1a63, mode 2 takes 29 and mode 3 takes 83, and mode 2 also
+   * wins on 1cbn and 1ajj (8 against 9). On the 6CO8 capsid it inverts hard --
+   * at sdens=2 mode 2 needed 51 iterations and 356.7 s of psolve against mode
+   * 3's 37 iterations and 0.34 s, and at sdens=1 mode 2 stalled at the
+   * 100-iteration cap with residual 1.24e-1 where mode 3 converged in 87.
+   * run_6co8_fabipb_fast.sh therefore passes -P=3, and any capsid-scale run
+   * should. (The capsid mode-2 figures predate the transL2L fix and several
+   * other changes; the direction is clear but the exact numbers are stale.)
+   */
+  int precondCacheMode;
   int nLeafCubesFlat;       /* flattened finest-level cube count */
   int *leafPanelStart;      /* flattened per-leaf panel start index */
   int *leafPanelCount;      /* flattened per-leaf panel count */
