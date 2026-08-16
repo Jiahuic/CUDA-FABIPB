@@ -3590,6 +3590,7 @@ int deviceSmCount() {
  * FABIPB_*_GPU_SCRATCH_MIB still overrides with an explicit byte budget.
  */
 long long chargeTreeScratchThreads(const char *mibEnv, int perSm,
+                                   double sqrtCoeff,
                                    long long slabDoubles, long long nPanels,
                                    int blockSize) {
   long long stride;
@@ -3604,6 +3605,17 @@ long long chargeTreeScratchThreads(const char *mibEnv, int perSm,
   if (budgetMiB > 0.0) {
     stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
                          ((double)slabDoubles * sizeof(double)));
+  } else if (sqrtCoeff > 0.0) {
+    /*
+     * threads * sqrt(slab) = const, per SM. Once the rolling-window kernel cut
+     * the slab, a flat per-SM thread count stopped fitting: measured optima on
+     * 7A6A were (slab 224 -> 32,768), (480 -> 22,784), (880 -> 16,384), whose
+     * products with sqrt(slab) are 490k, 499k and 486k -- constant to 3%, where
+     * the thread counts themselves span 2x and the byte budgets span 2x in the
+     * other direction. Fitted on one card, so it is still overridable.
+     */
+    stride = (long long)((double)deviceSmCount() * sqrtCoeff /
+                         sqrt((double)slabDoubles));
   } else {
     stride = (long long)deviceSmCount() * perSm;
   }
@@ -4216,6 +4228,15 @@ int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
  * =================================================================== */
 
 #define CTE_MAX_STACK 64
+
+/*
+ * Row geometry of the Cartesian derivative tensor, from the nMom table already
+ * on the device. nMom[m] counts rows 0..m, so row m starts at nMom[m-1] and
+ * holds nMom[m]-nMom[m-1] = (m+1)(m+2)/2 entries. Used to convert the global
+ * indices in idx3 into offsets within a single row.
+ */
+#define CTE_ROWOFF(nm, m) (((m) <= 0) ? 0 : (nm)[(m) - 1])
+#define CTE_ROWLEN(nm, m) ((nm)[m] - CTE_ROWOFF(nm, m))
 #define CTE_WARP 32
 
 struct ChargeTreeGpu {
@@ -4543,8 +4564,27 @@ __device__ void cteSetupDerivsStrided(int order, const double *x,
  * scratch: the whole point is that it is proportional to the number of resident
  * threads, not to the panel count.
  *
- * Per-level sizes follow the CPU: level p holds nMom[derivMax - p] entries,
- * which the recurrence never exceeds because p + iRow <= order <= derivMax.
+ * Storage is a rolling window, not the whole pyramid. The recurrence builds row
+ * iRow of level p from rows iRow-1 and iRow-2 of level p+1, and the loop already
+ * runs iRow outermost, so only two rows per level ever need to be live. Level 0
+ * is the only level the contraction reads, and term n of it needs rows n and
+ * n+1, so the contraction is fused into the row loop and level 0 needs no more
+ * storage than any other level.
+ *
+ * That takes the slab from sum_m nMom[m] = C(derivMax+4,4) down to
+ * 2*nMom[derivMax] per array -- 715 -> 440 doubles at derivMax=9. It matters
+ * because the kernel is footprint-bound: holding threads, arithmetic and
+ * coalescing fixed and varying only the footprint gave 248.6 MiB -> 37.17 s
+ * against 2.8 MiB -> 14.92 s on 7A6A, so roughly 2.5x is the ceiling for any
+ * footprint reduction (see docs/6co8_gpu_fabipb_milestone.md).
+ *
+ * Row m lives in slot m&1, so writing row iRow reuses the slot holding row
+ * iRow-2, which is dead by then. Levels are visited with p ascending, and level
+ * p reads only level p+1, so level p's overwrite of its own iRow-2 slot always
+ * happens after level p-1 has read it.
+ *
+ * Every arithmetic operation and its order are unchanged from the pyramid
+ * version -- only where the values are stored -- so the output is bit-identical.
  */
 __global__ void chargeTreeEnergyKernel(
     int nPanels, int derivMax, int idxDim, int chgDepth, int height,
@@ -4557,20 +4597,26 @@ __global__ void chargeTreeEnergyKernel(
     const int *kidIdx, const int *chgIdx, const double *moments,
     const double *pos, const double *chr,
     const int *fidx3, const int *sgn3d, const int *levOff,
+    const int *nMomT,
     double *scratch, long long stride,
     double *out) {
   const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
-  double *dg0[16];
-  double *dgk[16];
+  /* Base of each level's two-row window; slot m&1 holds row m. */
+  double *lev0[16];
+  double *levk[16];
+  int rowCap[16];            /* allocated row length at this level */
   double gv0[18], gvk[18];
+  const long long halfOff = (long long)levOff[derivMax + 1];
   int p;
   int panelIdx;
 
   if (tid >= stride) return;
   for (p = 0; p <= derivMax && p < 16; p++) {
-    dg0[p] = scratch + (long long)levOff[p] * stride + tid;
-    dgk[p] = scratch + ((long long)levOff[derivMax + 1] + levOff[p]) * stride + tid;
+    lev0[p] = scratch + (long long)levOff[p] * stride + tid;
+    levk[p] = scratch + (halfOff + levOff[p]) * stride + tid;
+    /* Level p never holds a row longer than row(derivMax - p). */
+    rowCap[p] = CTE_ROWLEN(nMomT, derivMax - p);
   }
 
   for (panelIdx = (int)tid; panelIdx < nPanels; panelIdx += (int)nThreadsTotal) {
@@ -4598,28 +4644,115 @@ __global__ void chargeTreeEnergyKernel(
         const double *mom = &moments[nodeMomOff[node]];
         int i, i1, i2, n;
 
-        cteSetupDerivsStrided(ordHere + 1, r, kap, fourPiIv, fidx3, idxDim,
-                              gv0, gvk, dg0, dgk, stride);
-        i = 0;
-        for (n = 0; n <= ordHere; n++) {
-          for (i1 = 0; i1 <= n; i1++) {
-            for (i2 = 0; i2 <= n - i1; i2++, i++) {
-              int i3 = n - i1 - i2;
-              double dnG0, dnGk;
+        int order = ordHere + 1;
+        int iRow;
+        double rr = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+
 #define CTE_IDX(a,b,c) fidx3[(((a) * idxDim) + (b)) * idxDim + (c)]
-              dnG0 = nrm[0] * dg0[0][(long long)CTE_IDX(i1 + 1, i2, i3) * stride]
-                   + nrm[1] * dg0[0][(long long)CTE_IDX(i1, i2 + 1, i3) * stride]
-                   + nrm[2] * dg0[0][(long long)CTE_IDX(i1, i2, i3 + 1) * stride];
-              dnGk = nrm[0] * dgk[0][(long long)CTE_IDX(i1 + 1, i2, i3) * stride]
-                   + nrm[1] * dgk[0][(long long)CTE_IDX(i1, i2 + 1, i3) * stride]
-                   + nrm[2] * dgk[0][(long long)CTE_IDX(i1, i2, i3 + 1) * stride];
-#undef CTE_IDX
-              y0 += sgn3d[i] * mom[i] * (dg0[0][(long long)i * stride] -
-                                         dgk[0][(long long)i * stride]);
-              y1 += sgn3d[i] * mom[i] * (eps * dnGk - dnG0);
+/* Address of local entry `l` of row `m` at level `q`, in each half. */
+#define CTE_A0(q,m,l) (lev0[q] + (long long)(((m) & 1) * rowCap[q] + (l)) * stride)
+#define CTE_AK(q,m,l) (levk[q] + (long long)(((m) & 1) * rowCap[q] + (l)) * stride)
+
+        cteRadialDerivs(rr, order, kap, fourPiIv, gv0, gvk);
+
+        /* Row 0 of every level is the radial derivative itself. */
+        for (p = 0; p <= order; p++) {
+          *CTE_A0(p, 0, 0) = gv0[p];
+          *CTE_AK(p, 0, 0) = gvk[p];
+        }
+        /* Row 1: three entries, each level p from level p+1's single row-0. */
+        for (p = 0; p < order; p++) {
+          double a0 = *CTE_A0(p + 1, 0, 0), ak = *CTE_AK(p + 1, 0, 0);
+          *CTE_A0(p, 1, 0) = a0 * r[2];  *CTE_AK(p, 1, 0) = ak * r[2];
+          *CTE_A0(p, 1, 1) = a0 * r[1];  *CTE_AK(p, 1, 1) = ak * r[1];
+          *CTE_A0(p, 1, 2) = a0 * r[0];  *CTE_AK(p, 1, 2) = ak * r[0];
+        }
+
+        /*
+         * Rows 2..order, then the contraction of term n = iRow-1, which needs
+         * exactly level 0's rows n and n+1 -- both live at this point. Doing it
+         * here keeps the n ordering of the accumulation identical to the
+         * unfused version, so y0/y1 come out bit-identical.
+         */
+        for (iRow = 1; iRow <= order; iRow++) {
+          if (iRow >= 2) {
+            for (p = 0; p <= order - iRow; p++) {
+              int p1 = p + 1;
+              int off  = CTE_ROWOFF(nMomT, iRow);
+              int off1 = CTE_ROWOFF(nMomT, iRow - 1);
+              int off2 = CTE_ROWOFF(nMomT, iRow - 2);
+              int iRow1 = iRow - 1;
+              int l = CTE_IDX(0, 0, iRow) - off;
+              int l1 = CTE_IDX(0, 0, iRow1) - off1;
+              int l2 = CTE_IDX(0, 0, iRow - 2) - off2;
+
+              *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[2]
+                                  + *CTE_A0(p1, iRow - 2, l2) * iRow1;
+              *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[2]
+                                  + *CTE_AK(p1, iRow - 2, l2) * iRow1;
+              l++;
+              l1 = CTE_IDX(0, 0, iRow1) - off1;
+              *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[1];
+              *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[1];
+              l++;
+              for (i2 = 2; i2 <= iRow; i2++, l++) {
+                int i3 = iRow - i2;
+                l1 = CTE_IDX(0, i2 - 1, i3) - off1;
+                l2 = CTE_IDX(0, i2 - 2, i3) - off2;
+                *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[1]
+                                    + *CTE_A0(p1, iRow - 2, l2) * (i2 - 1);
+                *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[1]
+                                    + *CTE_AK(p1, iRow - 2, l2) * (i2 - 1);
+              }
+              for (i2 = 0; i2 <= iRow1; i2++, l++) {
+                int i3 = iRow1 - i2;
+                l1 = CTE_IDX(0, i2, i3) - off1;
+                *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[0];
+                *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[0];
+              }
+              for (i1 = 2; i1 <= iRow; i1++) {
+                for (i2 = 0; i2 <= iRow - i1; i2++, l++) {
+                  int i3 = iRow - i1 - i2;
+                  l1 = CTE_IDX(i1 - 1, i2, i3) - off1;
+                  l2 = CTE_IDX(i1 - 2, i2, i3) - off2;
+                  *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[0]
+                                      + *CTE_A0(p1, iRow - 2, l2) * (i1 - 1);
+                  *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[0]
+                                      + *CTE_AK(p1, iRow - 2, l2) * (i1 - 1);
+                }
+              }
+            }
+          }
+
+          n = iRow - 1;
+          if (n <= ordHere) {
+            int offN  = CTE_ROWOFF(nMomT, n);
+            int offN1 = CTE_ROWOFF(nMomT, n + 1);
+            i = offN;
+            for (i1 = 0; i1 <= n; i1++) {
+              for (i2 = 0; i2 <= n - i1; i2++, i++) {
+                int i3 = n - i1 - i2;
+                int lA = CTE_IDX(i1 + 1, i2, i3) - offN1;
+                int lB = CTE_IDX(i1, i2 + 1, i3) - offN1;
+                int lC = CTE_IDX(i1, i2, i3 + 1) - offN1;
+                int l  = i - offN;
+                double dnG0, dnGk;
+
+                dnG0 = nrm[0] * *CTE_A0(0, n + 1, lA)
+                     + nrm[1] * *CTE_A0(0, n + 1, lB)
+                     + nrm[2] * *CTE_A0(0, n + 1, lC);
+                dnGk = nrm[0] * *CTE_AK(0, n + 1, lA)
+                     + nrm[1] * *CTE_AK(0, n + 1, lB)
+                     + nrm[2] * *CTE_AK(0, n + 1, lC);
+                y0 += sgn3d[i] * mom[i] * (*CTE_A0(0, n, l) - *CTE_AK(0, n, l));
+                y1 += sgn3d[i] * mom[i] * (eps * dnGk - dnG0);
+              }
             }
           }
         }
+#undef CTE_A0
+#undef CTE_AK
+#undef CTE_IDX
         continue;
       }
 
@@ -4692,18 +4825,22 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   }
   if (gCTE.derivOrderMax + 1 >= 16) return 0;   /* fixed pointer arrays */
 
-  /* Level p holds nMom[derivMax - p] entries, as on the CPU. levOff[derivMax+1]
-   * is the total, which also separates the dg0 half from the dgk half. */
+  /* Two rows per level, each sized for the longest row that level can hold:
+   * row(derivMax - p). levOff[derivMax+1] is the per-array total, which also
+   * separates the dg0 half from the dgk half. Summed, that is 2*nMom[derivMax]
+   * against the old pyramid's sum_m nMom[m]. */
   levOff.resize((size_t)gCTE.derivOrderMax + 2);
   levOff[0] = 0;
   for (p = 0; p <= gCTE.derivOrderMax; p++) {
-    levOff[(size_t)p + 1] = levOff[(size_t)p] + sys->nMom[gCTE.derivOrderMax - p];
+    int m = gCTE.derivOrderMax - p;
+    int rowLen = sys->nMom[m] - ((m <= 0) ? 0 : sys->nMom[m - 1]);
+    levOff[(size_t)p + 1] = levOff[(size_t)p] + 2 * rowLen;
   }
   slabDoubles = 2LL * levOff[(size_t)gCTE.derivOrderMax + 1];
 
   /* Cap concurrency so the scratch stays bounded; panels are then taken in a
    * grid-stride loop. See chargeTreeScratchThreads for how perSm was measured. */
-  stride = chargeTreeScratchThreads("FABIPB_ENERGY_GPU_SCRATCH_MIB", 160,
+  stride = chargeTreeScratchThreads("FABIPB_ENERGY_GPU_SCRATCH_MIB", 0, 3465.0,
                                     slabDoubles, gCTE.nPanels, blockSize);
   scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
 
@@ -4732,7 +4869,7 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
       gCTE.d_nodeMomOff, gCTE.d_nodeOrder,
       gCTE.d_kidIdx, gCTE.d_chgIdx, gCTE.d_moments,
       gCTE.d_pos, gCTE.d_chr,
-      gCTE.d_idx3, gCTE.d_sgn3, d_levOff,
+      gCTE.d_idx3, gCTE.d_sgn3, d_levOff, gCTE.d_nMom,
       d_scratch, stride,
       gCTE.d_out);
   err = cudaGetLastError();
@@ -4987,7 +5124,7 @@ int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
 
   /* Lower perSm than the energy kernel: this one steps up sharply in time past
    * roughly 16k threads on the measurement card. */
-  stride = chargeTreeScratchThreads("FABIPB_RHS_GPU_SCRATCH_MIB", 112,
+  stride = chargeTreeScratchThreads("FABIPB_RHS_GPU_SCRATCH_MIB", 112, 0.0,
                                     slabDoubles, gCTE.nPanels, blockSize);
   scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
 
