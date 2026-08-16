@@ -211,17 +211,67 @@ Inside GMRES, from the earlier instrumented run:
 | Nearfield GPU timer | 2,425.41 s | 135.70 s | 17.87x |
 | Matvec total | 2,851.33 s | 559.00 s | 5.10x |
 
+### sdens=1 after GPU setupRHS and scratch retuning
+
+`results/fmm/6co8_fabipb_fast/sdens1_scratchtune`, total **700.83 s**.
+
+**This run is not directly comparable to the 870.95 s above**, for two reasons
+that have to be separated before quoting any ratio:
+
+1. The 870.95 s run **did not converge** -- `info=1`, 100 iterations (the cap),
+   residual `1.500076e-4`. This one converged: `info=0`, **87 iterations**,
+   residual `9.865349e-05`. Comparing wall-clock totals therefore compares 87
+   matvecs against 100. Per iteration GMRES went 4.519 s -> 4.268 s, and
+   nothing in either change touches the matvec, so treat that 5% as run-to-run
+   variance rather than a result.
+2. Two changes landed between them: `setupRHS` moved to the GPU charge-tree
+   kernel, and the charge-tree scratch was resized by thread count.
+
+Isolating the stages that are independent of iteration count:
+
+| Stage | CPU | GPU, 256 MiB budget | GPU, thread-sized | Net |
+|---|---:|---:|---:|---:|
+| Set up RHS | 127.62 s | 78.64 s | **58.72 s** | 2.17x |
+| Energy treecode | -- | 268.71 s | **233.11 s** | 1.15x |
+
+So the scratch retuning alone is worth 1.34x on `setupRHS` and 1.15x on the
+energy stage here -- about 55 s, or 6-7% of the run. That is much less than the
+2.17x / 1.56x it gives on 7A6A, and the reason is visible in the tuning data:
+`sdens=1` runs at `derivMax=8`, where the thread-count curve is nearly flat,
+whereas 7A6A's production config sits at `derivMax=6`, where the old fixed byte
+budget overshot the optimum by 4x. The retuning matters most at low `derivMax`.
+
+Note the previously reported 78.64 s `setupRHS` figure was measured at the
+mistuned 46,976 threads, against a ~16k optimum, so it understated the GPU
+kernel.
+
+Energy `-123,425.979217`, against `-123,425.081706` for the 100-iteration run:
+5.9e-5 relative, consistent with the two runs stopping at different residuals.
+
 ### sdens=2
 
 | Stage | Recorded | Optimized | Speedup |
 |---|---:|---:|---:|
-| Total | 7,619.25 s | 3,846 s (panel-tree energy) | 1.98x |
-| GMRES | 4,961.18 s | 1,482.43 s | 3.35x |
-| Nearfield | 3,354.73 s | 266.08 s | 12.61x |
+| Total | 7,619.25 s | **3,225.61 s** | **2.36x** |
+| GMRES | 4,961.18 s | 907.61 s | 5.47x |
+| Nearfield | 3,354.73 s | 265.05 s | 12.66x |
 | M2M | 74.63 s | 3.61 s | 20.67x |
 | L2L | 57.91 s | 3.27 s | 17.71x |
-| Set up RHS | 684.16 s | 685.10 s | 1.00x |
-| M2L | 941.25 s | 950.11 s | 1.00x |
+| Energy treecode | 1,890 s | 1,542.71 s | 1.23x |
+| Set up RHS | 684.16 s | 689.61 s | 0.99x |
+| M2L | 941.25 s | 446.20 s | 2.11x |
+
+The M2L figure validated the 2.13x projected from a forced-streaming 7A6A case,
+and Q2M went 98.5 s -> 30.3 s (3.24x) once the runner stopped overriding the
+GPU Q2M default. 37 iterations, residual `8.324220e-05`.
+
+**Not yet re-measured at this density:** GPU `setupRHS` and the thread-sized
+scratch both landed after this run, so the 689.61 s `setupRHS` line is still the
+CPU path. `sdens=2` runs at `derivMax=9`, where the tuning sweep showed the
+energy curve is flat but the RHS kernel's old 256 MiB default sat at 46,976
+threads against a ~16k optimum, so the RHS stage is where the gain should be.
+An earlier intermediate run at this density totalled 3,846 s with panel-tree
+energy; that figure is superseded.
 
 Energy `-114,101.694486` against the recorded `-114,103.117477`, a 1.25e-5
 relative shift consistent with the `transL2L` fix.
