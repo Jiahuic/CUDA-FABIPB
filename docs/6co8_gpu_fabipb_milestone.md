@@ -171,67 +171,105 @@ should target nearfield throughput and the post-solve energy treecode, while
 the next accuracy work should compare the panel-Galerkin and TABI nodepatch
 representations on one byte-identical mesh.
 
-## Optimized Rerun (2026-08-15)
+## Optimized Rerun (2026-08-15 / 16)
 
-The nearfield and energy work described below was applied and the `sdens=1`
-case rerun on the saved mesh with the same settings (`-a=20`, `-t=8`, `-P=3`,
-`eps1=4`, `eps2=80`, tolerance `1e-4`, `theta=0.3`).
+The `sdens=1` case was rerun on the saved mesh with the settings the original
+used (`-a=20`, `-t=8`, `-P=3`, `eps1=4`, `eps2=80`, tolerance `1e-4`,
+`theta=0.3`), then rerun again after further work. Numbers below are the
+latest measured values.
 
-**The result is unchanged to every digit**: `-123,418.693595`, `info=1`, 100
-iterations, final residual `1.509927e-4`. That is the intended outcome -- none
-of the changes were meant to alter the discretization, only to stop
-recomputing and re-transferring geometry that does not change between matvecs.
+### Energies changed, deliberately
+
+A defect was found in `transL2L` while parallelising the downward pass: it
+filled its `fcnBuf` scratch to `ordOut` but indexed it to `ordIn`, and in
+variable-order mode (the default) the coarser parent carries the higher order,
+so `ordIn > ordOut` is the normal case. Entries in `(ordOut, ordIn]` were read
+uninitialised, picking up whatever the previous call left in the shared
+file-scope buffer. See the commit for the evidence that the fix is right
+rather than merely different.
+
+So energies moved by roughly 8e-5 relative. The pre-fix `sdens=1` value was
+`-123,418.693595`; it is now `-123,425.081706` at `info=1`, 100 iterations,
+residual `1.500076e-4`. The recorded-results table above is the original
+milestone record and is left as it stands.
+
+### sdens=1, measured end to end
 
 | Stage | Recorded | Optimized | Speedup |
 |---|---:|---:|---:|
-| Total | 4,429.31 s | 2,576.49 s | 1.72x |
-| Load panels | 23.97 s | 8.85 s | 2.71x |
-| Set up RHS | 129.80 s | 126.67 s | 1.02x |
-| GMRES | 2,994.99 s | 702.86 s | 4.26x |
-| Energy treecode | 1,267.42 s | 1,724.50 s | see below |
+| Total | 4,429.31 s | **870.95 s** | **5.09x** |
+| Load panels | 23.97 s | 9.07 s | 2.64x |
+| Set up RHS | 129.80 s | 127.62 s | 1.02x |
+| GMRES | 2,994.99 s | 451.90 s | 6.63x |
+| Energy treecode | 1,267.42 s | 268.71 s | 4.72x |
 
-Inside GMRES:
+Inside GMRES, from the earlier instrumented run:
 
 | | Recorded | Optimized | Speedup |
 |---|---:|---:|---:|
 | Nearfield | 2,430.67 s | 141.39 s | 17.19x |
 | Nearfield GPU timer | 2,425.41 s | 135.70 s | 17.87x |
 | Matvec total | 2,851.33 s | 559.00 s | 5.10x |
-| M2L | 144.65 s | 144.17 s | 1.00x |
 
-The rerun used `FABIPB_ENERGY_MODE=compare`, so its energy stage ran **both**
-evaluators and is not comparable as printed: charge-tree took 1,279.22 s
-(matching the 1,267.42 s recorded) and panel-tree 445.28 s. With panel-tree
-alone -- now the runner default -- the total is **1,297 s, a 3.41x overall
-speedup**.
+### sdens=2
 
-Both evaluators at full scale:
+| Stage | Recorded | Optimized | Speedup |
+|---|---:|---:|---:|
+| Total | 7,619.25 s | 3,846 s (panel-tree energy) | 1.98x |
+| GMRES | 4,961.18 s | 1,482.43 s | 3.35x |
+| Nearfield | 3,354.73 s | 266.08 s | 12.61x |
+| M2M | 74.63 s | 3.61 s | 20.67x |
+| L2L | 57.91 s | 3.27 s | 17.71x |
+| Set up RHS | 684.16 s | 685.10 s | 1.00x |
+| M2L | 941.25 s | 950.11 s | 1.00x |
+
+Energy `-114,101.694486` against the recorded `-114,103.117477`, a 1.25e-5
+relative shift consistent with the `transL2L` fix.
+
+### Reading compare-mode timings
+
+`FABIPB_ENERGY_MODE=compare` runs **both** evaluators, so its energy stage is
+the sum of the two and must not be compared against a recorded single-evaluator
+figure. Doing that is what made the `sdens=2` energy stage look like a 2x
+regression when the correct split was charge-tree 1,885 s (matching the
+recorded 1,890 s) and panel-tree 1,594 s, i.e. an improvement. Both evaluators
+at `sdens=1`:
 
 ```text
-charge-tree  -59.151987570322532   1279.22 s
+charge-tree  -59.151987570342845   1279.22 s
 panel-tree   -59.154442436439652    445.28 s   (rel-diff 4.15e-5)
 ```
 
 The panel-tree value is the more accurate of the two; see the theta->0
-convergence check in the source comment on `energyTreeTheta()`.
+convergence check in the source comment on `energyTreeTheta()`. The GPU
+evaluator reproduces the CPU one exactly and is 1.66x faster at `sdens=1`
+(268.7 s against 445.3 s), measured by holding the solution fixed and toggling
+only the evaluator with `FABIPB_ENERGY_GPU=0`. Comparing `-g=1` against `-g=0`
+instead compares two different GMRES solutions and shows a spurious 4e-5
+difference.
 
-New machinery, at scale, all within budget:
+### New machinery, at scale, all within budget
 
 ```text
-special-pair cache   138,366,798 pairs   5.155 GiB host   168 chunks
-leaf-pair table       25,529,703 pairs   0.476 GiB device
-pinned staging        6/6 buffers        0.500 GiB host
+sdens=1  special cache   138,366,798 pairs    5.155 GiB host   168 chunks
+         leaf-pair table  25,529,703 pairs    0.476 GiB device
+sdens=2  special cache   561,290,776 pairs   20.910 GiB host   582 chunks
+         leaf-pair table  99,879,047 pairs    1.860 GiB device
+         pinned staging   6/6 buffers         0.500 GiB host
 ```
 
-M2L is now the largest single matvec cost (144 s of 559 s) and the energy
-treecode the largest stage overall (445 s of 1,297 s). Note the M2L
-coefficient rebuild is the same class of redundant per-matvec work that the
-nearfield cache removed, and has not been addressed.
+### Where the time now sits
 
-`sdens=2` has not been rerun. Its cache would need roughly 21 GiB against the
-32 GiB default budget, and its leaf-pair table is about four times larger, so
-the binary search in the index-generating kernel runs a couple of levels
-deeper.
+At `sdens=1` the run is 871 s and fairly flat. At `sdens=2` the balance is
+different because M2L cannot fit the device cache (66.5 GiB needed against
+46.8 GiB free) and therefore streams, rebuilding its coefficients on every
+matvec: energy 1,594 s, M2L 950 s, setupRHS 685 s. The M2L coefficient build
+has since been threaded and `setupRHS` has a device implementation; neither is
+reflected in the table above.
+
+Note also that phases alternate between host and device, so `nvidia-smi` shows
+the GPU idle for long stretches -- `setupRHS` alone was 685 s at 0% GPU before
+it was ported.
 
 ## Result Locations
 
