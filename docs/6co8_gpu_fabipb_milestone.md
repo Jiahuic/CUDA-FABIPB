@@ -248,30 +248,87 @@ kernel.
 Energy `-123,425.979217`, against `-123,425.081706` for the 100-iteration run:
 5.9e-5 relative, consistent with the two runs stopping at different residuals.
 
+### sdens=1 with the Arnoldi orthogonalisation threaded
+
+`results/fmm/6co8_fabipb_fast/sdens1_basisthreads`, total **652.99 s**.
+
+| Stage | Serial basis | Threaded basis | Speedup |
+|---|---:|---:|---:|
+| GMRES `basis` | 58.97 s | **10.41 s** | **5.66x** |
+| GMRES total | 371.34 s | 322.47 s | 1.15x |
+| Run total | 700.83 s | 652.99 s | 1.07x |
+
+Same 87 iterations, same final residual `9.865349e-05`, energy
+`-123,425.979217` agreeing to every printed digit. That is not proof of bit
+identity -- a reassociated sum shifts things around 1e-12 relative, below the
+printed precision -- but it confirms the chunked reduction does not perturb the
+Krylov trajectory.
+
+This one was not an algorithmic problem. The ddot/daxpy pair already went
+through OpenBLAS; it was pinned to a single thread by with_benchmark_env.sh,
+which the runner never overrode, so 163 MB vectors were swept on one core. It
+is the third time a runner-level override has hidden a binary default (after
+the thread pools in ec7a1a4 and the `-Q=0` hardcode).
+
+### Energy kernel: measured footprint sensitivity
+
+Nsight Compute is unavailable on this machine -- `ERR_NVGPUCTRPERM`, with
+`RmProfilingAdminOnly: 1`, so performance counters need root. The same question
+was settled with a timing-only probe instead: the kernel was patched so threads
+share derivative slabs, holding thread count, arithmetic, and coalescing fixed
+while the footprint shrinks. Results are garbage under the races; only the time
+is meaningful. On 7A6A at `derivMax=9`, 22,784 threads:
+
+| Footprint | Energy stage | vs. current |
+|---:|---:|---:|
+| 248.6 MiB (as shipped) | 37.17 s | -- |
+| 124.3 MiB | 21.54 s | 1.73x |
+| 44.7 MiB | 16.07 s | 2.31x |
+| 11.2 MiB | 15.43 s | 2.41x |
+| 2.8 MiB | 14.92 s | 2.49x |
+
+So the kernel is footprint-bound, and roughly 2.5x is the most any footprint
+reduction can return. About 70% of the slab is intermediate levels the
+contraction never reads (495 of 715 doubles per array at `derivMax=8`, 715 of
+1001 at 9); they exist only because the recurrence builds level p from level
+p+1. The dependency is narrow -- row `iRow` of level p needs only rows `iRow-1`
+and `iRow-2` of level p+1, and the loop already runs `iRow` outermost -- so
+keeping two rows per level and fusing the level-0 contraction into the row loop
+would cut the footprint 3.09x at `derivMax=9`, to about 80 MiB. Interpolating
+the table, that is worth roughly 1.9-2.0x on the energy stage. Not yet
+implemented.
+
 ### sdens=2
 
 | Stage | Recorded | Optimized | Speedup |
 |---|---:|---:|---:|
-| Total | 7,619.25 s | **3,225.61 s** | **2.36x** |
-| GMRES | 4,961.18 s | 907.61 s | 5.47x |
-| Nearfield | 3,354.73 s | 265.05 s | 12.66x |
-| M2M | 74.63 s | 3.61 s | 20.67x |
-| L2L | 57.91 s | 3.27 s | 17.71x |
-| Energy treecode | 1,890 s | 1,542.71 s | 1.23x |
-| Set up RHS | 684.16 s | 689.61 s | 0.99x |
-| M2L | 941.25 s | 446.20 s | 2.11x |
+| Total | 7,619.25 s | **2,930.54 s** | **2.60x** |
+| GMRES | 4,961.18 s | 934.87 s | 5.31x |
+| Nearfield | 3,354.73 s | 267.60 s | 12.54x |
+| M2M | 74.63 s | 3.50 s | 21.32x |
+| L2L | 57.91 s | 3.28 s | 17.65x |
+| Energy treecode | 1,890 s | 1,548.73 s | 1.22x |
+| Set up RHS | 684.16 s | 320.55 s | 2.13x |
+| M2L | 941.25 s | 446.61 s | 2.11x |
 
 The M2L figure validated the 2.13x projected from a forced-streaming 7A6A case,
 and Q2M went 98.5 s -> 30.3 s (3.24x) once the runner stopped overriding the
 GPU Q2M default. 37 iterations, residual `8.324220e-05`.
 
-**Not yet re-measured at this density:** GPU `setupRHS` and the thread-sized
-scratch both landed after this run, so the 689.61 s `setupRHS` line is still the
-CPU path. `sdens=2` runs at `derivMax=9`, where the tuning sweep showed the
-energy curve is flat but the RHS kernel's old 256 MiB default sat at 46,976
-threads against a ~16k optimum, so the RHS stage is where the gain should be.
-An earlier intermediate run at this density totalled 3,846 s with panel-tree
-energy; that figure is superseded.
+`results/fmm/6co8_fabipb_sdens2/scratchtune_rhsgpu`, 37 iterations, residual
+`9.355239e-05`, energy `-114,082.750614`.
+
+The GPU `setupRHS` kernel and the thread-sized scratch both landed after the
+previous run at this density, and they split exactly as the tuning sweep
+predicted: `setupRHS` 689.61 -> 320.55 s (2.15x), while the energy stage was
+flat at 1,542.71 -> 1,548.73 s. `derivMax=9` is where the thread-count curve
+levels off, so there was nothing there for the retuning to win; the RHS kernel
+had been sitting at 46,976 threads against a ~16k optimum, and that is where
+the gain came from. Earlier intermediate totals at this density of 3,846 s and
+3,225.61 s are superseded.
+
+`basis` was 98.75 s in this run, which still used the pre-threading binary; see
+the sdens=1 section for what threading it is worth.
 
 Energy `-114,101.694486` against the recorded `-114,103.117477`, a 1.25e-5
 relative shift consistent with the `transL2L` fix.
