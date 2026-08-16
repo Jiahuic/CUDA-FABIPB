@@ -3538,6 +3538,80 @@ int applyM2LStreamingChunks(const ssystem *sys) {
   return 1;
 }
 
+/*
+ * SM count of the current device, queried once.
+ *
+ * The charge-tree kernels size their scratch from this: their throughput
+ * optimum is a concurrent-thread count, not a byte count (see
+ * chargeTreeScratchThreads), and thread counts only mean anything relative to
+ * the machine's width. Falls back to the measurement device (RTX 6000 Ada) if
+ * the query fails, which only costs a mistuned default, never correctness.
+ */
+int deviceSmCount() {
+  static int smCount = 0;
+  if (smCount == 0) {
+    cudaDeviceProp prop;
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+        prop.multiProcessorCount > 0) {
+      smCount = prop.multiProcessorCount;
+    } else {
+      smCount = 142;
+    }
+  }
+  return smCount;
+}
+
+/*
+ * Concurrent-thread count for a charge-tree kernel's derivative scratch.
+ *
+ * Both kernels give every thread a private slab of slabDoubles and then take
+ * panels in a grid-stride loop, so this is a pure occupancy/cache trade: too
+ * few threads and the machine idles, too many and the slabs stop fitting the
+ * cache. It used to be set by a fixed 256 MiB byte budget, which is wrong,
+ * because slabDoubles grows with derivMax and so the same byte count buys a
+ * different number of threads on every problem. Measured on 7A6A (420,576
+ * panels, RTX 6000 Ada, 142 SMs) by sweeping thread count at three slab sizes:
+ *
+ *   kernel  derivMax  slab(doubles)  best threads  best bytes
+ *   energy  5         251            27,392        55 MB
+ *   energy  6         420            20,096        67 MB
+ *   energy  9         1430           20,480        234 MB
+ *   rhs     9         715            12k-16k       70-94 MB
+ *
+ * The optimum moves by 1.4x in threads across a 5.7x change in slab size, and
+ * by 4.3x in bytes -- so threads is the invariant to hold, scaled by SM count
+ * so it transfers to other cards. perSm is the tuned constant: the energy
+ * kernel tolerates more concurrency than the RHS kernel, which showed a sharp
+ * step up in time past ~16k threads. Both curves are flat near the optimum,
+ * so these sit mid-plateau rather than on a measured peak.
+ *
+ * FABIPB_*_GPU_SCRATCH_MIB still overrides with an explicit byte budget.
+ */
+long long chargeTreeScratchThreads(const char *mibEnv, int perSm,
+                                   long long slabDoubles, long long nPanels,
+                                   int blockSize) {
+  long long stride;
+  const char *env = getenv(mibEnv);
+  double budgetMiB = -1.0;
+
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end != env && *end == '\0' && v > 0.0) budgetMiB = v;
+  }
+  if (budgetMiB > 0.0) {
+    stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
+                         ((double)slabDoubles * sizeof(double)));
+  } else {
+    stride = (long long)deviceSmCount() * perSm;
+  }
+  if (stride < blockSize) stride = blockSize;
+  if (stride > nPanels) stride = nPanels;
+  return ((stride + blockSize - 1) / blockSize) * blockSize;
+}
+
 }  // namespace
 
 int gpuBackendAvailable(void) {
@@ -4628,26 +4702,9 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   slabDoubles = 2LL * levOff[(size_t)gCTE.derivOrderMax + 1];
 
   /* Cap concurrency so the scratch stays bounded; panels are then taken in a
-   * grid-stride loop. Budget is configurable for tight-memory machines. */
-  {
-    const char *env = getenv("FABIPB_ENERGY_GPU_SCRATCH_MIB");
-    /* Not "as much as fits": the kernel is bound by how much of the scratch
-     * stays in L2, not by thread count. Measured on 7A6A (420k panels, 12
-     * matvecs): 64 MiB -> 11.66 s, 256 MiB -> 9.72 s, 1 GiB -> 16.87 s,
-     * 4 GiB -> 15.93 s, against 10.84 s for the 72-thread CPU evaluator. The
-     * optimum is where the working set still fits the cache. Tuned on one mesh
-     * and one card, so it is exposed as a knob. */
-    double budgetMiB = 256.0;
-    if (env != NULL && env[0] != '\0') {
-      char *e2 = NULL; double v = strtod(env, &e2);
-      if (e2 != env && *e2 == '\0' && v > 0.0) budgetMiB = v;
-    }
-    stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
-                         ((double)slabDoubles * sizeof(double)));
-    if (stride < blockSize) stride = blockSize;
-    if (stride > gCTE.nPanels) stride = gCTE.nPanels;
-    stride = ((stride + blockSize - 1) / blockSize) * blockSize;
-  }
+   * grid-stride loop. See chargeTreeScratchThreads for how perSm was measured. */
+  stride = chargeTreeScratchThreads("FABIPB_ENERGY_GPU_SCRATCH_MIB", 160,
+                                    slabDoubles, gCTE.nPanels, blockSize);
   scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
 
   if (scratchStride != stride) {
@@ -4928,19 +4985,10 @@ int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
   }
   slabDoubles = levOff[(size_t)gCTE.derivOrderMax + 1];
 
-  {
-    const char *env = getenv("FABIPB_RHS_GPU_SCRATCH_MIB");
-    double budgetMiB = 256.0;   /* same reasoning as the energy evaluator */
-    if (env != NULL && env[0] != '\0') {
-      char *e2 = NULL; double v = strtod(env, &e2);
-      if (e2 != env && *e2 == '\0' && v > 0.0) budgetMiB = v;
-    }
-    stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
-                         ((double)slabDoubles * sizeof(double)));
-    if (stride < blockSize) stride = blockSize;
-    if (stride > gCTE.nPanels) stride = gCTE.nPanels;
-    stride = ((stride + blockSize - 1) / blockSize) * blockSize;
-  }
+  /* Lower perSm than the energy kernel: this one steps up sharply in time past
+   * roughly 16k threads on the measurement card. */
+  stride = chargeTreeScratchThreads("FABIPB_RHS_GPU_SCRATCH_MIB", 112,
+                                    slabDoubles, gCTE.nPanels, blockSize);
   scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
 
   if (scratchStride != stride) {
