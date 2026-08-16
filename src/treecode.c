@@ -142,7 +142,12 @@ void freeRhsTreeWorkspace(RhsTreeWorkspace *ws) {
   memset(ws, 0, sizeof(*ws));
 }
 
-static void setupScreenedDerivsLocal(ssystem *sys, RhsTreeWorkspace *ws,
+/*
+ * Thread-safe setupDerivs: identical recurrence, but the workspace is passed
+ * in rather than taken from the file-scope dG0/dGk. Exposed because the M2L
+ * streaming path needs to run this concurrently across threads.
+ */
+void setupDerivsWorkspace(ssystem *sys, RhsTreeWorkspace *ws,
                                      int order, const double *x) {
   int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2;
   double r;
@@ -559,7 +564,7 @@ static void energyTreeWalk(ssystem *sys, cube *chgCb, double *quadPt,
   dist = sqrt(SQR(r[0]) + SQR(r[1]) + SQR(r[2]));
 
   if (chgCb->eRad < theta * dist && chgCb->level >= sys->height) {
-    setupScreenedDerivsLocal(sys, ws, rhsChargeExpansionOrder(sys, chgCb->level) + 1, r);
+    setupDerivsWorkspace(sys, ws, rhsChargeExpansionOrder(sys, chgCb->level) + 1, r);
     chgClusterEnergyEval(sys, chgCb, pnlX, ws, yFar);
     y[0] += yFar[0];
     y[1] += yFar[1];

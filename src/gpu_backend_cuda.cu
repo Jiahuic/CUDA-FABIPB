@@ -17,6 +17,10 @@
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
 extern "C" int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
 extern "C" int rhsChargeExpansionOrder(ssystem *sys, int level);
+extern "C" void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws);
+extern "C" void freeRhsTreeWorkspace(RhsTreeWorkspace *ws);
+extern "C" void setupDerivsWorkspace(ssystem *sys, RhsTreeWorkspace *ws,
+                                     int order, const double *x);
 extern "C" int ***idx3;
 extern "C" void kernelKER4(double *x, double *y);
 extern "C" void (*kernel)(double *x, double *y);
@@ -3359,12 +3363,125 @@ int flushM2LStreamingChunk(int pairCount, int groupCount, int coeffCount) {
   return cudaGetLastError() == cudaSuccess;
 }
 
+/*
+ * A chunk's worth of destination groups, with the output slots each will fill.
+ * Recording these first turns the coefficient build into an independent
+ * scatter, which is what makes it threadable.
+ */
+struct M2LChunkGroup {
+  int globalStart;
+  int count;
+  int order;
+  int nMom;
+  int pairBase;     /* first slot in h_pairSrc / h_pairCoeffOffset */
+  int coeffBase;    /* first slot in h_g0 / h_gk */
+};
+
+static int m2lBuildThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_SETUP_THREADS");
+  long hc;
+  int threads;
+
+  (void)hc;
+  if (env != NULL && env[0] != '\0') threads = atoi(env);
+  else { unsigned int c = std::thread::hardware_concurrency(); threads = (c > 0U) ? (int)c : 1; }
+  if (threads < 1) threads = 1;
+  if (threads > nTasks) threads = nTasks;
+  if (threads > 64) threads = 64;
+  return threads;
+}
+
+/*
+ * Fills the coefficient staging buffers for one chunk.
+ *
+ * setupDerivs() runs once per M2L pair on every matvec -- 546M pairs times 38
+ * matvecs on the virus, 20.8 billion calls -- rebuilding coefficients that
+ * depend only on the (fixed) cube centres. It ran on one thread, and at
+ * sdens=2 that made M2L 950 s, 68% of the matvec.
+ *
+ * Groups average only about a hundred pairs, so threading inside a group would
+ * be all fork/join. Threading across the chunk's groups instead gives each
+ * worker thousands of pairs. Every group writes to slots reserved for it in the
+ * bookkeeping pass, so the threads never overlap and the buffers come out
+ * byte-identical to the serial order.
+ */
+static int fillM2LChunkGroups(const ssystem *sys,
+                              const std::vector<M2LChunkGroup> &groups) {
+  int nGroups = (int)groups.size();
+  int nThreads;
+
+  if (nGroups <= 0) return 1;
+  nThreads = m2lBuildThreadCount(nGroups);
+
+  if (nThreads <= 1) {
+    RhsTreeWorkspace ws;
+    int g;
+    initRhsTreeWorkspace((ssystem *)sys, &ws);
+    for (g = 0; g < nGroups; g++) {
+      const M2LChunkGroup &grp = groups[(size_t)g];
+      int j;
+      for (j = 0; j < grp.count; j++) {
+        int globalPair = grp.globalStart + j;
+        cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[globalPair]];
+        cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[globalPair]];
+        double r[3];
+        int k, at = grp.coeffBase + j * grp.nMom;
+        for (k = 0; k < 3; k++) r[k] = dst->x[k] - src->x[k];
+        setupDerivsWorkspace((ssystem *)sys, &ws, grp.order, r);
+        gM2L.h_pairSrc[grp.pairBase + j] = sys->m2lPairSrc[globalPair];
+        gM2L.h_pairCoeffOffset[grp.pairBase + j] = at;
+        memcpy(&gM2L.h_g0[at], ws.dg0[0], (size_t)grp.nMom * sizeof(double));
+        memcpy(&gM2L.h_gk[at], ws.dgk[0], (size_t)grp.nMom * sizeof(double));
+      }
+    }
+    freeRhsTreeWorkspace(&ws);
+    return 1;
+  }
+
+  {
+    std::vector<std::thread> workers;
+    std::vector<int> ok((size_t)nThreads, 1);
+    int t;
+    workers.reserve((size_t)nThreads);
+    for (t = 0; t < nThreads; t++) {
+      workers.push_back(std::thread([&, t]() {
+        RhsTreeWorkspace ws;
+        int begin = (int)(((long long)nGroups * t) / nThreads);
+        int end = (int)(((long long)nGroups * (t + 1)) / nThreads);
+        int g;
+        initRhsTreeWorkspace((ssystem *)sys, &ws);
+        for (g = begin; g < end; g++) {
+          const M2LChunkGroup &grp = groups[(size_t)g];
+          int j;
+          for (j = 0; j < grp.count; j++) {
+            int globalPair = grp.globalStart + j;
+            cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[globalPair]];
+            cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[globalPair]];
+            double r[3];
+            int k, at = grp.coeffBase + j * grp.nMom;
+            for (k = 0; k < 3; k++) r[k] = dst->x[k] - src->x[k];
+            setupDerivsWorkspace((ssystem *)sys, &ws, grp.order, r);
+            gM2L.h_pairSrc[grp.pairBase + j] = sys->m2lPairSrc[globalPair];
+            gM2L.h_pairCoeffOffset[grp.pairBase + j] = at;
+            memcpy(&gM2L.h_g0[at], ws.dg0[0], (size_t)grp.nMom * sizeof(double));
+            memcpy(&gM2L.h_gk[at], ws.dgk[0], (size_t)grp.nMom * sizeof(double));
+          }
+        }
+        freeRhsTreeWorkspace(&ws);
+      }));
+    }
+    for (t = 0; t < nThreads; t++) workers[(size_t)t].join();
+  }
+  return 1;
+}
+
 int applyM2LStreamingChunks(const ssystem *sys) {
   int groupIdx;
   int pairCount = 0;
   int groupCount = 0;
   int coeffCount = 0;
   int chunks = 0;
+  std::vector<M2LChunkGroup> chunkGroups;
 
   for (groupIdx = 0; groupIdx < sys->nM2LDstGroups; groupIdx++) {
     int globalStart = sys->m2lDstGroupStart[groupIdx];
@@ -3372,7 +3489,7 @@ int applyM2LStreamingChunks(const ssystem *sys) {
     int order = sys->m2lPairOrder[globalStart];
     int nMom = sys->nMom[order];
     long long neededCoeff = (long long)count * (long long)nMom;
-    int j;
+    M2LChunkGroup grp;
 
     if (count > gM2L.streamPairCapacity || neededCoeff > gM2L.streamCoeffCapacity) {
       printf("GPU M2L streaming group exceeds chunk capacity: group=%d pairs=%d coeff=%lld\n",
@@ -3382,7 +3499,9 @@ int applyM2LStreamingChunks(const ssystem *sys) {
     if (groupCount == gM2L.streamGroupCapacity ||
         pairCount + count > gM2L.streamPairCapacity ||
         (long long)coeffCount + neededCoeff > gM2L.streamCoeffCapacity) {
+      if (!fillM2LChunkGroups(sys, chunkGroups)) return 0;
       if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
+      chunkGroups.clear();
       pairCount = 0;
       groupCount = 0;
       coeffCount = 0;
@@ -3393,24 +3512,21 @@ int applyM2LStreamingChunks(const ssystem *sys) {
     gM2L.h_groupCount[groupCount] = count;
     gM2L.h_groupDst[groupCount] = sys->m2lPairDst[globalStart];
     gM2L.h_groupOrder[groupCount] = order;
-    for (j = 0; j < count; j++) {
-      int globalPair = globalStart + j;
-      cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[globalPair]];
-      cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[globalPair]];
-      double r[3];
-      int k;
-      for (k = 0; k < 3; k++) r[k] = dst->x[k] - src->x[k];
-      setupDerivs(order, r);
-      gM2L.h_pairSrc[pairCount] = sys->m2lPairSrc[globalPair];
-      gM2L.h_pairCoeffOffset[pairCount] = coeffCount;
-      memcpy(&gM2L.h_g0[coeffCount], dG0[0], (size_t)nMom * sizeof(double));
-      memcpy(&gM2L.h_gk[coeffCount], dGk[0], (size_t)nMom * sizeof(double));
-      pairCount++;
-      coeffCount += nMom;
-    }
+
+    grp.globalStart = globalStart;
+    grp.count = count;
+    grp.order = order;
+    grp.nMom = nMom;
+    grp.pairBase = pairCount;
+    grp.coeffBase = coeffCount;
+    chunkGroups.push_back(grp);
+
+    pairCount += count;
+    coeffCount += (int)neededCoeff;
     groupCount++;
   }
   if (groupCount > 0) {
+    if (!fillM2LChunkGroups(sys, chunkGroups)) return 0;
     if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
     chunks++;
   }
@@ -3421,6 +3537,7 @@ int applyM2LStreamingChunks(const ssystem *sys) {
   }
   return 1;
 }
+
 }  // namespace
 
 int gpuBackendAvailable(void) {
