@@ -43,6 +43,12 @@ typedef struct {
   double scale1;
   double scale2;
   int buildLU;
+  /*
+   * Precomputed disjoint-pair kernel values for this batch, or NULL to compute
+   * them here. Pair (i,j) of block idx lives at pairOffset[idx] + i*HMsize + j.
+   */
+  const double *k0, *k1, *k2, *k3;
+  const long long *pairOffset;
 } PrecondSetupTask;
 
 typedef struct {
@@ -156,7 +162,7 @@ static void *precondSetupWorker(void *arg) {
     int Msize = 2 * HMsize;
     panel *pnlX, *pnlY;
     int i, j;
-    int useGpuDisjoint = useGpuPrecondDisjoint(task->sys);
+    int useGpuDisjoint = (task->k0 == NULL) && useGpuPrecondDisjoint(task->sys);
     panel **blockPanels = NULL;
     int *disjointDst = NULL;
     int *disjointSrc = NULL;
@@ -193,7 +199,14 @@ static void *precondSetupWorker(void *arg) {
           else if (nVtx == -2) localTwoCommonRev++;
           else if (nVtx == 3) localSelf++;
         }
-        if (useGpuDisjoint && nVtx == 0) {
+        if (task->k0 != NULL && nVtx == 0) {
+          /* Already computed on the device for the whole batch. */
+          long long at = task->pairOffset[idx] + (long long)i * HMsize + j;
+          pcBlocks[idx][i*Msize+j]                 = -task->k1[at];
+          pcBlocks[idx][i*Msize+j+HMsize]          = -task->k0[at];
+          pcBlocks[idx][(i+HMsize)*Msize+j]        = -task->k3[at];
+          pcBlocks[idx][(i+HMsize)*Msize+j+HMsize] = -task->k2[at];
+        } else if (useGpuDisjoint && nVtx == 0) {
           disjointDst[nDisjoint] = i;
           disjointSrc[nDisjoint] = j;
           nDisjoint++;
@@ -250,6 +263,254 @@ static void *precondSetupWorker(void *arg) {
     __sync_fetch_and_add(&pcCaseSelfCount, localSelf);
   }
   return NULL;
+}
+
+/*
+ * Runs precondSetupWorker over [begin,end) with the given thread count.
+ * kArrays/pairOffset may be NULL, in which case each worker computes its own
+ * disjoint pairs as before.
+ */
+static void runPrecondSetupRange(ssystem *sys, cube **cubes, int begin, int end,
+                                 double scale1, double scale2, int buildLU,
+                                 const double *k0, const double *k1,
+                                 const double *k2, const double *k3,
+                                 const long long *pairOffset) {
+  int nBlocks = end - begin;
+  int nThreads = setupThreadCountPc(nBlocks);
+  int t;
+
+  if (nBlocks <= 0) return;
+  if (nThreads <= 1) {
+    PrecondSetupTask task;
+    memset(&task, 0, sizeof(task));
+    task.sys = sys; task.cubes = cubes;
+    task.begin = begin; task.end = end;
+    task.scale1 = scale1; task.scale2 = scale2; task.buildLU = buildLU;
+    task.k0 = k0; task.k1 = k1; task.k2 = k2; task.k3 = k3;
+    task.pairOffset = pairOffset;
+    precondSetupWorker(&task);
+    return;
+  }
+  {
+    pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+    PrecondSetupTask *tasks =
+        (PrecondSetupTask *)calloc((size_t)nThreads, sizeof(PrecondSetupTask));
+    int created = 0;
+    ASSERT(threads != NULL);
+    ASSERT(tasks != NULL);
+    for (t = 0; t < nThreads; t++) {
+      tasks[t].sys = sys; tasks[t].cubes = cubes;
+      tasks[t].begin = begin + (int)(((long long)nBlocks * t) / nThreads);
+      tasks[t].end   = begin + (int)(((long long)nBlocks * (t + 1)) / nThreads);
+      tasks[t].scale1 = scale1; tasks[t].scale2 = scale2;
+      tasks[t].buildLU = buildLU;
+      tasks[t].k0 = k0; tasks[t].k1 = k1; tasks[t].k2 = k2; tasks[t].k3 = k3;
+      tasks[t].pairOffset = pairOffset;
+    }
+    for (t = 0; t < nThreads - 1; t++) {
+      if (pthread_create(&threads[created], NULL, precondSetupWorker, &tasks[t]) != 0) break;
+      created++;
+    }
+    if (created < nThreads - 1) {
+      /* Fold the un-launched ranges into this thread's task. */
+      tasks[created].end = end;
+    }
+    precondSetupWorker(&tasks[created]);
+    for (t = 0; t < created; t++) pthread_join(threads[t], NULL);
+    free(tasks);
+    free(threads);
+  }
+}
+
+typedef struct {
+  cube **cubes;
+  const long long *pairOffset;
+  int *pairSrc;
+  int *pairDst;
+  int begin;
+  int end;
+} PrecondFillTask;
+
+static void *precondFillWorker(void *arg) {
+  PrecondFillTask *task = (PrecondFillTask *)arg;
+  int idx;
+
+  for (idx = task->begin; idx < task->end; idx++) {
+    cube *cb = task->cubes[idx];
+    int HMsize = cb->nPnls;
+    long long base = task->pairOffset[idx];
+    panel *pnlY;
+    int a, b;
+
+    for (a = 0, pnlY = cb->pnls; a < HMsize; a++, pnlY = pnlY->nextC) {
+      panel *pnlX;
+      long long row = base + (long long)a * HMsize;
+      for (b = 0, pnlX = cb->pnls; b < HMsize; b++, pnlX = pnlX->nextC) {
+        task->pairDst[row + b] = pnlY->idx;
+        task->pairSrc[row + b] = pnlX->idx;
+      }
+    }
+  }
+  return NULL;
+}
+
+/* Fills [begin,end) across the setup pool; segments are disjoint by offset. */
+static void runPrecondFill(PrecondFillTask *proto, int begin, int end) {
+  int nBlocks = end - begin;
+  int nThreads = setupThreadCountPc(nBlocks);
+  int t, created = 0;
+  pthread_t *threads;
+  PrecondFillTask *tasks;
+
+  if (nBlocks <= 0) return;
+  if (nThreads <= 1) {
+    proto->begin = begin; proto->end = end;
+    precondFillWorker(proto);
+    return;
+  }
+  threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+  tasks = (PrecondFillTask *)calloc((size_t)nThreads, sizeof(PrecondFillTask));
+  ASSERT(threads != NULL);
+  ASSERT(tasks != NULL);
+  for (t = 0; t < nThreads; t++) {
+    tasks[t] = *proto;
+    tasks[t].begin = begin + (int)(((long long)nBlocks * t) / nThreads);
+    tasks[t].end   = begin + (int)(((long long)nBlocks * (t + 1)) / nThreads);
+  }
+  for (t = 0; t < nThreads - 1; t++) {
+    if (pthread_create(&threads[created], NULL, precondFillWorker, &tasks[t]) != 0) break;
+    created++;
+  }
+  if (created < nThreads - 1) tasks[created].end = end;
+  precondFillWorker(&tasks[created]);
+  for (t = 0; t < created; t++) pthread_join(threads[t], NULL);
+  free(tasks);
+  free(threads);
+}
+
+/* Host budget for one batch, in pairs: 2 ints in, 4 doubles out per pair. */
+static long long precondBatchPairCap(void) {
+  const char *env = getenv("FABIPB_PRECOND_BATCH_MIB");
+  double mib = 1024.0;
+  long long perPair = (long long)(2 * sizeof(int) + 4 * sizeof(double));
+  long long cap;
+
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end != env && *end == '\0' && v > 0.0) mib = v;
+  }
+  cap = (long long)((mib * 1024.0 * 1024.0) / (double)perPair);
+  if (cap < 65536) cap = 65536;
+  return cap;
+}
+
+/*
+ * Build every block with the batched GPU path.
+ *
+ * Each block's pairs are a subset of the nearfield's -- children of one parent
+ * cube are always neighbours -- so this reuses the nearfield kernel and one
+ * resident copy of the panel geometry rather than the per-block path, which
+ * took a global mutex and issued about ten synchronous CUDA calls per block.
+ *
+ * All HMsize^2 pairs of a block go to the device, not just the disjoint ones.
+ * Sorting them out first would need either a second nrCommonVtx pass or a
+ * compaction step, and the shared-vertex, shared-edge and self cases are only a
+ * few percent of the pairs, so computing values that are then ignored is
+ * cheaper than the bookkeeping to avoid it.
+ *
+ * Returns 0 if anything is unavailable, leaving the caller to run the original
+ * path over the whole range.
+ */
+static int precondSetupBatchedGpu(ssystem *sys, cube **cubes, int nBlocks,
+                                  double scale1, double scale2, int buildLU) {
+  long long cap = precondBatchPairCap();
+  long long *pairOffset = NULL;
+  int *pairSrc = NULL, *pairDst = NULL;
+  double *k[4] = {NULL, NULL, NULL, NULL};
+  int b0, i, ok = 1;
+
+  if (!useGpuPrecondDisjoint(sys) || nBlocks <= 0) return 0;
+  /*
+   * Below this the per-block path is faster and this one is declined.
+   *
+   * The per-block build issues its CUDA calls from the setup pool under a
+   * mutex, so while one thread is inside the driver the other 71 are doing
+   * nrCommonVtx, allocation and dgetrf. That overlap is worth more than the
+   * launch overhead removed here until there are enough blocks for the
+   * overhead to dominate. Measured setupPC, per-block against batched:
+   *
+   *      11,257 blocks   1.276 s | 1.401 s   (0.91x -- per-block wins)
+   *      45,444 blocks   2.375 s | 0.701 s   (3.39x)
+   *     161,005 blocks   1.191 s | 0.439 s   (2.71x)
+   *   1,391,176 blocks 111.961 s | 78.932 s  (1.42x, capsid sdens=2)
+   *
+   * The crossover sits between the first two, so the threshold is placed
+   * between them rather than at a measured point. Block counts here are not a
+   * proxy for problem size: more blocks means smaller blocks, which is why the
+   * per-block column is not monotonic.
+   */
+  {
+    const char *env = getenv("FABIPB_PRECOND_BATCH_MIN_BLOCKS");
+    long minBlocks = 32768;
+    if (env != NULL && env[0] != '\0') {
+      char *end = NULL;
+      long v = strtol(env, &end, 10);
+      if (end != env && *end == '\0' && v >= 0) minBlocks = v;
+    }
+    if ((long)nBlocks < minBlocks) return 0;
+  }
+
+  pairOffset = (long long *)calloc((size_t)nBlocks, sizeof(long long));
+  pairSrc = (int *)malloc((size_t)cap * sizeof(int));
+  pairDst = (int *)malloc((size_t)cap * sizeof(int));
+  for (i = 0; i < 4; i++) k[i] = (double *)malloc((size_t)cap * sizeof(double));
+  if (pairOffset == NULL || pairSrc == NULL || pairDst == NULL ||
+      k[0] == NULL || k[1] == NULL || k[2] == NULL || k[3] == NULL) {
+    ok = 0;
+  }
+
+  for (b0 = 0; ok && b0 < nBlocks; ) {
+    long long used = 0;
+    int b1 = b0;
+    int idx;
+
+    /* Grow the batch while it fits; always take at least one block. */
+    while (b1 < nBlocks) {
+      long long need = (long long)cubes[b1]->nPnls * (long long)cubes[b1]->nPnls;
+      if (b1 > b0 && used + need > cap) break;
+      pairOffset[b1] = used;
+      used += need;
+      b1++;
+      if (used >= cap) break;
+    }
+    if (used > cap) { ok = 0; break; }
+
+    /* Threaded: blocks write disjoint segments of the pair arrays. */
+    {
+      PrecondFillTask fill;
+      fill.cubes = cubes;
+      fill.pairOffset = pairOffset;
+      fill.pairSrc = pairSrc;
+      fill.pairDst = pairDst;
+      runPrecondFill(&fill, b0, b1);
+    }
+
+    if (!gpuBuildPrecondPairsBatched(sys, pairSrc, pairDst, used,
+                                     k[0], k[1], k[2], k[3])) {
+      ok = 0;
+      break;
+    }
+    runPrecondSetupRange(sys, cubes, b0, b1, scale1, scale2, buildLU,
+                         k[0], k[1], k[2], k[3], pairOffset);
+    b0 = b1;
+  }
+
+  free(pairOffset);
+  free(pairSrc);
+  free(pairDst);
+  for (i = 0; i < 4; i++) free(k[i]);
+  return ok;
 }
 
 static void *precondApplyLUWorker(void *arg) {
@@ -353,7 +614,6 @@ void setupPreconditioning(ssystem *sys) {
   if ((sys->precondCacheMode > 0 && sys->precondCacheMode != 3) ||
       sys->debugComparePrecond > 0) {
     cube **precondCubes;
-    int nThreads;
     CALLOC_FULL(pcBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
     CALLOC_FULL(pcBlockSize, nPrecondBlocks, int, OFF, ASOLVER);
     if (sys->precondCacheMode > 1 || sys->debugComparePrecond > 0) {
@@ -374,37 +634,17 @@ void setupPreconditioning(ssystem *sys) {
         CALLOC_FULL(pcIpivBlocks[idx], Msize, int, OFF, ASOLVER);
       }
     }
-    nThreads = setupThreadCountPc(nPrecondBlocks);
-    if (nThreads <= 1) {
-      PrecondSetupTask task;
-      task.sys = sys;
-      task.cubes = precondCubes;
-      task.begin = 0;
-      task.end = nPrecondBlocks;
-      task.scale1 = scale1;
-      task.scale2 = scale2;
-      task.buildLU = (pcLUBlocks != NULL);
-      precondSetupWorker(&task);
-    } else {
-      pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
-      PrecondSetupTask *tasks = (PrecondSetupTask *)calloc((size_t)nThreads, sizeof(PrecondSetupTask));
-      ASSERT(threads != NULL);
-      ASSERT(tasks != NULL);
-      for (idx = 0; idx < nThreads; idx++) {
-        tasks[idx].sys = sys;
-        tasks[idx].cubes = precondCubes;
-        tasks[idx].begin = (int)(((long long)nPrecondBlocks * idx) / nThreads);
-        tasks[idx].end = (int)(((long long)nPrecondBlocks * (idx + 1)) / nThreads);
-        tasks[idx].scale1 = scale1;
-        tasks[idx].scale2 = scale2;
-        tasks[idx].buildLU = (pcLUBlocks != NULL);
-        pthread_create(&threads[idx], NULL, precondSetupWorker, &tasks[idx]);
-      }
-      for (idx = 0; idx < nThreads; idx++) {
-        pthread_join(threads[idx], NULL);
-      }
-      free(tasks);
-      free(threads);
+    /*
+     * Batched GPU build first: the block pairs duplicate nearfield pairs, so it
+     * shares that kernel and one resident panel-geometry upload instead of the
+     * per-block path's mutex and ~10 synchronous CUDA calls per block. Falls
+     * back to the original per-block build if anything is unavailable.
+     */
+    if (!precondSetupBatchedGpu(sys, precondCubes, nPrecondBlocks,
+                                scale1, scale2, (pcLUBlocks != NULL))) {
+      runPrecondSetupRange(sys, precondCubes, 0, nPrecondBlocks,
+                           scale1, scale2, (pcLUBlocks != NULL),
+                           NULL, NULL, NULL, NULL, NULL);
     }
     free(precondCubes);
   }

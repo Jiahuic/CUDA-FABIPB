@@ -24,6 +24,16 @@ int gpuSetupRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
 int gpuPanelChargeTreeEnergy(struct ssystem *sys, const double *sgm, double *pot);
 /* setupRHS via the same charge-tree walk on the device. 0 => use the CPU path. */
 int gpuChargeTreeRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
+/*
+ * Batched preconditioner build: computes the disjoint-pair KER values for many
+ * blocks in one pass, sharing the nearfield kernel and one resident copy of the
+ * panel geometry. Pair indices are pnl->idx. Returns 0 if unavailable, leaving
+ * the caller on the CPU path.
+ */
+int gpuBuildPrecondPairsBatched(struct ssystem *sys,
+                                const int *pairSrc, const int *pairDst,
+                                long long nPairs,
+                                double *k0, double *k1, double *k2, double *k3);
 int gpuBuildPrecondDisjointBlock(struct panel **panels, int nPanels,
                                  const int *dstLocal, const int *srcLocal,
                                  int nPairs, double *block);
