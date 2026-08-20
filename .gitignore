@@ -2,6 +2,11 @@ build/
 build-*/
 results/*
 !results/README.md
+TABI-PB/
+nanoshaper/
+nanoshaper-master/
+/nanoshaper-master
+resume.md
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -21,6 +26,10 @@ test_proteins/*.face
 test_proteins/H1N1.pqr
 test_proteins/H1N1_atoms.pqr
 test_proteins/ZIKV_6CO8_zenodo.pqr
+test_proteins/*.pdb
+test_proteins/*_charmm.pqr
+test_proteins/*_charmm_protein_compact.pqr
+test_proteins/TABI.pqr
 TABI-PB/examples/pqr.zip
 TABI-PB/examples/zenodo_4568768/
 bimpb_cuda/
