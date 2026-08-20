@@ -239,6 +239,12 @@ the command, mesh metadata, RHS summary, GMRES status, and stage timings under
 `SDENS` is the user-facing NanoShaper/TABI density label. The runner translates
 it internally to FABIPB's mesh parameter.
 
+The source binary auto-selects GPU mode, Q2M/L2P placement, preconditioner,
+worker thread counts, and panel-tree energy defaults. The runner handles mesh
+setup, output directories, tree RHS, and result summaries. Expert overrides
+such as `FMM_GPU`, `FMM_Q2M`, and `FMM_PRECONDITIONER` are still available but
+are not needed for normal capsid runs.
+
 ```sh
 SDENS=1 \
 OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_full \
@@ -247,6 +253,14 @@ OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_full \
 SDENS=2 FMM_DEPTH=9 \
 OUT_DIR=results/fmm/6co8_fabipb_sdens2/zenodo_sdens2_depth9_full \
 ./scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+```
+
+H1N1 at the paper density:
+
+```sh
+SDENS=0.5 \
+OUT_DIR=results/fmm/h1n1_fabipb_sdens05/h1n1_sdens05_depth8_full \
+./scripts/run_6co8_fabipb_fast.sh test_proteins/H1N1_atoms.pqr
 ```
 
 Run the supported regression checks after rebuilding:

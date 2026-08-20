@@ -4,6 +4,11 @@
 > Some one-off debug commands shown below were removed from the production
 > code during cleanup. Use the current 6CO8 runner and the supported options
 > in `build/fabipb -h` for new runs.
+>
+> Update 2026-08-20: the production RHS and post-solve energy tree defaults are
+> now `FABIPB_RHS_TREE_THETA=0.3` and `FABIPB_ENERGY_TREE_THETA=0.3`. Older
+> notes below may discuss `0.2` as the default; use explicit environment
+> settings when reproducing historical runs.
 
 Current branch:
 
@@ -468,14 +473,16 @@ A same-mesh `1a63` sweep measured the CPU tree acceptance-ratio tradeoff:
 | 0.30 | 0.0470 s | 5.10e-4 | 2.39e-3 |
 | 0.40 | 0.0339 s | 1.80e-3 | 1.07e-2 |
 
-`theta=0.3` is a useful explicit 6CO8 timing experiment, but it is not the new
-default until its fine-virus RHS sums are compared against the existing
-`theta=0.2` result. The expected long-term implementation is a flattened GPU
-charge tree: persistent node/moment/leaf-charge arrays, one GPU target per
-panel quadrature point, an explicit bounded traversal stack, multipole
-evaluation for accepted nodes, and direct charge evaluation only in reached
-leaves. This changes the hardware used without changing the current tree-RHS
-equations or acceptance rule.
+`theta=0.3` was originally treated as an explicit 6CO8 timing experiment. It is
+now the source default RHS setting because the accuracy loss is acceptable for
+the current comparison target and the speedup is material.
+Set `FABIPB_RHS_TREE_THETA=0.2` when reproducing the stricter historical runs.
+The expected long-term implementation is a flattened GPU charge tree:
+persistent node/moment/leaf-charge arrays, one GPU target per panel quadrature
+point, an explicit bounded traversal stack, multipole evaluation for accepted
+nodes, and direct charge evaluation only in reached leaves. This changes the
+hardware used without changing the current tree-RHS equations or acceptance
+rule.
 
 Focused tests:
 

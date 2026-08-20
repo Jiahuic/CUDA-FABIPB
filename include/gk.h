@@ -84,7 +84,7 @@ struct ssystem {
   int debugCompareApply;    /* 0=off, >0 compare one CPU/GPU applyFMM call */
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
-  int gpuQ2MMode;           /* 1=GPU Q2M (default), 0=force the CPU dgemv loop */
+  int gpuQ2MMode;           /* 1=GPU Q2M, 0=CPU dgemv loop; default resolved after loadPanel */
   int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
   /*
    * 0=original, 1=cached local blocks, 2=cached LU, 3=diagonal/Jacobi.
@@ -111,9 +111,9 @@ struct ssystem {
    * converged in 87. (Those capsid figures predate the transL2L fix and other
    * changes; the direction is solid, the numbers are stale.)
    *
-   * The default is left at 2 only because changing it shifts every existing
-   * small-case baseline; on this evidence 3 would be the better default for
-   * anything but a high-contrast dielectric.
+   * The default is resolved after loadPanel: huge capsids use mode 3 to avoid
+   * memory and solve-time pressure, small/medium high-contrast dielectric cases
+   * use mode 2, and other cases use mode 3.
    */
   int precondCacheMode;
   int nLeafCubesFlat;       /* flattened finest-level cube count */

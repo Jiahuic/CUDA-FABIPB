@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -329,6 +330,18 @@ static void buildM2LPairList(ssystem *sys) {
   for (lev = depth; lev >= height; lev--) {
     for (cb = sys->cubeList[lev]; cb != NULL; cb = cb->next) {
       int count = cb->n2Nbrs - cb->nNbrs;
+      if (count < 0) {
+        fprintf(stderr,
+                "FMM M2L setup failed: cube level=%d flatIdx=%d has invalid M2L neighbor count %d (n2Nbrs=%d nNbrs=%d)\n",
+                cb->level, cb->flatIdx, count, cb->n2Nbrs, cb->nNbrs);
+        exit(1);
+      }
+      if ((long long)sys->nM2LPairsFlat + (long long)count > (long long)INT_MAX) {
+        fprintf(stderr,
+                "FMM M2L setup failed: flattened M2L pair count exceeds INT_MAX at depth=%d level=%d. partial=%d add=%d. Use a smaller FMM_DEPTH until 64-bit/streamed M2L setup is implemented.\n",
+                depth, lev, sys->nM2LPairsFlat, count);
+        exit(1);
+      }
       sys->nM2LPairsFlat += count;
     }
   }
@@ -641,7 +654,8 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   time1 = wall_seconds_local();
   if (!(sys->gpuMode > 0 && gpuM2LApply(sys))) {
     if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedNoGpuM2L) {
-      printf("GPU M2L path unavailable; using CPU fallback.\n");
+      printf("GPU M2L path unavailable: %s; using CPU fallback.\n",
+             gpuM2LLastError());
       warnedNoGpuM2L = 1;
     }
   for (idx = 0; idx < sys->nM2LPairsFlat; idx++) {
@@ -673,8 +687,15 @@ void applyFMM(ssystem *sys, double *alpha, double *sgm, double *beta, double *po
   /* L2P transformations */
   time1 = wall_seconds_local();
   nMom = sys->nMom[sys->ordMom[depth]];
-  if (!(sys->gpuMode > 0 && gpuL2PApply(sys, *alpha, *beta, pot))) {
-    if (sys->gpuMode > 0 && gpuBackendAvailable() && !warnedNoGpuL2P) {
+  /*
+   * The current GPU Q2M and L2P paths share the large leaf-transform cache.
+   * When gpuQ2MMode is disabled for memory-sensitive virus runs, keep L2P on
+   * the CPU too so that nearfield can use the freed GPU memory.
+   */
+  if (!(sys->gpuMode > 0 && sys->gpuQ2MMode > 0 &&
+        gpuL2PApply(sys, *alpha, *beta, pot))) {
+    if (sys->gpuMode > 0 && sys->gpuQ2MMode > 0 &&
+        gpuBackendAvailable() && !warnedNoGpuL2P) {
       printf("GPU L2P path unavailable; using CPU fallback.\n");
       warnedNoGpuL2P = 1;
     }

@@ -9,6 +9,10 @@ const char *gpuNearfieldLastError(void) {
   return "CUDA backend not compiled";
 }
 
+const char *gpuM2LLastError(void) {
+  return "CUDA backend not compiled";
+}
+
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
   (void)sys;
   (void)alpha;
@@ -43,6 +47,12 @@ int gpuL2PApply(ssystem *sys, double alpha, double beta, double *pot) {
   (void)beta;
   (void)pot;
   return 0;
+}
+
+void gpuReleaseMatvecCaches(void) {
+}
+
+void gpuReleaseChargeTreeCache(void) {
 }
 
 int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {

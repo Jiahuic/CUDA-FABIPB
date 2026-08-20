@@ -24,6 +24,7 @@
 
 #define DEFAULT_MAX_DIRECT_RHS_PAIRS 5000000000ULL
 #define DEFAULT_MAX_GPU_DIRECT_RHS_PAIRS 200000000000ULL
+#define DEFAULT_HUGE_CAPSID_ATOMS 5000000ULL
 
 #if defined(__GNUC__) || defined(__clang__)
 #define FABIPB_THREAD_LOCAL __thread
@@ -215,6 +216,78 @@ static void reportDirectRhsLimit(int nPnls, int nChar, int gpuMode) {
            "FABIPB_MAX_DIRECT_RHS_PAIRS=%llu; using tree-accelerated RHS.\n",
            rhsPairs, nPnls, nChar, maxDirectRhsPairs);
   }
+}
+
+static unsigned long long getHugeCapsidAtomThreshold(void) {
+  const char *env = getenv("FABIPB_HUGE_CAPSID_ATOMS");
+
+  if (env != NULL && env[0] != '\0') {
+    return parseUnsignedLongLongEnv("FABIPB_HUGE_CAPSID_ATOMS",
+                                    DEFAULT_HUGE_CAPSID_ATOMS);
+  }
+  return parseUnsignedLongLongEnv("FABIPB_Q2M_HUGE_CAPSID_ATOMS",
+                                  DEFAULT_HUGE_CAPSID_ATOMS);
+}
+
+static int isHighContrastDielectric(void) {
+  double ratio = epsilon2 / epsilon1;
+  return epsilon1 > 0.0 && epsilon1 <= 2.0 && ratio >= 40.0;
+}
+
+static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
+                                    int precondExplicit) {
+  unsigned long long threshold = getHugeCapsidAtomThreshold();
+  int hugeCapsid = (unsigned long long)sys->nChar > threshold;
+  int highContrast = isHighContrastDielectric();
+
+  if (!q2mExplicit) {
+    if (sys->gpuMode <= 0) {
+      sys->gpuQ2MMode = 0;
+    } else if (hugeCapsid) {
+      sys->gpuQ2MMode = 0;
+    } else {
+      sys->gpuQ2MMode = 1;
+    }
+  }
+
+  if (!precondExplicit) {
+    if (hugeCapsid) {
+      sys->precondCacheMode = 3;
+    } else if (highContrast) {
+      sys->precondCacheMode = 2;
+    } else {
+      sys->precondCacheMode = 3;
+    }
+  }
+
+  if (sys->benchmarkMode > 0) {
+    if (sys->matvecMode == 0) {
+      const char *q2mReason = q2mExplicit ? "explicit -Q"
+          : (sys->gpuMode <= 0) ? "auto: GPU disabled"
+          : hugeCapsid ? "auto: huge capsid, preserve GPU memory for nearfield"
+                       : "auto: small/medium case, use GPU Q2M/L2P";
+      printf("Resolved GPU Q2M mode=%d (%s; huge-capsid-threshold=%llu atoms, charges=%d)\n",
+             sys->gpuQ2MMode, q2mReason, threshold, sys->nChar);
+    }
+    {
+      const char *precondReason = precondExplicit ? "explicit -P"
+          : hugeCapsid ? "auto: huge capsid, use diagonal preconditioner"
+          : highContrast ? "auto: high dielectric contrast, use cached block-LU"
+                         : "auto: default diagonal preconditioner";
+      printf("Resolved preconditioner mode=%d (%s; eps2/eps1=%g)\n",
+             sys->precondCacheMode, precondReason, epsilon2 / epsilon1);
+    }
+  }
+}
+
+static const char *autoOrExplicitLabel(int explicitFlag, int value,
+                                       char *buf, size_t bufSize) {
+  if (explicitFlag) {
+    snprintf(buf, bufSize, "%d", value);
+  } else {
+    snprintf(buf, bufSize, "auto");
+  }
+  return buf;
 }
 
 /*
@@ -505,9 +578,10 @@ static void print_usage(const char *prog) {
   printf("  -d=<val>  backend-specific override: MSMS density or NanoShaper Grid_scale\n");
   printf("  -M=0|1    full solve or mesh-only calibration run (default: 0)\n");
   printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");
-  printf("  -Q=0|1    CPU dgemv loop or GPU Q2M path (default: 1)\n");
+  printf("  -Q=0|1    CPU dgemv loop or GPU Q2M path (default: auto)\n");
+  printf("            auto disables Q2M/L2P on huge capsids to preserve nearfield GPU memory\n");
   printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
-  printf("  -P=-1|0|1|2|3  disabled, original, cached-block, cached-LU, or diagonal/Jacobi preconditioner (default: 2)\n");
+  printf("  -P=-1|0|1|2|3  disabled, original, cached-block, cached-LU, or diagonal/Jacobi preconditioner (default: auto)\n");
   printf("                 3 is faster than 2 in most measured cases and is required at capsid\n");
   printf("                 scale, where 2 costs far more preconditioner-solve time and can stall;\n");
   printf("                 2 wins mainly at high dielectric contrast (eps1=1 against eps2=80).\n");
@@ -531,12 +605,12 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_MAX_GPU_DIRECT_RHS_PAIRS=<n>  cap GPU direct setupRHS work\n");
   printf("  FABIPB_ALLOW_LARGE_DIRECT_RHS=1  bypass the active direct setupRHS cap\n");
   printf("  FABIPB_FORCE_TREE_RHS=1   force the tree-accelerated setupRHS path\n");
-  printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio (default 0.2)\n");
+  printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio (default 0.3)\n");
   printf("  FABIPB_RHS_THREADS=<n> setupRHS tree worker threads (default: online CPUs, max 128)\n");
   printf("Post-solve energy evaluation:\n");
-  printf("  FABIPB_ENERGY_MODE=charge-tree|panel-tree|compare  energy evaluator (default: charge-tree)\n");
+  printf("  FABIPB_ENERGY_MODE=charge-tree|panel-tree|compare  energy evaluator (default: panel-tree)\n");
   printf("                            panel-tree is threaded and more accurate; compare runs both and reports the diff\n");
-  printf("  FABIPB_ENERGY_TREE_THETA=<x> panel-tree acceptance ratio (default 0.2; independent of the RHS ratio)\n");
+  printf("  FABIPB_ENERGY_TREE_THETA=<x> panel-tree acceptance ratio (default 0.3; independent of the RHS ratio)\n");
   printf("  FABIPB_ENERGY_THREADS=<n> panel-tree worker threads (default: online CPUs, max 128)\n");
   printf("Diagnostics (optional; disabled unless explicitly enabled):\n");
   printf("  FABIPB_RHS_SUMMARY_PATH=<path> write raw and TABI-style RHS summary CSV\n");
@@ -586,7 +660,7 @@ static const char *energyMode(void) {
   const char *env = getenv("FABIPB_ENERGY_MODE");
 
   if (env == NULL || env[0] == '\0') {
-    return "charge-tree";
+    return "panel-tree";
   }
   if (strcmp(env, "charge-tree") == 0 ||
       strcmp(env, "panel-tree") == 0 ||
@@ -594,9 +668,9 @@ static const char *energyMode(void) {
     return env;
   }
   fprintf(stderr,
-          "Warning: ignoring invalid FABIPB_ENERGY_MODE='%s'; using charge-tree\n",
+          "Warning: ignoring invalid FABIPB_ENERGY_MODE='%s'; using panel-tree\n",
           env);
-  return "charge-tree";
+  return "panel-tree";
 }
 
 static void writeSolutionIfRequested(ssystem *sys, double *sgm) {
@@ -970,6 +1044,8 @@ int main(int nargs, char *argv[]){
   double meshControlValue = 0.0;
   int meshOverrideSet = 0;
   int meshOnlyMode = 0;
+  int q2mExplicit = 0;
+  int precondExplicit = 0;
   const char *meshControlName = NULL;
   const char *backendParamName = NULL;
 
@@ -993,7 +1069,7 @@ int main(int nargs, char *argv[]){
   sys->matvecMode = 0;
   sys->gpuQ2MMode = 1;
   sys->gpuNearfieldMode = 1;
-  sys->precondCacheMode = 2;
+  sys->precondCacheMode = 3;
   //kappa = sqrt(8.430325455*bulk_strength/epsilon2); // bulk_strength = 0.15
   kappa = 0.1257;
 
@@ -1049,9 +1125,15 @@ int main(int nargs, char *argv[]){
     else if ((v = optValue(arg, "c"))    != NULL) sys->debugCompareApply  = optInt(arg, v, 0, 1);
     else if ((v = optValue(arg, "C"))    != NULL) sys->debugComparePrecond= optInt(arg, v, 0, 1);
     else if ((v = optValue(arg, "r"))    != NULL) sys->matvecMode         = optInt(arg, v, 0, 2);
-    else if ((v = optValue(arg, "Q"))    != NULL) sys->gpuQ2MMode         = optInt(arg, v, 0, 1);
+    else if ((v = optValue(arg, "Q"))    != NULL) {
+      sys->gpuQ2MMode = optInt(arg, v, 0, 1);
+      q2mExplicit = 1;
+    }
     else if ((v = optValue(arg, "G"))    != NULL) sys->gpuNearfieldMode   = optInt(arg, v, 0, 1);
-    else if ((v = optValue(arg, "P"))    != NULL) sys->precondCacheMode   = optInt(arg, v, -1, 3);
+    else if ((v = optValue(arg, "P"))    != NULL) {
+      sys->precondCacheMode = optInt(arg, v, -1, 3);
+      precondExplicit = 1;
+    }
     else if ((v = optValue(arg, "d"))    != NULL) {
       meshOverrideValue = optDouble(arg, v, 1e-12, 1e9);
       meshOverrideSet = 1;
@@ -1116,6 +1198,8 @@ int main(int nargs, char *argv[]){
   }
 
   if (sys->benchmarkMode > 0) {
+    char q2mBuf[16];
+    char precondBuf[16];
     if (missing_external_thread_env()) {
       fprintf(stderr,
               "Warning: BLAS/OpenMP thread env vars were not exported before startup. "
@@ -1138,10 +1222,14 @@ int main(int nargs, char *argv[]){
     printf("Matvec mode=%d (0=FMM, 1=direct GPU baseline, 2=direct CPU baseline)\n",
            sys->matvecMode);
     if (sys->matvecMode == 0) {
-      printf("GPU Q2M mode=%d (1=GPU, 0=CPU dgemv loop)\n", sys->gpuQ2MMode);
+      printf("GPU Q2M mode=%s (1=GPU, 0=CPU dgemv loop)\n",
+             autoOrExplicitLabel(q2mExplicit, sys->gpuQ2MMode,
+                                 q2mBuf, sizeof(q2mBuf)));
       printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
     }
-    printf("Preconditioner mode=%d (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n", sys->precondCacheMode);
+    printf("Preconditioner mode=%s (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n",
+           autoOrExplicitLabel(precondExplicit, sys->precondCacheMode,
+                               precondBuf, sizeof(precondBuf)));
     printf("Energy mode=%s (charge-tree, panel-tree, compare)\n", energyMode());
     if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
       printf("Debug compare flags: apply=%d precond=%d\n",
@@ -1164,6 +1252,7 @@ int main(int nargs, char *argv[]){
     printf("Mesh-only mode: stopping after mesh generation.\n");
     return 0;
   }
+  resolveAutoSolverPolicy(sys, q2mExplicit, precondExplicit);
   reportDirectRhsLimit(nPnls, sys->nChar, sys->gpuMode);
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
@@ -1203,6 +1292,17 @@ int main(int nargs, char *argv[]){
   stage_t0 = wall_seconds();
   setupRHS(sys, sgm);
   setupRHS_t = wall_seconds() - stage_t0;
+  if (sys->gpuMode > 0) {
+    /*
+     * setupRHS may leave the charge-tree GPU cache resident. Virus-scale
+     * nearfield streaming needs that memory for its panel/pair staging; the
+     * final energy evaluator rebuilds the charge tree after GMRES if needed.
+    */
+    gpuReleaseChargeTreeCache();
+    if (sys->benchmarkMode > 0) {
+      printf("Released RHS charge-tree GPU cache before GMRES.\n");
+    }
+  }
   if (sys->debugCompareApply > 0) {
     compareApplyFMMOnce(sys, sgm);
   }

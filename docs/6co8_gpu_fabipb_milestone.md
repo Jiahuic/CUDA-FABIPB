@@ -71,16 +71,16 @@ GPU M2L chunk:              512 MiB
 GPU nearfield chunk:        512 MiB
 ```
 
-The explicit `theta=0.3` RHS setting is an accuracy/runtime choice, not the
-code default. Relative to `theta=0.2`, sampled full-virus RHS differences were
+The `theta=0.3` RHS setting is now the source default accuracy/runtime choice.
+Relative to `theta=0.2`, sampled full-virus RHS differences were
 0.0136% for component 0 and 0.1288% for component 1. On `1a63`, the component
 errors against direct RHS were 5.10e-4 and 2.39e-3 at `theta=0.3`.
 
 That RHS ratio applies only to the RHS. The post-solve energy treecode has its
-own `FABIPB_ENERGY_TREE_THETA` (default 0.2), deliberately separate: loosening
-the RHS to 0.3 is a reasonable trade because setupRHS runs once per solve, but
-applying the same 0.3 to the energy cost 70x accuracy on `1a63` (7.2e-6 ->
-5.2e-4 against the theta->0 limit) for a stage that also runs only once.
+own `FABIPB_ENERGY_TREE_THETA`. This document was written when the energy
+default was `0.2`; the current production default is `0.3` for virus-scale
+throughput. Set `FABIPB_ENERGY_TREE_THETA=0.2` for the stricter historical
+setting.
 
 ## What Made The Full Solve Possible
 

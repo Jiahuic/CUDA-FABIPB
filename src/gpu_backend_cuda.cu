@@ -147,6 +147,7 @@ struct NearfieldGpuCache {
 
 NearfieldGpuCache gNear = {};
 char gNearfieldLastError[512] = "";
+char gM2LLastError[512] = "";
 
 struct M2LGpuCache {
   const ssystem *sys;
@@ -292,6 +293,13 @@ void setNearfieldLastError(const char *fmt, ...) {
   va_end(ap);
 }
 
+void setM2LLastError(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(gM2LLastError, sizeof(gM2LLastError), fmt, ap);
+  va_end(ap);
+}
+
 int envFlagEnabled(const char *name) {
   const char *value = getenv(name);
   return value != NULL && atoi(value) != 0;
@@ -347,6 +355,27 @@ int cudaMemcpyNearfield(void *dst, const void *src, size_t bytes,
   if (err != cudaSuccess) {
     setNearfieldLastError("cudaMemcpy %s failed for %.3f GiB: %s",
                           name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+int cudaMallocM2L(void **ptr, size_t bytes, const char *name) {
+  cudaError_t err = cudaMalloc(ptr, bytes);
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMalloc %s failed for %.3f GiB: %s",
+                    name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+int cudaMemcpyM2L(void *dst, const void *src, size_t bytes,
+                  enum cudaMemcpyKind kind, const char *name) {
+  cudaError_t err = cudaMemcpy(dst, src, bytes, kind);
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMemcpy %s failed for %.3f GiB: %s",
+                    name, bytesToGiB(bytes), cudaGetErrorString(err));
     return 0;
   }
   return 1;
@@ -457,16 +486,28 @@ static void freeNearfieldSpecialCache(void) {
   gNear.specialCacheChunks = 0;
 }
 
+static void freeNearfieldStreamPairTable(void) {
+  cudaFree(gNear.d_streamPairOffset);
+  cudaFree(gNear.d_streamPairSrcStart);
+  cudaFree(gNear.d_streamPairSrcCount);
+  cudaFree(gNear.d_streamPairDstStart);
+  gNear.d_streamPairOffset = NULL;
+  gNear.d_streamPairSrcStart = NULL;
+  gNear.d_streamPairSrcCount = NULL;
+  gNear.d_streamPairDstStart = NULL;
+  gNear.streamPairCount = 0;
+}
+
 /*
- * Ceiling on the special cache, in bytes. Defaults to 32 GiB, which covers the
- * 22.5 GiB the full virus mesh needs while leaving room for the GMRES
- * workspace and the panel array on a 256 GiB host. Set
+ * Ceiling on the special cache, in bytes. Defaults to 64 GiB, which covers the
+ * 51.9 GiB H1N1 sdens=1 special-case cache while leaving room on current
+ * capsid workstations. Set
  * FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB=0 to disable caching entirely and go
  * back to reclassifying every matvec.
  */
 static size_t nearfieldSpecialCacheBudget(void) {
   const char *env = getenv("FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB");
-  double mib = 32.0 * 1024.0;
+  double mib = 64.0 * 1024.0;
 
   if (env != NULL && env[0] != '\0') {
     char *endptr = NULL;
@@ -525,15 +566,7 @@ void freeNearfieldCache() {
   cudaFree(gNear.d_k3);
   cudaFree(gNear.d_sgm);
   cudaFree(gNear.d_pot);
-  cudaFree(gNear.d_streamPairOffset);
-  cudaFree(gNear.d_streamPairSrcStart);
-  cudaFree(gNear.d_streamPairSrcCount);
-  cudaFree(gNear.d_streamPairDstStart);
-  gNear.d_streamPairOffset = NULL;
-  gNear.d_streamPairSrcStart = NULL;
-  gNear.d_streamPairSrcCount = NULL;
-  gNear.d_streamPairDstStart = NULL;
-  gNear.streamPairCount = 0;
+  freeNearfieldStreamPairTable();
   gNear.d_panels = NULL;
   gNear.d_src = NULL;
   gNear.d_dst = NULL;
@@ -806,6 +839,13 @@ void freePrecondCache() {
   gPrecond.d_k3 = NULL;
   gPrecond.panelCapacity = 0;
   gPrecond.pairCapacity = 0;
+}
+
+extern "C" void gpuReleaseMatvecCaches(void) {
+  freeNearfieldCache();
+  freeM2LCache();
+  freeLeafCache();
+  freeDirectCache();
 }
 
 int ensurePrecondCapacity(int nPanels, int nPairs) {
@@ -1144,10 +1184,8 @@ int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions
         !cudaMallocNearfield((void **)&gNear.d_streamPairSrcCount,
                              (size_t)nPairs * sizeof(int), "stream pairSrcCount") ||
         !cudaMallocNearfield((void **)&gNear.d_streamPairDstStart,
-                             (size_t)nPairs * sizeof(int), "stream pairDstStart")) {
-      return 0;
-    }
-    if (!cudaMemcpyNearfield(gNear.d_streamPairOffset, &hOffset[0],
+                             (size_t)nPairs * sizeof(int), "stream pairDstStart") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairOffset, &hOffset[0],
                              ((size_t)nPairs + 1U) * sizeof(long long),
                              cudaMemcpyHostToDevice, "stream pairOffset") ||
         !cudaMemcpyNearfield(gNear.d_streamPairSrcStart, &hSrcStart[0],
@@ -1159,19 +1197,30 @@ int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions
         !cudaMemcpyNearfield(gNear.d_streamPairDstStart, &hDstStart[0],
                              (size_t)nPairs * sizeof(int),
                              cudaMemcpyHostToDevice, "stream pairDstStart")) {
-      return 0;
+      if (sys->benchmarkMode > 0) {
+        printf("GPU nearfield streaming pair table disabled: %s\n",
+               gpuNearfieldLastError());
+      }
+      freeNearfieldStreamPairTable();
+      cudaGetLastError();
+      setNearfieldLastError("not attempted");
+    } else {
+      gNear.streamPairCount = nPairs;
     }
-    gNear.streamPairCount = nPairs;
   }
 
   if (sys->benchmarkMode > 0) {
     printf("GPU nearfield streaming: interactions=%lld chunk-capacity=%lld chunk-device=%.3f GiB qOrd=1\n",
            totalInteractions, capacity,
            bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
-    printf("GPU nearfield streaming pair table: pairs=%d device=%.3f GiB\n",
-           gNear.streamPairCount,
-           bytesToGiB(((size_t)gNear.streamPairCount + 1U) * sizeof(long long) +
-                      3U * (size_t)gNear.streamPairCount * sizeof(int)));
+    if (gNear.streamPairCount > 0) {
+      printf("GPU nearfield streaming pair table: pairs=%d device=%.3f GiB\n",
+             gNear.streamPairCount,
+             bytesToGiB(((size_t)gNear.streamPairCount + 1U) * sizeof(long long) +
+                        3U * (size_t)gNear.streamPairCount * sizeof(int)));
+    } else {
+      printf("GPU nearfield streaming pair table: disabled\n");
+    }
   }
   return 1;
 }
@@ -1369,10 +1418,13 @@ int allocateM2LStreamingArrays(size_t chunkBytes) {
       !gM2L.h_cubeNMom || !gM2L.h_idxI1 || !gM2L.h_idxI2 || !gM2L.h_idxI3 ||
       !gM2L.h_idx3Flat || !gM2L.h_g0 || !gM2L.h_gk || !gM2L.h_momPot ||
       !gM2L.h_momDpdn || !gM2L.h_lec1 || !gM2L.h_lec2 ||
-      !gM2L.h_lec3 || !gM2L.h_lec4) return 0;
+      !gM2L.h_lec3 || !gM2L.h_lec4) {
+    setM2LLastError("host allocation for M2L streaming cache failed");
+    return 0;
+  }
 
 #define M2L_STREAM_CUDA_ALLOC(ptr, count, type) \
-  do { if (cudaMalloc((void **)&(ptr), (count) * sizeof(type)) != cudaSuccess) return 0; } while (0)
+  do { if (!cudaMallocM2L((void **)&(ptr), (count) * sizeof(type), #ptr)) return 0; } while (0)
   M2L_STREAM_CUDA_ALLOC(gM2L.d_pairSrc, pairCapacity, int);
   M2L_STREAM_CUDA_ALLOC(gM2L.d_pairCoeffOffset, pairCapacity + 1U, int);
   M2L_STREAM_CUDA_ALLOC(gM2L.d_groupStart, groupCapacity, int);
@@ -1598,7 +1650,7 @@ int buildM2LStreamingTables(const ssystem *sys) {
   }
 
 #define M2L_STREAM_UPLOAD(dst, src, count, type) \
-  do { if (cudaMemcpy((dst), (src), (count) * sizeof(type), cudaMemcpyHostToDevice) != cudaSuccess) return 0; } while (0)
+  do { if (!cudaMemcpyM2L((dst), (src), (count) * sizeof(type), cudaMemcpyHostToDevice, #dst)) return 0; } while (0)
   M2L_STREAM_UPLOAD(gM2L.d_cubeCoeffOffset, gM2L.h_cubeCoeffOffset, nCubes, int);
   M2L_STREAM_UPLOAD(gM2L.d_cubeNMom, gM2L.h_cubeNMom, nCubes, int);
   M2L_STREAM_UPLOAD(gM2L.d_idxI1, gM2L.h_idxI1, maxMom, int);
@@ -3338,8 +3390,7 @@ int flushM2LStreamingChunk(int pairCount, int groupCount, int coeffCount) {
 
 #define M2L_CHUNK_UPLOAD(dst, src, count, type) \
   do { \
-    err = cudaMemcpy((dst), (src), (size_t)(count) * sizeof(type), cudaMemcpyHostToDevice); \
-    if (err != cudaSuccess) return 0; \
+    if (!cudaMemcpyM2L((dst), (src), (size_t)(count) * sizeof(type), cudaMemcpyHostToDevice, #dst)) return 0; \
   } while (0)
   M2L_CHUNK_UPLOAD(gM2L.d_pairSrc, gM2L.h_pairSrc, pairCount, int);
   M2L_CHUNK_UPLOAD(gM2L.d_pairCoeffOffset, gM2L.h_pairCoeffOffset, pairCount, int);
@@ -3360,7 +3411,13 @@ int flushM2LStreamingChunk(int pairCount, int groupCount, int coeffCount) {
       gM2L.d_g0, gM2L.d_gk, epsilon,
       gM2L.d_momPot, gM2L.d_momDpdn,
       gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
-  return cudaGetLastError() == cudaSuccess;
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setM2LLastError("streaming m2lGroupedKernel launch failed: %s",
+                    cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
 }
 
 /*
@@ -3492,8 +3549,9 @@ int applyM2LStreamingChunks(const ssystem *sys) {
     M2LChunkGroup grp;
 
     if (count > gM2L.streamPairCapacity || neededCoeff > gM2L.streamCoeffCapacity) {
-      printf("GPU M2L streaming group exceeds chunk capacity: group=%d pairs=%d coeff=%lld\n",
-             groupIdx, count, neededCoeff);
+      setM2LLastError("streaming group exceeds chunk capacity: group=%d pairs=%d coeff=%lld pair-capacity=%d coeff-capacity=%d",
+                      groupIdx, count, neededCoeff,
+                      gM2L.streamPairCapacity, gM2L.streamCoeffCapacity);
       return 0;
     }
     if (groupCount == gM2L.streamGroupCapacity ||
@@ -3530,7 +3588,13 @@ int applyM2LStreamingChunks(const ssystem *sys) {
     if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
     chunks++;
   }
-  if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+  {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setM2LLastError("streaming M2L kernels failed: %s", cudaGetErrorString(err));
+      return 0;
+    }
+  }
   if (sys->benchmarkMode > 0) {
     printf("GPU M2L streaming apply: chunks=%d pairs=%d coeff=%lld\n",
            chunks, gM2L.nPairs, gM2L.totalPairCoeff);
@@ -3642,6 +3706,10 @@ int gpuBackendAvailable(void) {
 
 const char *gpuNearfieldLastError(void) {
   return gNearfieldLastError[0] ? gNearfieldLastError : "unknown nearfield GPU failure";
+}
+
+const char *gpuM2LLastError(void) {
+  return gM2LLastError[0] ? gM2LLastError : "unknown M2L GPU failure";
 }
 
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
@@ -3884,7 +3952,9 @@ int gpuM2LApply(ssystem *sys) {
   cudaError_t err;
   int blockSize;
 
+  setM2LLastError("not attempted");
   if (sys == NULL || sys->nM2LPairsFlat <= 0) {
+    setM2LLastError("invalid input or empty M2L pair list");
     return 0;
   }
 
@@ -3907,19 +3977,29 @@ int gpuM2LApply(ssystem *sys) {
   err = cudaMemcpy(gM2L.d_momPot, gM2L.h_momPot,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMemcpy momPot host-to-device failed for %.3f GiB: %s",
+                    bytesToGiB((size_t)gM2L.totalCubeCoeff * sizeof(double)),
+                    cudaGetErrorString(err));
+    return 0;
+  }
   err = cudaMemcpy(gM2L.d_momDpdn, gM2L.h_momDpdn,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMemcpy momDpdn host-to-device failed for %.3f GiB: %s",
+                    bytesToGiB((size_t)gM2L.totalCubeCoeff * sizeof(double)),
+                    cudaGetErrorString(err));
+    return 0;
+  }
   err = cudaMemset(gM2L.d_lec1, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec1 failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemset(gM2L.d_lec2, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec2 failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemset(gM2L.d_lec3, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec3 failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemset(gM2L.d_lec4, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec4 failed: %s", cudaGetErrorString(err)); return 0; }
 
   if (gM2L.streaming) {
     if (!applyM2LStreamingChunks(sys)) return 0;
@@ -3935,27 +4015,33 @@ int gpuM2LApply(ssystem *sys) {
         gM2L.d_momPot, gM2L.d_momDpdn,
         gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
     err = cudaGetLastError();
-    if (err != cudaSuccess) return 0;
+    if (err != cudaSuccess) {
+      setM2LLastError("m2lGroupedKernel launch failed: %s", cudaGetErrorString(err));
+      return 0;
+    }
     err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) return 0;
+    if (err != cudaSuccess) {
+      setM2LLastError("m2lGroupedKernel failed: %s", cudaGetErrorString(err));
+      return 0;
+    }
   }
 
   err = cudaMemcpy(gM2L.h_lec1, gM2L.d_lec1,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec1 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemcpy(gM2L.h_lec2, gM2L.d_lec2,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec2 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemcpy(gM2L.h_lec3, gM2L.d_lec3,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec3 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemcpy(gM2L.h_lec4, gM2L.d_lec4,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec4 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
 
   for (cubeIdx = 0; cubeIdx < sys->nFmmCubesFlat; cubeIdx++) {
     cube *cb = sys->fmmCubeByIdx[cubeIdx];
@@ -4422,6 +4508,7 @@ struct ChargeTreeGpu {
   double *d_pos;
   double *d_chr;
   NearPanelGeom *d_panels;
+  int *d_panelIdx;
   /* small tables */
   int *d_idx3;
   int *d_sgn3;
@@ -4440,10 +4527,15 @@ static void freeChargeTreeGpu(void) {
   cudaFree(gCTE.d_nodeOrder);    cudaFree(gCTE.d_kidIdx);
   cudaFree(gCTE.d_chgIdx);       cudaFree(gCTE.d_moments);
   cudaFree(gCTE.d_pos);          cudaFree(gCTE.d_chr);
-  cudaFree(gCTE.d_panels);       cudaFree(gCTE.d_idx3);
+  cudaFree(gCTE.d_panels);       cudaFree(gCTE.d_panelIdx);
+  cudaFree(gCTE.d_idx3);
   cudaFree(gCTE.d_sgn3);         cudaFree(gCTE.d_nMom);
   cudaFree(gCTE.d_out);
   memset(&gCTE, 0, sizeof(gCTE));
+}
+
+extern "C" void gpuReleaseChargeTreeCache(void) {
+  freeChargeTreeGpu();
 }
 
 /* Depth-first flatten of the charge tree into contiguous arrays. */
@@ -4591,6 +4683,7 @@ static int buildChargeTreeGpu(const ssystem *sys) {
   /* panel geometry: same layout the nearfield already uses */
   {
     std::vector<NearPanelGeom> geom((size_t)sys->nPnls);
+    std::vector<int> panelIdx((size_t)sys->nPnls);
     panel *pnl;
     int idx, k;
     for (idx = 0, pnl = sys->pnlLst; pnl != NULL && idx < sys->nPnls; pnl = pnl->nextC, idx++) {
@@ -4601,12 +4694,18 @@ static int buildChargeTreeGpu(const ssystem *sys) {
         geom[(size_t)idx].normal[k] = pnl->normal[k];
       }
       geom[(size_t)idx].area = pnl->area;
+      panelIdx[(size_t)idx] = pnl->idx;
     }
     if (!cudaMallocNearfield((void **)&gCTE.d_panels,
                              (size_t)sys->nPnls * sizeof(NearPanelGeom), "cte panels") ||
         !cudaMemcpyNearfield(gCTE.d_panels, &geom[0],
                              (size_t)sys->nPnls * sizeof(NearPanelGeom),
-                             cudaMemcpyHostToDevice, "cte panels")) return 0;
+                             cudaMemcpyHostToDevice, "cte panels") ||
+        !cudaMallocNearfield((void **)&gCTE.d_panelIdx,
+                             (size_t)sys->nPnls * sizeof(int), "cte panelIdx") ||
+        !cudaMemcpyNearfield(gCTE.d_panelIdx, &panelIdx[0],
+                             (size_t)sys->nPnls * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte panelIdx")) return 0;
   }
 
   if (!cudaMallocNearfield((void **)&gCTE.d_out,
@@ -4756,8 +4855,9 @@ __global__ void chargeTreeEnergyKernel(
     const double *pos, const double *chr,
     const int *fidx3, const int *sgn3d, const int *levOff,
     const int *nMomT,
+    const int *panelOrigIdx, const double *sgm,
     double *scratch, long long stride,
-    double *out) {
+    double *partial) {
   const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
   /* Base of each level's two-row window; slot m&1 holds row m. */
@@ -4766,6 +4866,8 @@ __global__ void chargeTreeEnergyKernel(
   int rowCap[16];            /* allocated row length at this level */
   double gv0[18], gvk[18];
   const long long halfOff = (long long)levOff[derivMax + 1];
+  extern __shared__ double blockSum[];
+  double threadSum = 0.0;
   int p;
   int panelIdx;
 
@@ -4948,9 +5050,23 @@ __global__ void chargeTreeEnergyKernel(
       }
     }
 
-    /* qOrd==1: weight 0.5 then the 2*area factor, so net = area. */
-    out[2 * panelIdx] = y0 * pn->area;
-    out[2 * panelIdx + 1] = y1 * pn->area;
+    {
+      int idx = panelOrigIdx[panelIdx];
+      /* qOrd==1: weight 0.5 then the 2*area factor, so net = area. */
+      threadSum += (y0 * pn->area) * sgm[idx + nPanels] +
+                   (y1 * pn->area) * sgm[idx];
+    }
+  }
+  blockSum[threadIdx.x] = threadSum;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      blockSum[threadIdx.x] += blockSum[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    partial[blockIdx.x] = blockSum[0];
   }
 }
 
@@ -4961,26 +5077,36 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   long long stride, slabDoubles;
   size_t scratchBytes;
   cudaError_t err;
-  std::vector<double> host;
+  std::vector<double> hostPartial;
   std::vector<int> levOff;
   double total = 0.0;
   int p, i;
   static double *d_scratch = NULL;
   static int *d_levOff = NULL;
+  static double *d_sgm = NULL;
+  static size_t d_sgmBytes = 0;
+  static double *d_partial = NULL;
+  static int d_partialCount = 0;
   static long long scratchStride = 0;
+  double tBuild0, tBuild1, tScratch0, tScratch1, tUpload0, tUpload1;
+  double tKernel0, tKernel1, tCopy0, tCopy1, tReduce0, tReduce1;
+  int rebuiltTree = 0;
 
   if (sys == NULL || sgm == NULL || pot == NULL) return 0;
   if (!gpuBackendAvailable()) return 0;
   if (sys->maxQuadOrder != 1) return 0;   /* kernel assumes the 1-point rule */
   if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) return 0;
 
+  tBuild0 = wall_seconds_cuda_local();
   if (gCTE.sys != sys) {
     freeChargeTreeGpu();
     cudaFree(d_scratch); d_scratch = NULL;
     cudaFree(d_levOff);  d_levOff = NULL;
     scratchStride = 0;
     if (!buildChargeTreeGpu(sys)) { freeChargeTreeGpu(); return 0; }
+    rebuiltTree = 1;
   }
+  tBuild1 = wall_seconds_cuda_local();
   if (gCTE.derivOrderMax + 1 >= 16) return 0;   /* fixed pointer arrays */
 
   /* Two rows per level, each sized for the longest row that level can hold:
@@ -5001,7 +5127,9 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   stride = chargeTreeScratchThreads("FABIPB_ENERGY_GPU_SCRATCH_MIB", 0, 3465.0,
                                     slabDoubles, gCTE.nPanels, blockSize);
   scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
+  gridSize = (int)(stride / blockSize);
 
+  tScratch0 = wall_seconds_cuda_local();
   if (scratchStride != stride) {
     cudaFree(d_scratch); d_scratch = NULL;
     if (!cudaMallocNearfield((void **)&d_scratch, scratchBytes, "cte scratch")) {
@@ -5015,9 +5143,29 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
         !cudaMemcpyNearfield(d_levOff, &levOff[0], levOff.size() * sizeof(int),
                              cudaMemcpyHostToDevice, "cte levOff")) return 0;
   }
+  if (d_sgmBytes < (size_t)2 * sys->nPnls * sizeof(double)) {
+    cudaFree(d_sgm);
+    d_sgm = NULL;
+    d_sgmBytes = (size_t)2 * sys->nPnls * sizeof(double);
+    if (!cudaMallocNearfield((void **)&d_sgm, d_sgmBytes, "cte sgm")) return 0;
+  }
+  if (d_partialCount < gridSize) {
+    cudaFree(d_partial);
+    d_partial = NULL;
+    d_partialCount = gridSize;
+    if (!cudaMallocNearfield((void **)&d_partial,
+                             (size_t)gridSize * sizeof(double),
+                             "cte partial")) return 0;
+  }
+  tScratch1 = wall_seconds_cuda_local();
 
-  gridSize = (int)(stride / blockSize);
-  chargeTreeEnergyKernel<<<gridSize, blockSize>>>(
+  tUpload0 = wall_seconds_cuda_local();
+  if (!cudaMemcpyNearfield(d_sgm, sgm, d_sgmBytes,
+                           cudaMemcpyHostToDevice, "cte sgm")) return 0;
+  tUpload1 = wall_seconds_cuda_local();
+
+  tKernel0 = wall_seconds_cuda_local();
+  chargeTreeEnergyKernel<<<gridSize, blockSize, (size_t)blockSize * sizeof(double)>>>(
       gCTE.nPanels, gCTE.derivOrderMax, gCTE.idxDim, sys->chgDepth, sys->height,
       energyTreeTheta(), kappa, epsilon, fourPiI,
       gCTE.d_panels,
@@ -5028,8 +5176,9 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
       gCTE.d_kidIdx, gCTE.d_chgIdx, gCTE.d_moments,
       gCTE.d_pos, gCTE.d_chr,
       gCTE.d_idx3, gCTE.d_sgn3, d_levOff, gCTE.d_nMom,
+      gCTE.d_panelIdx, d_sgm,
       d_scratch, stride,
-      gCTE.d_out);
+      d_partial);
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     setNearfieldLastError("charge-tree energy launch failed: %s", cudaGetErrorString(err));
@@ -5040,22 +5189,26 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
     setNearfieldLastError("charge-tree energy kernel failed: %s", cudaGetErrorString(err));
     return 0;
   }
+  tKernel1 = wall_seconds_cuda_local();
 
-  host.resize((size_t)2 * gCTE.nPanels);
-  if (!cudaMemcpyNearfield(&host[0], gCTE.d_out,
-                           (size_t)2 * gCTE.nPanels * sizeof(double),
-                           cudaMemcpyDeviceToHost, "cte out")) return 0;
+  tCopy0 = wall_seconds_cuda_local();
+  hostPartial.resize((size_t)gridSize);
+  if (!cudaMemcpyNearfield(&hostPartial[0], d_partial,
+                           (size_t)gridSize * sizeof(double),
+                           cudaMemcpyDeviceToHost, "cte partial")) return 0;
+  tCopy1 = wall_seconds_cuda_local();
 
-  /* Same combination as panelEnergyWorker(): entry i is panelByIdx[i], whose
-   * own idx selects the solution components. */
-  for (i = 0; i < gCTE.nPanels; i++) {
-    panel *pnl = sys->panelByIdx[i];
-    total += host[2 * i] * sgm[pnl->idx + sys->nPnls] + host[2 * i + 1] * sgm[pnl->idx];
-  }
+  tReduce0 = wall_seconds_cuda_local();
+  for (i = 0; i < gridSize; i++) total += hostPartial[(size_t)i];
+  tReduce1 = wall_seconds_cuda_local();
   *pot = total;
   if (sys->benchmarkMode > 0) {
     printf("GPU charge-tree energy: threads=%lld grid=%d scratch=%.3f GiB slab=%lld doubles\n",
            stride, gridSize, bytesToGiB(scratchBytes), slabDoubles);
+    printf("GPU charge-tree energy breakdown (s): build=%.6f scratch=%.6f sgm_h2d=%.6f kernel=%.6f partial_d2h=%.6f reduce=%.6f rebuilt=%d\n",
+           tBuild1 - tBuild0, tScratch1 - tScratch0, tUpload1 - tUpload0,
+           tKernel1 - tKernel0, tCopy1 - tCopy0, tReduce1 - tReduce0,
+           rebuiltTree);
   }
   return 1;
 }

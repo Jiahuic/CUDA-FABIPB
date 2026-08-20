@@ -15,13 +15,18 @@ fmm_r="$(awk -v density="$sdens" 'BEGIN {
   exit 1
 }
 fmm_depth="${FMM_DEPTH:-8}"
-fmm_gpu="${FMM_GPU:-1}"
-# The GPU Q2M kernel is 1.9x faster than the CPU dgemv loop and gives identical
-# energies; it used to be off by default and labelled "debug". Passing 0 here
-# would silently override the binary default, as this script did before.
-fmm_q2m="${FMM_Q2M:-1}"
+if [[ -n "${FMM_GPU+x}" ]]; then
+  if [[ "$FMM_GPU" != "-1" && "$FMM_GPU" != "0" && "$FMM_GPU" != "1" ]]; then
+    echo "FMM_GPU must be -1, 0, or 1: $FMM_GPU" >&2
+    exit 1
+  fi
+  fmm_gpu="$FMM_GPU"
+  fmm_gpu_reason="explicit FMM_GPU=$FMM_GPU"
+else
+  fmm_gpu=-1
+  fmm_gpu_reason="auto: binary selects GPU when CUDA is available"
+fi
 fmm_qorder="${FMM_QORDER:-1}"
-fmm_preconditioner="${FMM_PRECONDITIONER:-3}"
 restart="${GMRES_RESTART:-30}"
 max_iter="${GMRES_MAX_ITER:-100}"
 tolerance="${GMRES_TOLERANCE:-1e-4}"
@@ -32,26 +37,7 @@ stop_after_rhs="${STOP_AFTER_RHS:-0}"
 stop_after_gmres="${STOP_AFTER_GMRES:-0}"
 fabipb_timeout="${FABIPB_TIMEOUT:-}"
 live_log="${LIVE_LOG:-1}"
-rhs_threads="${FABIPB_RHS_THREADS:-${FMM_RHS_THREADS:-$(nproc)}}"
-energy_threads="${FABIPB_ENERGY_THREADS:-${FMM_ENERGY_THREADS:-$(nproc)}}"
-# FABIPB's own worker pools. These have to be passed explicitly: the command
-# below runs through with_benchmark_env.sh, which otherwise pins every pool to
-# a single thread for benchmark reproducibility. That is the right default when
-# comparing runs, but it is not what a production solve wants -- these pools
-# partition their loops into disjoint output slots, so the result is identical
-# at any thread count and the pinning only costs time.
-worker_threads="${FABIPB_WORKER_THREADS:-$(nproc)}"
-rhs_tree_theta="${FABIPB_RHS_TREE_THETA:-${FMM_RHS_TREE_THETA:-0.3}}"
 rhs_sample_stride="${FABIPB_RHS_SAMPLE_STRIDE:-${RHS_SAMPLE_STRIDE:-1000}}"
-m2l_chunk_mib="${FABIPB_GPU_M2L_CHUNK_MIB:-512}"
-nearfield_chunk_mib="${FABIPB_GPU_NEARFIELD_CHUNK_MIB:-512}"
-# panel-tree by default: on the full virus it evaluated the energy in 445 s
-# against 1279 s for charge-tree, and it is also the more accurate of the two.
-# Against the theta->0 limit the charge-tree evaluator is off by 1.1e-3 on 1a63
-# because it hardcodes theta=0.2, where panel-tree is off by 7.2e-6. Set
-# FABIPB_ENERGY_MODE=charge-tree to reproduce pre-2026-08 energies exactly, or
-# =compare to run both and print the difference.
-energy_mode="${FABIPB_ENERGY_MODE:-panel-tree}"
 
 nanoshaper_bin="${FABIPB_NANOSHAPER_BIN:-}"
 if [[ -z "$nanoshaper_bin" ]]; then
@@ -74,6 +60,29 @@ if [[ ! -x "$nanoshaper_bin" ]]; then
   echo "NanoShaper is missing or not executable: $nanoshaper_bin" >&2
   exit 1
 fi
+
+pqr_abs="$(readlink -f "$pqr")"
+if [[ -n "${FMM_Q2M+x}" ]]; then
+  if [[ "$FMM_Q2M" != "0" && "$FMM_Q2M" != "1" ]]; then
+    echo "FMM_Q2M must be 0 or 1: $FMM_Q2M" >&2
+    exit 1
+  fi
+  fmm_q2m_override="$FMM_Q2M"
+else
+  fmm_q2m_override="auto"
+fi
+
+if [[ -n "${FMM_PRECONDITIONER+x}" ]]; then
+  if ! [[ "$FMM_PRECONDITIONER" =~ ^-?[0-9]+$ ]] ||
+     [[ "$FMM_PRECONDITIONER" -lt -1 ]] || [[ "$FMM_PRECONDITIONER" -gt 3 ]]; then
+    echo "FMM_PRECONDITIONER must be one of -1, 0, 1, 2, 3: $FMM_PRECONDITIONER" >&2
+    exit 1
+  fi
+  fmm_preconditioner_override="$FMM_PRECONDITIONER"
+else
+  fmm_preconditioner_override="auto"
+fi
+
 if [[ -d "$out_dir" ]] && [[ -n "$(find "$out_dir" -mindepth 1 -print -quit)" ]] \
   && [[ "${ALLOW_EXISTING_OUT_DIR:-0}" != "1" ]]; then
   echo "Output directory is not empty: $out_dir" >&2
@@ -83,7 +92,6 @@ fi
 
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
-pqr_abs="$(readlink -f "$pqr")"
 rhs_summary_path="$out_dir/rhs_summary.csv"
 rhs_sample_path="$out_dir/rhs_sample.csv"
 ln -sfn "$pqr_abs" "$out_dir/input.pqr"
@@ -97,9 +105,10 @@ sdens=$sdens
 internal_fmm_r=$fmm_r
 fmm_depth=$fmm_depth
 fmm_gpu=$fmm_gpu
-fmm_q2m=$fmm_q2m
+fmm_gpu_reason=$fmm_gpu_reason
+fmm_q2m_override=$fmm_q2m_override
 fmm_qorder=$fmm_qorder
-fmm_preconditioner=$fmm_preconditioner
+fmm_preconditioner_override=$fmm_preconditioner_override
 gmres_restart=$restart
 gmres_max_iter=$max_iter
 gmres_tolerance=$tolerance
@@ -107,14 +116,17 @@ gmres_initial=$initial
 pdie=$pdie
 sdie=$sdie
 force_tree_rhs=1
-rhs_threads=$rhs_threads
-energy_threads=$energy_threads
-worker_threads=$worker_threads
-rhs_tree_theta=$rhs_tree_theta
+rhs_tree_theta_override=${FABIPB_RHS_TREE_THETA:-${FMM_RHS_TREE_THETA:-source-default}}
 rhs_summary_path=$rhs_summary_path
 rhs_sample_path=$rhs_sample_path
 rhs_sample_stride=$rhs_sample_stride
-energy_mode=$energy_mode
+rhs_threads_override=${FABIPB_RHS_THREADS:-${FMM_RHS_THREADS:-source-default}}
+energy_threads_override=${FABIPB_ENERGY_THREADS:-${FMM_ENERGY_THREADS:-source-default}}
+worker_threads_override=${FABIPB_WORKER_THREADS:-source-default}
+m2l_chunk_mib_override=${FABIPB_GPU_M2L_CHUNK_MIB:-source-default}
+nearfield_chunk_mib_override=${FABIPB_GPU_NEARFIELD_CHUNK_MIB:-source-default}
+nearfield_special_cache_mib_override=${FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB:-source-default}
+energy_mode_override=${FABIPB_ENERGY_MODE:-source-default}
 reuse_mesh=1
 stop_after_rhs=$stop_after_rhs
 stop_after_gmres=$stop_after_gmres
@@ -126,21 +138,28 @@ env_args=(
   FABIPB_NANOSHAPER_BIN="$nanoshaper_bin"
   FABIPB_REUSE_MESH=1
   FABIPB_FORCE_TREE_RHS=1
-  FABIPB_RHS_THREADS="$rhs_threads"
-  FABIPB_ENERGY_THREADS="$energy_threads"
-  FABIPB_NEARFIELD_BUILD_THREADS="$worker_threads"
-  FABIPB_SETUP_THREADS="$worker_threads"
-  FABIPB_PRECOND_APPLY_THREADS="$worker_threads"
-  FABIPB_DIRECT_THREADS="$worker_threads"
-  FABIPB_RHS_TREE_THETA="$rhs_tree_theta"
   FABIPB_RHS_SUMMARY_PATH="$rhs_summary_path"
   FABIPB_RHS_SAMPLE_PATH="$rhs_sample_path"
   FABIPB_RHS_SAMPLE_STRIDE="$rhs_sample_stride"
   FABIPB_GMRES_INITIAL="$initial"
-  FABIPB_GPU_M2L_CHUNK_MIB="$m2l_chunk_mib"
-  FABIPB_GPU_NEARFIELD_CHUNK_MIB="$nearfield_chunk_mib"
-  FABIPB_ENERGY_MODE="$energy_mode"
 )
+if [[ -n "${FMM_RHS_THREADS+x}" && -z "${FABIPB_RHS_THREADS+x}" ]]; then
+  env_args+=(FABIPB_RHS_THREADS="$FMM_RHS_THREADS")
+fi
+if [[ -n "${FMM_RHS_TREE_THETA+x}" && -z "${FABIPB_RHS_TREE_THETA+x}" ]]; then
+  env_args+=(FABIPB_RHS_TREE_THETA="$FMM_RHS_TREE_THETA")
+fi
+if [[ -n "${FMM_ENERGY_THREADS+x}" && -z "${FABIPB_ENERGY_THREADS+x}" ]]; then
+  env_args+=(FABIPB_ENERGY_THREADS="$FMM_ENERGY_THREADS")
+fi
+if [[ -n "${FABIPB_WORKER_THREADS+x}" ]]; then
+  env_args+=(
+    FABIPB_NEARFIELD_BUILD_THREADS="$FABIPB_WORKER_THREADS"
+    FABIPB_SETUP_THREADS="$FABIPB_WORKER_THREADS"
+    FABIPB_PRECOND_APPLY_THREADS="$FABIPB_WORKER_THREADS"
+    FABIPB_DIRECT_THREADS="$FABIPB_WORKER_THREADS"
+  )
+fi
 if [[ "$stop_after_rhs" == "1" ]]; then
   env_args+=(FABIPB_STOP_AFTER_RHS=1)
 fi
@@ -149,11 +168,18 @@ if [[ "$stop_after_gmres" == "1" ]]; then
 fi
 
 fabipb_cmd=(
-  "$repo_root/scripts/with_benchmark_env.sh" stdbuf -oL -eL "$fabipb_bin"
+  stdbuf -oL -eL "$fabipb_bin"
   -B=1 -g="$fmm_gpu" -m=2 -R="$fmm_r" -t="$fmm_depth"
-  -eps1="$pdie" -eps2="$sdie" -P="$fmm_preconditioner" -q="$fmm_qorder" -Q="$fmm_q2m"
-  -a="$restart" -i="$max_iter" -o="$tolerance" ./input
+  -eps1="$pdie" -eps2="$sdie" -q="$fmm_qorder"
+  -a="$restart" -i="$max_iter" -o="$tolerance"
 )
+if [[ "$fmm_q2m_override" != "auto" ]]; then
+  fabipb_cmd+=(-Q="$fmm_q2m_override")
+fi
+if [[ "$fmm_preconditioner_override" != "auto" ]]; then
+  fabipb_cmd+=(-P="$fmm_preconditioner_override")
+fi
+fabipb_cmd+=(./input)
 if [[ -n "$fabipb_timeout" ]]; then
   fabipb_cmd=(timeout "$fabipb_timeout" "${fabipb_cmd[@]}")
 fi
@@ -164,6 +190,9 @@ fi
 } >"$out_dir/command.txt"
 
 echo "[6co8-fast] FABIPB tree-RHS run"
+echo "[6co8-fast] auto config: gpu=$fmm_gpu ($fmm_gpu_reason)"
+echo "[6co8-fast] source policy: q2m=$fmm_q2m_override"
+echo "[6co8-fast] source policy: preconditioner=$fmm_preconditioner_override"
 (
   cd "$out_dir"
   if [[ "$live_log" == "1" ]]; then
