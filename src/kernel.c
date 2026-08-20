@@ -59,7 +59,6 @@ void kernelDC0( double r, int p, double *G ) {
  * paper, and kappa -> i*kappa.
  * Note that the paper has a typo in the recurrence formula
  */
-// Would change the subroutine name later
 void kernelDS0( double r, int p, double *G ) {
   double rexp, r1, r2, kappa2;
   int k;

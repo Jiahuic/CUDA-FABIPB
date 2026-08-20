@@ -186,7 +186,9 @@ At runtime:
 
 - default startup uses the GPU automatically when the backend is present
 - default FMM startup uses the grouped near-field GPU path when GPU is enabled
-- default preconditioner is the cached-LU path (`-P=2`)
+- default preconditioner is selected automatically after input loading:
+  diagonal/Jacobi for huge capsids and most eps1=4 runs, cached-LU mainly for
+  small/medium high-contrast eps1=1 cases
 - pass `-g=0` to force CPU
 - pass `-g=1` to require/request GPU explicitly
 
