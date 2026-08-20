@@ -99,12 +99,12 @@ FABIPB uses a panel-Galerkin discretization, so the energy is not expected to
 match TABI-PB exactly at the same mesh density. The current target is stable,
 trackable runtime with acceptable capsid-scale accuracy.
 
-### Current `sdens=1`, depth 8, GPU energy reduction
+### Current `sdens=1`, depth 8, source defaults
 
 Command:
 
 ```sh
-SDENS=1 PDIE=4 SDIE=80 FMM_DEPTH=8 FABIPB_GMRES_LOG_RESID=1 FABIPB_TIMEOUT=8h OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_gpu_energy_reduce_full ./scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
+SDENS=1 OUT_DIR=results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_full ./scripts/run_6co8_fabipb_fast.sh test_proteins/ZIKV_6CO8_zenodo.pqr
 ```
 
 Recorded result:
@@ -121,6 +121,26 @@ GMRES:                    398.169222 s
 treecode/energy:          227.098238 s
 energy kernel:            223.492387 s
 nearfield avg/call:       1.388252 s
+```
+
+Source-default rerun after moving Q2M, preconditioner, RHS theta, energy mode,
+and thread/chunk choices into the binary:
+
+```text
+output directory:         results/fmm/6co8_fabipb_sdens1/zenodo_sdens1_depth8_full
+vertices:                 5,109,760
+panels:                   10,222,292
+resolved Q2M:             1, auto small/medium case
+resolved preconditioner:  3, auto diagonal
+GMRES:                    87 iterations
+final residual:           9.865349e-05
+solvation energy:         -123,421.148457 kcal/mol
+total time:               530.832819 s
+setupRHS:                 59.640010 s
+GMRES:                    323.349698 s
+treecode/energy:          109.680781 s
+energy kernel:            106.312824 s
+nearfield avg/call:       1.391931 s
 ```
 
 Previous comparable run before nearfield and energy improvements:
