@@ -8,6 +8,7 @@
 
 #include "gmres.h"
 #include "gkGlobal.h"
+#include "fabipb_system.h"
 
 /* BLAS prototypes */
 extern int dcopy_(const int *n, const double *dx, const int *incx, double *dy, const int *incy);
@@ -508,7 +509,6 @@ static int gmresBasisThreadCount(void)
 {
     static int cached = 0;
     const char *env;
-    long hc;
     int threads;
 
     if (cached != 0) return cached;
@@ -516,8 +516,7 @@ static int gmresBasisThreadCount(void)
     if (env != NULL && env[0] != '\0') {
         threads = atoi(env);
     } else {
-        hc = sysconf(_SC_NPROCESSORS_ONLN);
-        threads = (hc > 0) ? (int)hc : 1;
+        threads = fabipb_online_cpu_count();
     }
     if (threads < 1) threads = 1;
     if (threads > 128) threads = 128;

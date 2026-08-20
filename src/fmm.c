@@ -19,6 +19,7 @@
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gpu_backend.h"
+#include "fabipb_system.h"
 
 #define STOREM2L 0
 #define SETUPONLY 0
@@ -71,14 +72,12 @@ typedef struct {
 
 static int transThreadCount(int nTasks) {
   const char *env = getenv("FABIPB_SETUP_THREADS");
-  long hc;
   int threads;
 
   if (env != NULL && env[0] != '\0') {
     threads = atoi(env);
   } else {
-    hc = sysconf(_SC_NPROCESSORS_ONLN);
-    threads = (hc > 0) ? (int)hc : 1;
+    threads = fabipb_online_cpu_count();
   }
   if (threads < 1) threads = 1;
   if (threads > nTasks) threads = nTasks;

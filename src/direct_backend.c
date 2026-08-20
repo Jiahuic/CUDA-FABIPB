@@ -1,5 +1,6 @@
 #include "direct_backend.h"
 #include "gk.h"
+#include "fabipb_system.h"
 
 #include <limits.h>
 #include <stddef.h>
@@ -34,14 +35,12 @@ typedef struct {
 
 static int directThreadCount(int nTasks) {
   const char *env = getenv("FABIPB_DIRECT_THREADS");
-  long hc;
   int threads;
 
   if (env != NULL) {
     threads = atoi(env);
   } else {
-    hc = sysconf(_SC_NPROCESSORS_ONLN);
-    threads = (hc > 0) ? (int)hc : 1;
+    threads = fabipb_online_cpu_count();
   }
   if (threads < 1) {
     threads = 1;

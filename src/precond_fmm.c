@@ -8,6 +8,7 @@
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gpu_backend.h"
+#include "fabipb_system.h"
 
 extern double **Q2PK1, **Q2PK2, **Q2PK3, **Q2PK4;
 extern void (*kernel)();
@@ -97,14 +98,12 @@ static double wall_seconds_pc(void) {
 
 static int setupThreadCountPc(int nTasks) {
   const char *env = getenv("FABIPB_SETUP_THREADS");
-  long hc;
   int threads;
 
   if (env != NULL) {
     threads = atoi(env);
   } else {
-    hc = sysconf(_SC_NPROCESSORS_ONLN);
-    threads = (hc > 0) ? (int)hc : 1;
+    threads = fabipb_online_cpu_count();
   }
   if (threads < 1) {
     threads = 1;
@@ -120,14 +119,12 @@ static int setupThreadCountPc(int nTasks) {
 
 static int applyThreadCountPc(int nTasks) {
   const char *env = getenv("FABIPB_PRECOND_APPLY_THREADS");
-  long hc;
   int threads;
 
   if (env != NULL) {
     threads = atoi(env);
   } else {
-    hc = sysconf(_SC_NPROCESSORS_ONLN);
-    threads = (hc > 0) ? (int)hc : 1;
+    threads = fabipb_online_cpu_count();
   }
   if (threads < 1) {
     threads = 1;
