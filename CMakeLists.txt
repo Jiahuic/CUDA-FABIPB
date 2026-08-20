@@ -46,7 +46,10 @@ if(FMM_PB_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   set(FMM_PB_HAS_CUDA ON)
-  list(APPEND FMM_PB_SOURCES src/gpu_backend_cuda.cu)
+  set(FMM_PB_CUDA_SOURCES
+    src/gpu_backend_cuda.cu
+  )
+  list(APPEND FMM_PB_SOURCES ${FMM_PB_CUDA_SOURCES})
 
   # Pin the device architecture. With nothing set, nvcc uses its own default
   # (sm_52 on CUDA 12.x), which costs twice over on a modern card: the driver
