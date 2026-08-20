@@ -259,9 +259,9 @@ __device__ __forceinline__ void cteRadialDerivs(double r, int p, double kap,
 
 /*
  * Cartesian derivative tensors of G0/Gk about a cluster centre; port of
- * setupScreenedDerivsLocal() in treecode.c. Lane 0 of the warp drives the
- * recurrence: each order p is built from p+1, so the levels are sequential,
- * and the per-level work is far too small to be worth splitting across lanes.
+ * setupScreenedDerivsLocal() in treecode.c. The recurrence is sequential in
+ * order p: each order is built from p+1, and the per-level work is too small
+ * to split usefully across CUDA lanes.
  */
 __device__ void cteSetupDerivsStrided(int order, const double *x,
                                double kap, double fourPiIv,
@@ -323,18 +323,11 @@ __device__ void cteSetupDerivsStrided(int order, const double *x,
 /*
  * One thread per panel, grid-stride.
  *
- * The first version gave a warp to each panel with the derivative scratch in
- * shared memory. That was correct but 5.6x slower than 72 CPU threads: all 32
- * lanes walked the same tree redundantly, lane 0 ran the derivative recurrence
- * alone while the rest idled, and 43 KB of shared memory per block held
- * occupancy to a single block per SM.
- *
- * Here each thread owns a panel and its own scratch slab in global memory. The
- * slabs are interleaved -- entry i of thread t lives at [i * stride + t] -- so
- * lanes touching the same tensor entry hit consecutive addresses. Concurrency
- * is capped and panels are taken in a grid-stride loop, which bounds the
- * scratch: the whole point is that it is proportional to the number of resident
- * threads, not to the panel count.
+ * Each thread owns a panel and its own scratch slab in global memory. The slabs
+ * are interleaved -- entry i of thread t lives at [i * stride + t] -- so lanes
+ * touching the same tensor entry hit consecutive addresses. Concurrency is
+ * capped and panels are taken in a grid-stride loop, which bounds scratch by the
+ * number of resident threads instead of the panel count.
  *
  * Storage is a rolling window, not the whole pyramid. The recurrence builds row
  * iRow of level p from rows iRow-1 and iRow-2 of level p+1, and the loop already
@@ -347,7 +340,7 @@ __device__ void cteSetupDerivsStrided(int order, const double *x,
  * 2*nMom[derivMax] per array -- 715 -> 440 doubles at derivMax=9. It matters
  * because the kernel is footprint-bound: holding threads, arithmetic and
  * coalescing fixed and varying only the footprint gave 248.6 MiB -> 37.17 s
- * against 2.8 MiB -> 14.92 s on 7A6A, so roughly 2.5x is the ceiling for any
+ * against 2.8 MiB -> 14.92 s on 7A6A, so roughly 2.5x is the ceiling for this
  * footprint reduction (see docs/6co8_gpu_fabipb_milestone.md).
  *
  * Row m lives in slot m&1, so writing row iRow reuses the slot holding row
