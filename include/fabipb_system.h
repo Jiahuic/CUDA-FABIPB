@@ -1,15 +1,16 @@
 #ifndef FABIPB_SYSTEM_H
 #define FABIPB_SYSTEM_H
 
-#if defined(__APPLE__)
-#include <sys/types.h>
-#include <sys/sysctl.h>
-#endif
-
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <stddef.h>
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+int sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                 void *newp, size_t newlen);
 #endif
 
 static inline int fabipb_online_cpu_count(void) {
