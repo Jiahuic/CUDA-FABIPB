@@ -9,8 +9,8 @@ On one machine, the same solver/input/mesh combination behaved differently
 under different OpenBLAS versions:
 
 - OpenBLAS `0.3.8` pthread build: converged
-- OpenBLAS `0.3.20` pthread build: did not converge on the same fixed mesh
-- OpenBLAS `0.3.21` pthread build: converged on the same fixed mesh
+- OpenBLAS `0.3.20` pthread build: did not converge under the same mesh-control settings
+- OpenBLAS `0.3.21` pthread build: converged under the same mesh-control settings
 
 The first divergence was traced to the LU-based preconditioner block solves.
 The raw preconditioner block matrices matched before factorization, while the
@@ -20,8 +20,8 @@ preconditioner blocks.
 
 ## Required Comparison Rules
 
-- keep the exact same input and generated mesh
-- reuse the mesh with `-m=0`
+- keep the exact same input, mesher, and mesh-resolution control
+- use the same `-m` and `-R` values for both BLAS runs
 - keep runtime thread settings pinned to `1`
 - compare only one BLAS change at a time
 
@@ -30,14 +30,14 @@ preconditioner blocks.
 Use:
 
 ```sh
-./scripts/compare_openblas_runs.sh   /path/to/openblas-0.3.8/lib   /path/to/openblas-0.3.21/lib   test_proteins/1a63 -g=0 -P=2 -m=0
+./scripts/compare_openblas_runs.sh   /path/to/openblas-0.3.8/lib   /path/to/openblas-0.3.21/lib   test_proteins/1a63 -g=0 -P=2 -m=1 -R=1.0
 ```
 
 If you need to reproduce the unstable environment explicitly, compare against
 `0.3.20` in a separate run:
 
 ```sh
-./scripts/compare_openblas_runs.sh   /path/to/openblas-0.3.20/lib   /path/to/openblas-0.3.21/lib   test_proteins/1a63 -g=0 -P=2 -m=0
+./scripts/compare_openblas_runs.sh   /path/to/openblas-0.3.20/lib   /path/to/openblas-0.3.21/lib   test_proteins/1a63 -g=0 -P=2 -m=1 -R=1.0
 ```
 
 The script:
@@ -62,7 +62,7 @@ For regular development and benchmarking, prefer `0.3.21` or newer.
 
 ## Interpretation
 
-If two OpenBLAS versions diverge on the same fixed mesh:
+If two OpenBLAS versions diverge under the same mesh-control settings:
 
 - the issue should be treated as environment sensitivity first
 - do not merge numerical-performance conclusions without recording the BLAS

@@ -7,7 +7,7 @@ FABIPB_PRECOND_APPLY_THREADS="${FABIPB_PRECOND_APPLY_THREADS:-1}"
 
 if [ "$#" -lt 3 ]; then
   echo "Usage: $0 <openblas_a_libdir> <openblas_b_libdir> <panel-base-or-pqr-path> [solver options...]" >&2
-  echo "Example: $0 /opt/openblas-0.3.8/lib /opt/openblas-0.3.20/lib test_proteins/1a63 -g=0 -P=0 -m=0" >&2
+  echo "Example: $0 /opt/openblas-0.3.8/lib /opt/openblas-0.3.20/lib test_proteins/1a63 -g=0 -P=0 -m=1 -R=1.0" >&2
   exit 2
 fi
 
@@ -22,7 +22,7 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
 fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/openblas_compare/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/openblas_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 run_case() {

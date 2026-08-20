@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 extern double *panelIA0(panel *pnlX, panel *pnlY);
@@ -63,9 +64,10 @@ static void *cpuDirectBuildWorker(void *arg) {
     long long base = (long long)i * (long long)task->sys->nPnls;
     for (j = 0; j < task->sys->nPnls; j++) {
       panel *pnlY = task->sys->panelByIdx[j];
-      double *KER = panelIA0(pnlX, pnlY);
       long long idx = base + (long long)j;
+      double *KER;
 
+      KER = panelIA0(pnlX, pnlY);
       gCpuDirect.k0[idx] = KER[0];
       gCpuDirect.k1[idx] = KER[1];
       gCpuDirect.k2[idx] = KER[2];
@@ -143,8 +145,10 @@ static int buildCpuDirectTables(const ssystem *sys) {
       }
       for (i = 0; i < nThreads; i++) {
         tasks[i].sys = sys;
-        tasks[i].begin = (sys->nPnls * i) / nThreads;
-        tasks[i].end = (sys->nPnls * (i + 1)) / nThreads;
+        /* (long long) so the product cannot overflow int at virus scale and
+         * hand a worker a negative range; see setupRHSTreeParallel. */
+        tasks[i].begin = (int)(((long long)sys->nPnls * i) / nThreads);
+        tasks[i].end = (int)(((long long)sys->nPnls * (i + 1)) / nThreads);
         pthread_create(&threads[i], NULL, cpuDirectBuildWorker, &tasks[i]);
       }
       for (i = 0; i < nThreads; i++) {

@@ -52,6 +52,9 @@ struct cube {               /* cube, actually a cluster of panels */
   double eBoxUp[3];         /* upper corner of the enclosing box */
   double eRad;              /* half-diameter of enclosing box */
   struct cube *next;        /* Ptr to next nonempty cube with panels */
+  double *mom_chr;          /* multipole moments of enclosed charges (charge-tree only) */
+  int *chgIdx;              /* indices into sys->pos/sys->chr for this leaf (charge-tree only) */
+  int nChgs;                /* number of charges in/under this cube (charge-tree only) */
 };
 typedef struct cube cube;
 
@@ -81,9 +84,38 @@ struct ssystem {
   int debugCompareApply;    /* 0=off, >0 compare one CPU/GPU applyFMM call */
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
-  int gpuQ2MMode;           /* 0=CPU default, 1=enable GPU Q2M path for debugging */
+  int gpuQ2MMode;           /* 1=GPU Q2M, 0=CPU dgemv loop; default resolved after loadPanel */
   int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
-  int precondCacheMode;     /* 0=original, 1=cached local blocks, 2=cached LU (preferred) */
+  /*
+   * 0=original, 1=cached local blocks, 2=cached LU, 3=diagonal/Jacobi.
+   *
+   * Mode 3 is faster than mode 2 in nearly everything measured, despite
+   * usually costing one more iteration: mode 2's setup and heavier solve
+   * outweigh the better convergence. Wall clock at tol 1e-4, R=1.0, q=1,
+   * a=30, mode 2 against mode 3:
+   *
+   *   1cbn eps1=1   8 its 0.381 s  |  9 its 0.326 s
+   *   1cbn eps1=4   8 its 0.505 s  |  9 its 0.381 s
+   *   1ajj eps1=1   8 its 0.478 s  |  9 its 0.371 s
+   *   1ajj eps1=4   8 its 0.486 s  |  9 its 0.360 s
+   *   1a63 eps1=1  29 its 1.047 s  | 83 its 1.359 s   <- the one mode-2 win
+   *   1a63 eps1=4  20 its 0.949 s  | 20 its 0.757 s
+   *
+   * The exception is driven by dielectric contrast, not problem size: at
+   * eps1=1/eps2=80 the diagonal preconditioner needs 83 iterations on 1a63,
+   * and at eps1=4/eps2=80 it needs 20, the same as mode 2. Since the capsid
+   * runs use eps1=4, that regime is the relevant one, and there mode 2 is
+   * strictly worse -- at sdens=2 it needed 51 iterations and 356.7 s of
+   * preconditioner solve against mode 3's 37 and 0.34 s, and at sdens=1 it
+   * stalled at the 100-iteration cap with residual 1.24e-1 where mode 3
+   * converged in 87. (Those capsid figures predate the transL2L fix and other
+   * changes; the direction is solid, the numbers are stale.)
+   *
+   * The default is resolved after loadPanel: huge capsids use mode 3 to avoid
+   * memory and solve-time pressure, small/medium high-contrast dielectric cases
+   * use mode 2, and other cases use mode 3.
+   */
+  int precondCacheMode;
   int nLeafCubesFlat;       /* flattened finest-level cube count */
   int *leafPanelStart;      /* flattened per-leaf panel start index */
   int *leafPanelCount;      /* flattened per-leaf panel count */
@@ -100,13 +132,44 @@ struct ssystem {
   int *m2lDstGroupStart;    /* start offset of each destination-grouped M2L range */
   int *m2lDstGroupCount;    /* interaction count of each destination-grouped M2L range */
   panel **panelByIdx;       /* direct panel lookup by contiguous index */
+  double *panelArea;        /* pnl->area by contiguous index; see buildPanelIndex */
+  int *fmmLevelStart;       /* first fmmCubeByIdx entry of each level */
+  int *fmmLevelCount;       /* cube count of each level */
   int maxlevCudes;          /* max cubes at finest level */
   int maxlevnPnls;          /* max panels in a cube at finest level */
   panel *pnlLst;            /* linked list of panels (Contiguous wn cubes) */
   panel *pnlOLst;           /* linked list of original order panels */
   cube **cubeList;          /* heads of lists of cubes for each level */
+  int chgDepth;             /* depth of the charge-only tree (v1: equals depth) */
+  cube **chgCubeList;       /* heads of per-level charge-tree cube lists */
 };
 typedef struct ssystem ssystem;
+
+typedef struct {
+  int maxOrder;
+  int derivOrder;
+  double *gvals0;
+  double *gvalsk;
+  double **dg0;
+  double **dgk;
+} RhsTreeWorkspace;
+
+/*
+ * Per-thread scratch for transM2M/transL2L.
+ *
+ * Both used only the file-scope buffers fcnBuf1/2/3 (moments.c) and
+ * convVecR/convVec1/convVec2 (expan.c), which made them unsafe to run on more
+ * than one thread. The workspace-taking variants take these explicitly so the
+ * upward and downward passes can be split across cubes; the original
+ * signatures remain as wrappers over the shared buffers for the single-threaded
+ * callers in moments.c and chargeTree.c.
+ */
+typedef struct {
+  int order;                /* fcn buffers hold order+1 entries */
+  int nMoments;             /* conv vectors hold nMoments entries */
+  double *fcn1, *fcn2, *fcn3;
+  double *convR, *conv1, *conv2;
+} TransWorkspace;
 
 typedef void (*KernelFn)(double *x, double *y);
 typedef void (*KernelDerivFn)(double r, int p, double *G);

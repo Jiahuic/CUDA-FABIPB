@@ -33,8 +33,8 @@ cmake --build build-prof
 Small case:
 
 ```sh
-./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -m=0 test_proteins/1ajj
-./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=0 test_proteins/1ajj
+./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -m=1 -R=1.0 test_proteins/1ajj
+./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=1 -R=1.0 test_proteins/1ajj
 ```
 
 Pass criteria:
@@ -50,15 +50,15 @@ Use compare modes only for validation, not timing.
 ApplyFMM compare:
 
 ```sh
-./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -c=1 -m=0 test_proteins/1ajj
-./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -c=1 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -c=1 -m=1 -R=1.0 test_proteins/1ajj
+./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -c=1 -m=1 -R=1.0 test_proteins/1a63
 ```
 
 Preconditioner compare:
 
 ```sh
-./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -C=1 -m=0 test_proteins/1ajj
-./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -C=1 -m=0 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -C=1 -m=1 -R=1.0 test_proteins/1ajj
+./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -C=1 -m=1 -R=1.0 test_proteins/1a63
 ```
 
 Pass criteria:
@@ -105,12 +105,14 @@ If direct GPU fails because of memory, record that explicitly.
 
 ## 6. High-Density Mesh Cases
 
-Use at least one denser MSMS case:
+Use at least one denser MSMS case. Prefer the normalized control for routine
+comparisons and use backend-specific override only when explicitly studying the
+MSMS density knob:
 
 ```sh
+./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=1 -R=0.5 test_proteins/1a63
+./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -m=1 -R=0.5 test_proteins/1a63
 ./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=1 -d=10 test_proteins/1a63
-./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=0 test_proteins/1a63
-./scripts/with_benchmark_env.sh ./build/fabipb -g=0 -m=0 test_proteins/1a63
 ```
 
 Record:
@@ -126,8 +128,8 @@ Record:
 Validate the parallel preconditioner setup:
 
 ```sh
-FABIPB_SETUP_THREADS=1 ./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=0 test_proteins/1a63
-FABIPB_SETUP_THREADS=8 ./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=0 test_proteins/1a63
+FABIPB_SETUP_THREADS=1 ./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=1 -R=1.0 test_proteins/1a63
+FABIPB_SETUP_THREADS=8 ./scripts/with_benchmark_env.sh ./build/fabipb -g=1 -m=1 -R=1.0 test_proteins/1a63
 ```
 
 Record:
@@ -172,3 +174,19 @@ Before writing final benchmark tables:
 4. Rerun one high-density case.
 5. Rerun one direct-GPU comparison.
 6. Confirm final logs do not show unintended CPU fallbacks.
+
+## 11. Mesh Calibration
+
+For MSMS vs NanoShaper calibration work, use mesh-only mode:
+
+```sh
+./build/fabipb -M=1 -m=1 -R=1.0 test_proteins/1ajj
+./build/fabipb -M=1 -m=2 -R=1.0 test_proteins/1ajj
+```
+
+Or sweep both backends:
+
+```sh
+RESOLUTIONS="0.75 1.00 1.25 1.50 2.00" \
+./scripts/calibrate_mesh_resolution.sh test_proteins/1ajj
+```

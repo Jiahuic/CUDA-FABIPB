@@ -66,6 +66,21 @@ Possible follow-up, but lower priority than the items above:
 - do not optimize this blindly; first add a `panelIA0()` case histogram for
   preconditioner assembly and check whether disjoint interactions dominate
 
+Parser robustness follow-up:
+
+- the current PQR reader in [`src/input.c`](/home/jiahuic/Garage/electrostatics/GPU-FABIPB/src/input.c)
+  is not robust to large real-world files that contain header/comment lines
+  such as `REMARK`
+- on `test_proteins/H1N1.pqr`, the parser counted `#Atoms = 0`, wrote an empty
+  `.xyzr`, and failed before reaching `msms`
+- root cause:
+  - the code uses `fscanf(... ) != EOF` with a fixed 10-field record layout
+  - it should instead validate successful field count and skip non-`ATOM` /
+    `HETATM` lines safely
+- required follow-up:
+  - update the PQR parser so large biomolecular inputs can be used directly
+    without manual preprocessing
+
 Historical planning notes follow below.
 
 ---

@@ -4,7 +4,9 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <limits.h>
 #include <cstring>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>
@@ -14,6 +16,12 @@
 
 extern "C" double *panelIA0(panel *pnlX, panel *pnlY);
 extern "C" int nrCommonVtx(panel *p, panel *q, int *idxX, int *idxY);
+extern "C" int rhsChargeExpansionOrder(ssystem *sys, int level);
+extern "C" void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws);
+extern "C" void freeRhsTreeWorkspace(RhsTreeWorkspace *ws);
+extern "C" void setupDerivsWorkspace(ssystem *sys, RhsTreeWorkspace *ws,
+                                     int order, const double *x);
+extern "C" int ***idx3;
 extern "C" void kernelKER4(double *x, double *y);
 extern "C" void (*kernel)(double *x, double *y);
 extern "C" void setupDerivs(int order, double *x);
@@ -60,7 +68,9 @@ struct NearfieldGpuCache {
   const ssystem *sys;
   int nPnls;
   int nearfieldMode;
+  int streaming;
   long long nInteractions;
+  long long chunkCapacity;
   long long caseDisjointCount;
   long long caseOneCommonCount;
   long long caseTwoCommonCount;
@@ -92,12 +102,56 @@ struct NearfieldGpuCache {
   double *d_k3;
   double *d_sgm;
   double *d_pot;
+  /*
+   * Cache of the streaming path's touching/self ("special") classification.
+   *
+   * Which pairs are special, and their panelIA0 coefficients, depend only on
+   * the mesh -- not on sgm -- so the streaming path was recomputing an
+   * identical answer on every matvec. Measured on a 420k-panel mesh that was
+   * 78% of nearfield time single-threaded, and still 52% after threading.
+   *
+   * specialOffset holds one entry per chunk plus a terminator, so chunk c
+   * occupies [specialOffset[c], specialOffset[c+1]). Chunk boundaries depend
+   * only on geometry and chunkCapacity, so they repeat exactly every matvec.
+   */
+  /*
+   * Flattened leaf-pair table, uploaded once, from which the streaming
+   * disjoint kernel derives panel indices instead of having them shipped
+   * every matvec. Per pair: the running interaction offset, and the panel
+   * ranges of its source and destination leaves.
+   */
+  int streamPairCount;
+  long long *d_streamPairOffset;
+  int *d_streamPairSrcStart;
+  int *d_streamPairSrcCount;
+  int *d_streamPairDstStart;
+  /* Whether each chunk staging buffer came from cudaHostAlloc (page-locked)
+   * or plain malloc, so the right free is used. */
+  int h_srcPinned;
+  int h_dstPinned;
+  int h_k0Pinned;
+  int h_k1Pinned;
+  int h_k2Pinned;
+  int h_k3Pinned;
+  int specialCacheEnabled;
+  int specialCacheValid;
+  long long specialCacheChunks;
+  std::vector<long long> *specialOffset;
+  std::vector<int> *cacheSrc;
+  std::vector<int> *cacheDst;
+  std::vector<double> *cacheK0;
+  std::vector<double> *cacheK1;
+  std::vector<double> *cacheK2;
+  std::vector<double> *cacheK3;
 };
 
 NearfieldGpuCache gNear = {};
+char gNearfieldLastError[512] = "";
+char gM2LLastError[512] = "";
 
 struct M2LGpuCache {
   const ssystem *sys;
+  int streaming;
   int nCubes;
   int nPairs;
   int nGroups;
@@ -105,7 +159,10 @@ struct M2LGpuCache {
   int maxIdxDim;
   long long totalPairCoeff;
   int totalCubeCoeff;
+  int *h_pairSrc;
   int *h_pairCoeffOffset;
+  int *h_groupStart;
+  int *h_groupCount;
   int *h_groupDst;
   int *h_groupOrder;
   int *h_cubeCoeffOffset;
@@ -143,6 +200,9 @@ struct M2LGpuCache {
   double *d_lec2;
   double *d_lec3;
   double *d_lec4;
+  int streamPairCapacity;
+  int streamGroupCapacity;
+  int streamCoeffCapacity;
 };
 
 M2LGpuCache gM2L = {};
@@ -226,6 +286,101 @@ struct PrecondGpuCache {
 PrecondGpuCache gPrecond = {};
 std::mutex gPrecondMutex;
 
+void setNearfieldLastError(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(gNearfieldLastError, sizeof(gNearfieldLastError), fmt, ap);
+  va_end(ap);
+}
+
+void setM2LLastError(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(gM2LLastError, sizeof(gM2LLastError), fmt, ap);
+  va_end(ap);
+}
+
+int envFlagEnabled(const char *name) {
+  const char *value = getenv(name);
+  return value != NULL && atoi(value) != 0;
+}
+
+double bytesToGiB(size_t bytes) {
+  return (double)bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+size_t nearfieldHostBytes(const ssystem *sys, long long nInteractions) {
+  size_t ni = (size_t)nInteractions;
+  size_t nNearPairs = (size_t)sys->nNearPairsFlat;
+  size_t nLeaves = (size_t)sys->nLeafCubesFlat;
+  size_t nPnls = (size_t)sys->nPnls;
+  return nPnls * sizeof(NearPanelGeom) +
+         2U * ni * sizeof(int) +
+         nNearPairs * sizeof(int) +
+         nNearPairs * sizeof(long long) +
+         2U * nLeaves * sizeof(int) +
+         (nLeaves + 1U) * sizeof(int) +
+         4U * ni * sizeof(double);
+}
+
+size_t nearfieldDeviceBytes(const ssystem *sys, long long nInteractions) {
+  size_t ni = (size_t)nInteractions;
+  size_t nNearPairs = (size_t)sys->nNearPairsFlat;
+  size_t nLeaves = (size_t)sys->nLeafCubesFlat;
+  size_t nPnls = (size_t)sys->nPnls;
+  size_t vecBytes = 2U * nPnls * sizeof(double);
+  return nPnls * sizeof(NearPanelGeom) +
+         2U * ni * sizeof(int) +
+         nNearPairs * sizeof(int) +
+         nNearPairs * sizeof(long long) +
+         2U * nLeaves * sizeof(int) +
+         (nLeaves + 1U) * sizeof(int) +
+         4U * ni * sizeof(double) +
+         2U * vecBytes;
+}
+
+int cudaMallocNearfield(void **ptr, size_t bytes, const char *name) {
+  cudaError_t err = cudaMalloc(ptr, bytes);
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMalloc %s failed for %.3f GiB: %s",
+                          name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+int cudaMemcpyNearfield(void *dst, const void *src, size_t bytes,
+                        enum cudaMemcpyKind kind, const char *name) {
+  cudaError_t err = cudaMemcpy(dst, src, bytes, kind);
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy %s failed for %.3f GiB: %s",
+                          name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+int cudaMallocM2L(void **ptr, size_t bytes, const char *name) {
+  cudaError_t err = cudaMalloc(ptr, bytes);
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMalloc %s failed for %.3f GiB: %s",
+                    name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+int cudaMemcpyM2L(void *dst, const void *src, size_t bytes,
+                  enum cudaMemcpyKind kind, const char *name) {
+  cudaError_t err = cudaMemcpy(dst, src, bytes, kind);
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMemcpy %s failed for %.3f GiB: %s",
+                    name, bytesToGiB(bytes), cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
 struct RhsPanelGeom {
   double v0[3];
   double a0[3];
@@ -265,19 +420,125 @@ __global__ void nearfieldDisjointQ1BuildKernel(
     double *k2,
     double *k3);
 
+__global__ void nearfieldDisjointQ1ApplyKernel(
+    int nPnls,
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double alpha,
+    const double *sgm,
+    double *pot);
+
+/* Bytes held per cached special pair: two indices plus four coefficients. */
+#define NEAR_SPECIAL_CACHE_BYTES_PER_PAIR (2U * sizeof(int) + 4U * sizeof(double))
+
+/*
+ * Page-locked staging allocation, falling back to malloc. Pinned pages cannot
+ * be swapped, so cudaHostAlloc can fail where malloc succeeds; the caller only
+ * loses copy bandwidth, never correctness. *pinned records which was used so
+ * the buffer is released with the matching call.
+ */
+static void *allocNearfieldStagingHost(size_t bytes, int *pinned) {
+  void *p = NULL;
+
+  *pinned = 0;
+  if (bytes == 0U) {
+    return NULL;
+  }
+  if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) == cudaSuccess && p != NULL) {
+    *pinned = 1;
+    return p;
+  }
+  cudaGetLastError();  /* clear the sticky error from the failed attempt */
+  return malloc(bytes);
+}
+
+static void freeNearfieldStagingHost(void *p, int *pinned) {
+  if (p == NULL) {
+    *pinned = 0;
+    return;
+  }
+  if (*pinned) {
+    cudaFreeHost(p);
+  } else {
+    free(p);
+  }
+  *pinned = 0;
+}
+
+static void freeNearfieldSpecialCache(void) {
+  delete gNear.specialOffset;
+  delete gNear.cacheSrc;
+  delete gNear.cacheDst;
+  delete gNear.cacheK0;
+  delete gNear.cacheK1;
+  delete gNear.cacheK2;
+  delete gNear.cacheK3;
+  gNear.specialOffset = NULL;
+  gNear.cacheSrc = NULL;
+  gNear.cacheDst = NULL;
+  gNear.cacheK0 = NULL;
+  gNear.cacheK1 = NULL;
+  gNear.cacheK2 = NULL;
+  gNear.cacheK3 = NULL;
+  gNear.specialCacheValid = 0;
+  gNear.specialCacheChunks = 0;
+}
+
+static void freeNearfieldStreamPairTable(void) {
+  cudaFree(gNear.d_streamPairOffset);
+  cudaFree(gNear.d_streamPairSrcStart);
+  cudaFree(gNear.d_streamPairSrcCount);
+  cudaFree(gNear.d_streamPairDstStart);
+  gNear.d_streamPairOffset = NULL;
+  gNear.d_streamPairSrcStart = NULL;
+  gNear.d_streamPairSrcCount = NULL;
+  gNear.d_streamPairDstStart = NULL;
+  gNear.streamPairCount = 0;
+}
+
+/*
+ * Ceiling on the special cache, in bytes. Defaults to 64 GiB, which covers the
+ * 51.9 GiB H1N1 sdens=1 special-case cache while leaving room on current
+ * capsid workstations. Set
+ * FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB=0 to disable caching entirely and go
+ * back to reclassifying every matvec.
+ */
+static size_t nearfieldSpecialCacheBudget(void) {
+  const char *env = getenv("FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB");
+  double mib = 64.0 * 1024.0;
+
+  if (env != NULL && env[0] != '\0') {
+    char *endptr = NULL;
+    double v = strtod(env, &endptr);
+    if (endptr != env && *endptr == '\0' && v >= 0.0) {
+      mib = v;
+    } else {
+      fprintf(stderr,
+              "Warning: ignoring invalid FABIPB_GPU_NEARFIELD_SPECIAL_CACHE_MIB='%s'\n",
+              env);
+    }
+  }
+  return (size_t)(mib * 1024.0 * 1024.0);
+}
+
 void freeNearfieldCache() {
+  freeNearfieldSpecialCache();
   free(gNear.h_panels);
-  free(gNear.h_src);
-  free(gNear.h_dst);
+  /* The streaming path may have page-locked these; the cached path mallocs
+   * them, in which case the pinned flags are 0 and this is a plain free. */
+  freeNearfieldStagingHost(gNear.h_src, &gNear.h_srcPinned);
+  freeNearfieldStagingHost(gNear.h_dst, &gNear.h_dstPinned);
   free(gNear.h_pairSrcCount);
   free(gNear.h_pairInteractionOffset);
   free(gNear.h_leafPanelStart);
   free(gNear.h_leafPanelCount);
   free(gNear.h_leafPairOffset);
-  free(gNear.h_k0);
-  free(gNear.h_k1);
-  free(gNear.h_k2);
-  free(gNear.h_k3);
+  freeNearfieldStagingHost(gNear.h_k0, &gNear.h_k0Pinned);
+  freeNearfieldStagingHost(gNear.h_k1, &gNear.h_k1Pinned);
+  freeNearfieldStagingHost(gNear.h_k2, &gNear.h_k2Pinned);
+  freeNearfieldStagingHost(gNear.h_k3, &gNear.h_k3Pinned);
   gNear.h_panels = NULL;
   gNear.h_src = NULL;
   gNear.h_dst = NULL;
@@ -305,6 +566,7 @@ void freeNearfieldCache() {
   cudaFree(gNear.d_k3);
   cudaFree(gNear.d_sgm);
   cudaFree(gNear.d_pot);
+  freeNearfieldStreamPairTable();
   gNear.d_panels = NULL;
   gNear.d_src = NULL;
   gNear.d_dst = NULL;
@@ -323,11 +585,16 @@ void freeNearfieldCache() {
   gNear.sys = NULL;
   gNear.nPnls = 0;
   gNear.nearfieldMode = 0;
+  gNear.streaming = 0;
   gNear.nInteractions = 0;
+  gNear.chunkCapacity = 0;
 }
 
 void freeM2LCache() {
+  free(gM2L.h_pairSrc);
   free(gM2L.h_pairCoeffOffset);
+  free(gM2L.h_groupStart);
+  free(gM2L.h_groupCount);
   free(gM2L.h_groupDst);
   free(gM2L.h_groupOrder);
   free(gM2L.h_cubeCoeffOffset);
@@ -344,7 +611,10 @@ void freeM2LCache() {
   free(gM2L.h_lec2);
   free(gM2L.h_lec3);
   free(gM2L.h_lec4);
+  gM2L.h_pairSrc = NULL;
   gM2L.h_pairCoeffOffset = NULL;
+  gM2L.h_groupStart = NULL;
+  gM2L.h_groupCount = NULL;
   gM2L.h_groupDst = NULL;
   gM2L.h_groupOrder = NULL;
   gM2L.h_cubeCoeffOffset = NULL;
@@ -406,6 +676,7 @@ void freeM2LCache() {
   gM2L.d_lec4 = NULL;
 
   gM2L.sys = NULL;
+  gM2L.streaming = 0;
   gM2L.nCubes = 0;
   gM2L.nPairs = 0;
   gM2L.nGroups = 0;
@@ -413,6 +684,9 @@ void freeM2LCache() {
   gM2L.maxIdxDim = 0;
   gM2L.totalPairCoeff = 0;
   gM2L.totalCubeCoeff = 0;
+  gM2L.streamPairCapacity = 0;
+  gM2L.streamGroupCapacity = 0;
+  gM2L.streamCoeffCapacity = 0;
 }
 
 void freeLeafCache() {
@@ -567,6 +841,13 @@ void freePrecondCache() {
   gPrecond.pairCapacity = 0;
 }
 
+extern "C" void gpuReleaseMatvecCaches(void) {
+  freeNearfieldCache();
+  freeM2LCache();
+  freeLeafCache();
+  freeDirectCache();
+}
+
 int ensurePrecondCapacity(int nPanels, int nPairs) {
   if (nPanels > gPrecond.panelCapacity) {
     free(gPrecond.h_panels);
@@ -621,17 +902,77 @@ int ensurePrecondCapacity(int nPanels, int nPairs) {
 int allocateHostArrays(long long n) {
   size_t ni = (size_t)n;
   gNear.h_panels = (NearPanelGeom *)malloc((size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
+  if (!gNear.h_panels) {
+    setNearfieldLastError("host malloc h_panels failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nPnls * sizeof(NearPanelGeom)));
+    return 0;
+  }
   gNear.h_src = (int *)malloc(ni * sizeof(int));
+  if (!gNear.h_src) {
+    setNearfieldLastError("host malloc h_src failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(int)));
+    return 0;
+  }
   gNear.h_dst = (int *)malloc(ni * sizeof(int));
+  if (!gNear.h_dst) {
+    setNearfieldLastError("host malloc h_dst failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(int)));
+    return 0;
+  }
   gNear.h_pairSrcCount = (int *)malloc((size_t)gNear.sys->nNearPairsFlat * sizeof(int));
+  if (!gNear.h_pairSrcCount) {
+    setNearfieldLastError("host malloc h_pairSrcCount failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nNearPairsFlat * sizeof(int)));
+    return 0;
+  }
   gNear.h_pairInteractionOffset = (long long *)malloc((size_t)gNear.sys->nNearPairsFlat * sizeof(long long));
+  if (!gNear.h_pairInteractionOffset) {
+    setNearfieldLastError("host malloc h_pairInteractionOffset failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nNearPairsFlat * sizeof(long long)));
+    return 0;
+  }
   gNear.h_leafPanelStart = (int *)malloc((size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
+  if (!gNear.h_leafPanelStart) {
+    setNearfieldLastError("host malloc h_leafPanelStart failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nLeafCubesFlat * sizeof(int)));
+    return 0;
+  }
   gNear.h_leafPanelCount = (int *)malloc((size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
+  if (!gNear.h_leafPanelCount) {
+    setNearfieldLastError("host malloc h_leafPanelCount failed for %.3f GiB",
+                          bytesToGiB((size_t)gNear.sys->nLeafCubesFlat * sizeof(int)));
+    return 0;
+  }
   gNear.h_leafPairOffset = (int *)calloc((size_t)gNear.sys->nLeafCubesFlat + 1, sizeof(int));
+  if (!gNear.h_leafPairOffset) {
+    setNearfieldLastError("host calloc h_leafPairOffset failed for %.3f GiB",
+                          bytesToGiB(((size_t)gNear.sys->nLeafCubesFlat + 1U) * sizeof(int)));
+    return 0;
+  }
   gNear.h_k0 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k0) {
+    setNearfieldLastError("host malloc h_k0 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   gNear.h_k1 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k1) {
+    setNearfieldLastError("host malloc h_k1 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   gNear.h_k2 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k2) {
+    setNearfieldLastError("host malloc h_k2 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   gNear.h_k3 = (double *)malloc(ni * sizeof(double));
+  if (!gNear.h_k3) {
+    setNearfieldLastError("host malloc h_k3 failed for %.3f GiB",
+                          bytesToGiB(ni * sizeof(double)));
+    return 0;
+  }
   if (!gNear.h_panels || !gNear.h_src || !gNear.h_dst || !gNear.h_pairSrcCount ||
       !gNear.h_pairInteractionOffset || !gNear.h_leafPanelStart ||
       !gNear.h_leafPanelCount || !gNear.h_leafPairOffset ||
@@ -644,36 +985,33 @@ int allocateHostArrays(long long n) {
 int allocateDeviceArrays(int nPnls, long long nInteractions) {
   size_t ni = (size_t)nInteractions;
   size_t vecBytes = (size_t)(2 * nPnls) * sizeof(double);
-  cudaError_t err = cudaSuccess;
 
-  err = cudaMalloc((void **)&gNear.d_panels, (size_t)gNear.sys->nPnls * sizeof(NearPanelGeom));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_src, ni * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_dst, ni * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_pairSrcCount, (size_t)gNear.sys->nNearPairsFlat * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_pairInteractionOffset, (size_t)gNear.sys->nNearPairsFlat * sizeof(long long));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_leafPanelStart, (size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_leafPanelCount, (size_t)gNear.sys->nLeafCubesFlat * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_leafPairOffset, ((size_t)gNear.sys->nLeafCubesFlat + 1) * sizeof(int));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k0, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k1, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k2, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_k3, ni * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_sgm, vecBytes);
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gNear.d_pot, vecBytes);
-  if (err != cudaSuccess) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_panels,
+                           (size_t)gNear.sys->nPnls * sizeof(NearPanelGeom),
+                           "d_panels")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_src, ni * sizeof(int), "d_src")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_dst, ni * sizeof(int), "d_dst")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_pairSrcCount,
+                           (size_t)gNear.sys->nNearPairsFlat * sizeof(int),
+                           "d_pairSrcCount")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_pairInteractionOffset,
+                           (size_t)gNear.sys->nNearPairsFlat * sizeof(long long),
+                           "d_pairInteractionOffset")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_leafPanelStart,
+                           (size_t)gNear.sys->nLeafCubesFlat * sizeof(int),
+                           "d_leafPanelStart")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_leafPanelCount,
+                           (size_t)gNear.sys->nLeafCubesFlat * sizeof(int),
+                           "d_leafPanelCount")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_leafPairOffset,
+                           ((size_t)gNear.sys->nLeafCubesFlat + 1U) * sizeof(int),
+                           "d_leafPairOffset")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k0, ni * sizeof(double), "d_k0")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k1, ni * sizeof(double), "d_k1")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k2, ni * sizeof(double), "d_k2")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_k3, ni * sizeof(double), "d_k3")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_sgm, vecBytes, "d_sgm")) return 0;
+  if (!cudaMallocNearfield((void **)&gNear.d_pot, vecBytes, "d_pot")) return 0;
 
   return 1;
 }
@@ -695,6 +1033,194 @@ int buildNearfieldPanelGeometry(const ssystem *sys) {
       gNear.h_panels[i].normal[k] = pnl->normal[k];
     }
     gNear.h_panels[i].area = pnl->area;
+  }
+  return 1;
+}
+
+long long nearfieldStreamingCapacity(size_t freeBytes) {
+  const char *env = getenv("FABIPB_GPU_NEARFIELD_CHUNK_MIB");
+  size_t requestedBytes = 512U * 1024U * 1024U;
+  const size_t bytesPerInteraction = 2U * sizeof(int) + 4U * sizeof(double);
+  size_t reserveBytes = 256U * 1024U * 1024U;
+
+  if (env != NULL) {
+    double mib = atof(env);
+    if (mib > 0.0) {
+      requestedBytes = (size_t)(mib * 1024.0 * 1024.0);
+    }
+  }
+  if (freeBytes > reserveBytes && requestedBytes > freeBytes - reserveBytes) {
+    requestedBytes = freeBytes - reserveBytes;
+  }
+  if (requestedBytes < bytesPerInteraction * 1024U) {
+    return 0;
+  }
+  return (long long)(requestedBytes / bytesPerInteraction);
+}
+
+int buildNearfieldStreamingCache(const ssystem *sys, long long totalInteractions,
+                                 size_t freeBytes) {
+  long long capacity = nearfieldStreamingCapacity(freeBytes);
+  size_t ni;
+  size_t vecBytes;
+
+  if (sys->maxQuadOrder != 1) {
+    setNearfieldLastError("streaming nearfield currently requires qOrd=1 (got %d)",
+                          sys->maxQuadOrder);
+    return 0;
+  }
+  if (capacity <= 0) {
+    setNearfieldLastError("not enough free GPU memory for a nearfield streaming chunk");
+    return 0;
+  }
+
+  gNear.sys = sys;
+  gNear.nPnls = sys->nPnls;
+  gNear.nearfieldMode = 0;
+  gNear.streaming = 1;
+  gNear.nInteractions = totalInteractions;
+  gNear.chunkCapacity = capacity;
+  freeNearfieldSpecialCache();
+  gNear.specialCacheEnabled = (nearfieldSpecialCacheBudget() > 0U) ? 1 : 0;
+  if (gNear.specialCacheEnabled) {
+    gNear.specialOffset = new std::vector<long long>();
+    gNear.cacheSrc = new std::vector<int>();
+    gNear.cacheDst = new std::vector<int>();
+    gNear.cacheK0 = new std::vector<double>();
+    gNear.cacheK1 = new std::vector<double>();
+    gNear.cacheK2 = new std::vector<double>();
+    gNear.cacheK3 = new std::vector<double>();
+    gNear.specialOffset->push_back(0);
+  }
+  ni = (size_t)capacity;
+  vecBytes = (size_t)(2 * sys->nPnls) * sizeof(double);
+
+  gNear.h_panels = (NearPanelGeom *)malloc((size_t)sys->nPnls * sizeof(NearPanelGeom));
+  /*
+   * The chunk staging buffers are page-locked. Every chunk copies its indices
+   * to the device on every matvec -- 3.8 GB per matvec on a 420k-panel mesh --
+   * and out of pageable memory the driver has to bounce that through an
+   * internal staging buffer, which measured 4.0 s of an 11.0 s nearfield
+   * stage. Pinning lets the DMA engine read the buffer directly.
+   *
+   * cudaHostAlloc can fail where malloc would succeed, since pinned pages
+   * cannot be swapped, so each falls back to ordinary memory rather than
+   * failing the run; correctness does not depend on it.
+   */
+  gNear.h_src = (int *)allocNearfieldStagingHost(ni * sizeof(int), &gNear.h_srcPinned);
+  gNear.h_dst = (int *)allocNearfieldStagingHost(ni * sizeof(int), &gNear.h_dstPinned);
+  gNear.h_k0 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k0Pinned);
+  gNear.h_k1 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k1Pinned);
+  gNear.h_k2 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k2Pinned);
+  gNear.h_k3 = (double *)allocNearfieldStagingHost(ni * sizeof(double), &gNear.h_k3Pinned);
+  if (gNear.h_panels == NULL || gNear.h_src == NULL || gNear.h_dst == NULL ||
+      gNear.h_k0 == NULL || gNear.h_k1 == NULL || gNear.h_k2 == NULL ||
+      gNear.h_k3 == NULL) {
+    setNearfieldLastError("host allocation for %.3f GiB nearfield streaming chunk failed",
+                          bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
+    return 0;
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield streaming staging: pinned=%d/6 chunk-host=%.3f GiB\n",
+           gNear.h_srcPinned + gNear.h_dstPinned + gNear.h_k0Pinned +
+           gNear.h_k1Pinned + gNear.h_k2Pinned + gNear.h_k3Pinned,
+           bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
+  }
+  if (!buildNearfieldPanelGeometry(sys)) return 0;
+
+  if (!cudaMallocNearfield((void **)&gNear.d_panels,
+                           (size_t)sys->nPnls * sizeof(NearPanelGeom), "stream d_panels") ||
+      !cudaMallocNearfield((void **)&gNear.d_src, ni * sizeof(int), "stream d_src") ||
+      !cudaMallocNearfield((void **)&gNear.d_dst, ni * sizeof(int), "stream d_dst") ||
+      !cudaMallocNearfield((void **)&gNear.d_k0, ni * sizeof(double), "stream d_k0") ||
+      !cudaMallocNearfield((void **)&gNear.d_k1, ni * sizeof(double), "stream d_k1") ||
+      !cudaMallocNearfield((void **)&gNear.d_k2, ni * sizeof(double), "stream d_k2") ||
+      !cudaMallocNearfield((void **)&gNear.d_k3, ni * sizeof(double), "stream d_k3") ||
+      !cudaMallocNearfield((void **)&gNear.d_sgm, vecBytes, "stream d_sgm") ||
+      !cudaMallocNearfield((void **)&gNear.d_pot, vecBytes, "stream d_pot")) {
+    return 0;
+  }
+  if (!cudaMemcpyNearfield(gNear.d_panels, gNear.h_panels,
+                           (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                           cudaMemcpyHostToDevice, "stream panels")) return 0;
+
+  /*
+   * Build and upload the leaf-pair table once. It lets the disjoint kernel
+   * derive its own panel indices, so from the second matvec onward neither the
+   * host index loop nor the per-chunk index upload has to run at all. The
+   * table is ~20 bytes per leaf pair, against 8 bytes per interaction for the
+   * arrays it replaces.
+   */
+  {
+    int nPairs = sys->nNearPairsFlat;
+    std::vector<long long> hOffset((size_t)nPairs + 1U);
+    std::vector<int> hSrcStart((size_t)nPairs), hSrcCount((size_t)nPairs),
+                     hDstStart((size_t)nPairs);
+    long long running = 0;
+    int p;
+
+    for (p = 0; p < nPairs; p++) {
+      int srcLeaf = sys->nearPairSrc[p];
+      int dstLeaf = sys->nearPairDst[p];
+      hOffset[(size_t)p] = running;
+      hSrcStart[(size_t)p] = sys->leafPanelStart[srcLeaf];
+      hSrcCount[(size_t)p] = sys->leafPanelCount[srcLeaf];
+      hDstStart[(size_t)p] = sys->leafPanelStart[dstLeaf];
+      running += (long long)sys->leafPanelCount[srcLeaf] *
+                 (long long)sys->leafPanelCount[dstLeaf];
+    }
+    hOffset[(size_t)nPairs] = running;
+
+    if (running != totalInteractions) {
+      setNearfieldLastError("leaf-pair table totals %lld interactions, expected %lld",
+                            running, totalInteractions);
+      return 0;
+    }
+
+    if (!cudaMallocNearfield((void **)&gNear.d_streamPairOffset,
+                             ((size_t)nPairs + 1U) * sizeof(long long), "stream pairOffset") ||
+        !cudaMallocNearfield((void **)&gNear.d_streamPairSrcStart,
+                             (size_t)nPairs * sizeof(int), "stream pairSrcStart") ||
+        !cudaMallocNearfield((void **)&gNear.d_streamPairSrcCount,
+                             (size_t)nPairs * sizeof(int), "stream pairSrcCount") ||
+        !cudaMallocNearfield((void **)&gNear.d_streamPairDstStart,
+                             (size_t)nPairs * sizeof(int), "stream pairDstStart") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairOffset, &hOffset[0],
+                             ((size_t)nPairs + 1U) * sizeof(long long),
+                             cudaMemcpyHostToDevice, "stream pairOffset") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairSrcStart, &hSrcStart[0],
+                             (size_t)nPairs * sizeof(int),
+                             cudaMemcpyHostToDevice, "stream pairSrcStart") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairSrcCount, &hSrcCount[0],
+                             (size_t)nPairs * sizeof(int),
+                             cudaMemcpyHostToDevice, "stream pairSrcCount") ||
+        !cudaMemcpyNearfield(gNear.d_streamPairDstStart, &hDstStart[0],
+                             (size_t)nPairs * sizeof(int),
+                             cudaMemcpyHostToDevice, "stream pairDstStart")) {
+      if (sys->benchmarkMode > 0) {
+        printf("GPU nearfield streaming pair table disabled: %s\n",
+               gpuNearfieldLastError());
+      }
+      freeNearfieldStreamPairTable();
+      cudaGetLastError();
+      setNearfieldLastError("not attempted");
+    } else {
+      gNear.streamPairCount = nPairs;
+    }
+  }
+
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield streaming: interactions=%lld chunk-capacity=%lld chunk-device=%.3f GiB qOrd=1\n",
+           totalInteractions, capacity,
+           bytesToGiB(ni * (2U * sizeof(int) + 4U * sizeof(double))));
+    if (gNear.streamPairCount > 0) {
+      printf("GPU nearfield streaming pair table: pairs=%d device=%.3f GiB\n",
+             gNear.streamPairCount,
+             bytesToGiB(((size_t)gNear.streamPairCount + 1U) * sizeof(long long) +
+                        3U * (size_t)gNear.streamPairCount * sizeof(int)));
+    } else {
+      printf("GPU nearfield streaming pair table: disabled\n");
+    }
   }
   return 1;
 }
@@ -845,6 +1371,82 @@ int allocateM2LDeviceArrays() {
   err = cudaMalloc((void **)&gM2L.d_lec4, nMom * sizeof(double));
   if (err != cudaSuccess) return 0;
 
+  return 1;
+}
+
+int allocateM2LStreamingArrays(size_t chunkBytes) {
+  size_t nCubes = (size_t)gM2L.nCubes;
+  size_t nMom = (size_t)gM2L.totalCubeCoeff;
+  size_t idxFlat = (size_t)gM2L.maxIdxDim * (size_t)gM2L.maxIdxDim *
+                   (size_t)gM2L.maxIdxDim;
+  size_t maxMom = (size_t)(((gM2L.maxOrder + 1) * (gM2L.maxOrder + 2) *
+                            (gM2L.maxOrder + 3)) / 6);
+  size_t coeffCapacity = (chunkBytes * 3U / 4U) / (2U * sizeof(double));
+  size_t pairCapacity = (chunkBytes / 4U) / (2U * sizeof(int));
+  size_t groupCapacity = std::min((size_t)gM2L.nGroups, (size_t)1048576U);
+
+  if (coeffCapacity > (size_t)INT_MAX) coeffCapacity = (size_t)INT_MAX;
+  if (pairCapacity > (size_t)INT_MAX) pairCapacity = (size_t)INT_MAX;
+  if (coeffCapacity == 0 || pairCapacity == 0 || groupCapacity == 0) return 0;
+  gM2L.streamCoeffCapacity = (int)coeffCapacity;
+  gM2L.streamPairCapacity = (int)pairCapacity;
+  gM2L.streamGroupCapacity = (int)groupCapacity;
+
+  gM2L.h_pairSrc = (int *)malloc(pairCapacity * sizeof(int));
+  gM2L.h_pairCoeffOffset = (int *)malloc((pairCapacity + 1U) * sizeof(int));
+  gM2L.h_groupStart = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_groupCount = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_groupDst = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_groupOrder = (int *)malloc(groupCapacity * sizeof(int));
+  gM2L.h_cubeCoeffOffset = (int *)malloc(nCubes * sizeof(int));
+  gM2L.h_cubeNMom = (int *)malloc(nCubes * sizeof(int));
+  gM2L.h_idxI1 = (int *)malloc(maxMom * sizeof(int));
+  gM2L.h_idxI2 = (int *)malloc(maxMom * sizeof(int));
+  gM2L.h_idxI3 = (int *)malloc(maxMom * sizeof(int));
+  gM2L.h_idx3Flat = (int *)malloc(idxFlat * sizeof(int));
+  gM2L.h_g0 = (double *)malloc(coeffCapacity * sizeof(double));
+  gM2L.h_gk = (double *)malloc(coeffCapacity * sizeof(double));
+  gM2L.h_momPot = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_momDpdn = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec1 = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec2 = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec3 = (double *)malloc(nMom * sizeof(double));
+  gM2L.h_lec4 = (double *)malloc(nMom * sizeof(double));
+  if (!gM2L.h_pairSrc || !gM2L.h_pairCoeffOffset ||
+      !gM2L.h_groupStart || !gM2L.h_groupCount ||
+      !gM2L.h_groupDst || !gM2L.h_groupOrder || !gM2L.h_cubeCoeffOffset ||
+      !gM2L.h_cubeNMom || !gM2L.h_idxI1 || !gM2L.h_idxI2 || !gM2L.h_idxI3 ||
+      !gM2L.h_idx3Flat || !gM2L.h_g0 || !gM2L.h_gk || !gM2L.h_momPot ||
+      !gM2L.h_momDpdn || !gM2L.h_lec1 || !gM2L.h_lec2 ||
+      !gM2L.h_lec3 || !gM2L.h_lec4) {
+    setM2LLastError("host allocation for M2L streaming cache failed");
+    return 0;
+  }
+
+#define M2L_STREAM_CUDA_ALLOC(ptr, count, type) \
+  do { if (!cudaMallocM2L((void **)&(ptr), (count) * sizeof(type), #ptr)) return 0; } while (0)
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_pairSrc, pairCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_pairCoeffOffset, pairCapacity + 1U, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupStart, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupCount, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupDst, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_groupOrder, groupCapacity, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_cubeCoeffOffset, nCubes, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_cubeNMom, nCubes, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idxI1, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idxI2, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idxI3, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_idx3Flat, idxFlat, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_sgn3, maxMom, int);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_g0, coeffCapacity, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_gk, coeffCapacity, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_momPot, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_momDpdn, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec1, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec2, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec3, nMom, double);
+  M2L_STREAM_CUDA_ALLOC(gM2L.d_lec4, nMom, double);
+#undef M2L_STREAM_CUDA_ALLOC
   return 1;
 }
 
@@ -999,6 +1601,74 @@ void buildM2LIndexTables() {
   }
 }
 
+size_t m2lStreamingChunkBytes() {
+  const char *env = getenv("FABIPB_GPU_M2L_CHUNK_MIB");
+  double mib = 512.0;
+  if (env != NULL && atof(env) > 0.0) mib = atof(env);
+  return (size_t)(mib * 1024.0 * 1024.0);
+}
+
+size_t m2lFullDeviceBytes() {
+  size_t nPairs = (size_t)gM2L.nPairs;
+  size_t nGroups = (size_t)gM2L.nGroups;
+  size_t nCubes = (size_t)gM2L.nCubes;
+  size_t nMom = (size_t)gM2L.totalCubeCoeff;
+  size_t nPairCoeff = (size_t)gM2L.totalPairCoeff;
+  return 2U * nPairCoeff * sizeof(double) +
+         2U * nPairs * sizeof(int) +
+         4U * nGroups * sizeof(int) +
+         2U * nCubes * sizeof(int) +
+         6U * nMom * sizeof(double);
+}
+
+int buildM2LStreamingTables(const ssystem *sys) {
+  int cubeIdx;
+  size_t chunkBytes = m2lStreamingChunkBytes();
+  size_t nCubes = (size_t)gM2L.nCubes;
+  size_t maxMom = (size_t)sys->nMom[sys->maxOrder];
+  size_t idxFlat = (size_t)gM2L.maxIdxDim * (size_t)gM2L.maxIdxDim *
+                   (size_t)gM2L.maxIdxDim;
+
+  if (gM2L.totalCubeCoeff > INT_MAX) {
+    printf("GPU M2L streaming unavailable: cube coefficient offsets exceed INT_MAX\n");
+    return 0;
+  }
+  gM2L.streaming = 1;
+  if (!allocateM2LStreamingArrays(chunkBytes)) return 0;
+  buildM2LIndexTables();
+
+  for (cubeIdx = 0; cubeIdx < gM2L.nCubes; cubeIdx++) {
+    cube *cb = sys->fmmCubeByIdx[cubeIdx];
+    int nMom = sys->nMom[sys->ordM2L[cb->level]];
+    if (cubeIdx == 0) {
+      gM2L.h_cubeCoeffOffset[cubeIdx] = 0;
+    } else {
+      gM2L.h_cubeCoeffOffset[cubeIdx] =
+          gM2L.h_cubeCoeffOffset[cubeIdx - 1] + gM2L.h_cubeNMom[cubeIdx - 1];
+    }
+    gM2L.h_cubeNMom[cubeIdx] = nMom;
+  }
+
+#define M2L_STREAM_UPLOAD(dst, src, count, type) \
+  do { if (!cudaMemcpyM2L((dst), (src), (count) * sizeof(type), cudaMemcpyHostToDevice, #dst)) return 0; } while (0)
+  M2L_STREAM_UPLOAD(gM2L.d_cubeCoeffOffset, gM2L.h_cubeCoeffOffset, nCubes, int);
+  M2L_STREAM_UPLOAD(gM2L.d_cubeNMom, gM2L.h_cubeNMom, nCubes, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idxI1, gM2L.h_idxI1, maxMom, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idxI2, gM2L.h_idxI2, maxMom, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idxI3, gM2L.h_idxI3, maxMom, int);
+  M2L_STREAM_UPLOAD(gM2L.d_idx3Flat, gM2L.h_idx3Flat, idxFlat, int);
+  M2L_STREAM_UPLOAD(gM2L.d_sgn3, sgn3, maxMom, int);
+#undef M2L_STREAM_UPLOAD
+
+  if (sys->benchmarkMode > 0) {
+    printf("GPU M2L streaming cache: cubes=%d pairs=%d coeff=%lld pair-capacity=%d coeff-capacity=%d group-capacity=%d device-chunk=%.3f GiB\n",
+           gM2L.nCubes, gM2L.nPairs, gM2L.totalPairCoeff,
+           gM2L.streamPairCapacity, gM2L.streamCoeffCapacity,
+           gM2L.streamGroupCapacity, bytesToGiB(chunkBytes));
+  }
+  return 1;
+}
+
 int buildM2LTables(const ssystem *sys) {
   int cubeIdx;
   int pairIdx;
@@ -1013,6 +1683,7 @@ int buildM2LTables(const ssystem *sys) {
   gM2L.maxIdxDim = sys->maxOrder + 1;
   gM2L.totalPairCoeff = 0;
   gM2L.totalCubeCoeff = 0;
+  gM2L.streaming = 0;
 
   for (cubeIdx = 0; cubeIdx < sys->nFmmCubesFlat; cubeIdx++) {
     cube *cb = sys->fmmCubeByIdx[cubeIdx];
@@ -1027,6 +1698,24 @@ int buildM2LTables(const ssystem *sys) {
 
   if (gM2L.nPairs <= 0 || gM2L.nGroups <= 0 || gM2L.nCubes <= 0) {
     return 0;
+  }
+  {
+    size_t freeBytes = 0, totalBytes = 0;
+    size_t fullBytes = m2lFullDeviceBytes();
+    int forceStreaming = envFlagEnabled("FABIPB_GPU_M2L_FORCE_STREAMING");
+    int offsetOverflow = gM2L.totalPairCoeff > INT_MAX;
+    int memoryOverflow = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess) {
+      memoryOverflow = fullBytes > (freeBytes * 4U / 5U);
+      if (sys->benchmarkMode > 0) {
+        printf("GPU M2L estimate: coeff=%lld full-device=%.3f GiB free=%.3f GiB total=%.3f GiB offset64-required=%d\n",
+               gM2L.totalPairCoeff, bytesToGiB(fullBytes), bytesToGiB(freeBytes),
+               bytesToGiB(totalBytes), offsetOverflow);
+      }
+    }
+    if (forceStreaming || offsetOverflow || memoryOverflow) {
+      return buildM2LStreamingTables(sys);
+    }
   }
   if (!allocateM2LHostArrays()) {
     return 0;
@@ -1195,10 +1884,16 @@ int buildNearfieldTables(const ssystem *sys) {
   int pairIdx;
   long long totalInteractions = 0;
   long long k = 0;
+  long long disjointBuildCount = 0;
+  size_t hostBytes = 0;
+  size_t deviceBytes = 0;
+  size_t freeBytes = 0;
+  size_t totalGpuBytes = 0;
   double t0, t1;
   int collectCaseCounts = (sys->benchmarkMode > 0);
   int useGpuDisjointBuild = gpuNearfieldDisjointBuildEnabled(sys);
 
+  setNearfieldLastError("not attempted");
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
     int srcLeaf = sys->nearPairSrc[pairIdx];
     int dstLeaf = sys->nearPairDst[pairIdx];
@@ -1208,10 +1903,36 @@ int buildNearfieldTables(const ssystem *sys) {
   }
 
   if (totalInteractions <= 0) {
+    setNearfieldLastError("nearfield cache has no interactions");
     return 0;
+  }
+  hostBytes = nearfieldHostBytes(sys, totalInteractions);
+  deviceBytes = nearfieldDeviceBytes(sys, totalInteractions);
+  if (cudaMemGetInfo(&freeBytes, &totalGpuBytes) == cudaSuccess) {
+    if (sys->benchmarkMode > 0) {
+      printf("GPU nearfield estimate: interactions=%lld host-cache=%.3f GiB device-cache=%.3f GiB free=%.3f GiB total=%.3f GiB mode=%d\n",
+             totalInteractions, bytesToGiB(hostBytes), bytesToGiB(deviceBytes),
+             bytesToGiB(freeBytes), bytesToGiB(totalGpuBytes), sys->gpuNearfieldMode);
+    }
+    if (envFlagEnabled("FABIPB_GPU_NEARFIELD_FORCE_STREAMING")) {
+      return buildNearfieldStreamingCache(sys, totalInteractions, freeBytes);
+    }
+    if (deviceBytes > freeBytes && !envFlagEnabled("FABIPB_GPU_NEARFIELD_ALLOW_OVERSIZE")) {
+      if (!envFlagEnabled("FABIPB_GPU_NEARFIELD_DISABLE_STREAMING")) {
+        return buildNearfieldStreamingCache(sys, totalInteractions, freeBytes);
+      }
+      setNearfieldLastError("estimated device cache %.3f GiB exceeds free GPU memory %.3f GiB and streaming is disabled",
+                            bytesToGiB(deviceBytes), bytesToGiB(freeBytes));
+      return 0;
+    }
+  } else if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield estimate: interactions=%lld host-cache=%.3f GiB device-cache=%.3f GiB free=unknown mode=%d\n",
+           totalInteractions, bytesToGiB(hostBytes), bytesToGiB(deviceBytes),
+           sys->gpuNearfieldMode);
   }
   gNear.sys = sys;
   gNear.nearfieldMode = sys->gpuNearfieldMode;
+  gNear.streaming = 0;
   gNear.caseDisjointCount = 0;
   gNear.caseOneCommonCount = 0;
   gNear.caseTwoCommonCount = 0;
@@ -1222,6 +1943,7 @@ int buildNearfieldTables(const ssystem *sys) {
     return 0;
   }
   if (!buildNearfieldPanelGeometry(sys)) {
+    setNearfieldLastError("nearfield panel geometry build failed");
     return 0;
   }
 
@@ -1270,19 +1992,23 @@ int buildNearfieldTables(const ssystem *sys) {
               nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
             }
             if (collectCaseCounts) {
-              int caseIdx = nearCaseIndex(nVtx);
-              switch (caseIdx) {
-                case 0: gNear.caseDisjointCount++; break;
-                case 1: gNear.caseOneCommonCount++; break;
-                case 2: gNear.caseTwoCommonCount++; break;
-                case 3: gNear.caseTwoCommonRevCount++; break;
-                case 4: gNear.caseSelfCount++; break;
-                default: break;
+              if (nVtx == 0) {
+                gNear.caseDisjointCount++;
+              } else {
+                int caseIdx = nearCaseIndex(nVtx);
+                switch (caseIdx) {
+                  case 1: gNear.caseOneCommonCount++; break;
+                  case 2: gNear.caseTwoCommonCount++; break;
+                  case 3: gNear.caseTwoCommonRevCount++; break;
+                  case 4: gNear.caseSelfCount++; break;
+                  default: break;
+                }
               }
             }
             gNear.h_dst[idx] = dstPanelIdx;
             gNear.h_src[idx] = srcPanelIdx;
             if (useGpuDisjointBuild && nVtx == 0) {
+              disjointBuildCount++;
               gNear.h_k0[idx] = 0.0;
               gNear.h_k1[idx] = 0.0;
               gNear.h_k2[idx] = 0.0;
@@ -1300,15 +2026,17 @@ int buildNearfieldTables(const ssystem *sys) {
     } else {
       std::vector<std::thread> workers;
       std::vector<long long> threadCounts((size_t)nThreads * 5U, 0);
+      std::vector<long long> threadDisjointBuildCounts((size_t)nThreads, 0);
       int t;
 
       workers.reserve((size_t)nThreads);
       for (t = 0; t < nThreads; t++) {
         int begin = (sys->nNearPairsFlat * t) / nThreads;
         int end = (sys->nNearPairsFlat * (t + 1)) / nThreads;
-        workers.emplace_back([=, &threadCounts]() {
+        workers.emplace_back([=, &threadCounts, &threadDisjointBuildCounts]() {
           int localPairIdx;
           long long *localCounts = &threadCounts[(size_t)t * 5U];
+          long long localDisjointBuildCount = 0;
           for (localPairIdx = begin; localPairIdx < end; localPairIdx++) {
             int srcLeaf = sys->nearPairSrc[localPairIdx];
             int dstLeaf = sys->nearPairDst[localPairIdx];
@@ -1332,14 +2060,19 @@ int buildNearfieldTables(const ssystem *sys) {
                   nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
                 }
                 if (collectCaseCounts) {
-                  int caseIdx = nearCaseIndex(nVtx);
-                  if (caseIdx >= 0) {
-                    localCounts[caseIdx]++;
+                  if (nVtx == 0) {
+                    localCounts[0]++;
+                  } else {
+                    int caseIdx = nearCaseIndex(nVtx);
+                    if (caseIdx >= 1 && caseIdx <= 4) {
+                      localCounts[caseIdx]++;
+                    }
                   }
                 }
                 gNear.h_dst[idx] = dstPanelIdx;
                 gNear.h_src[idx] = srcPanelIdx;
                 if (useGpuDisjointBuild && nVtx == 0) {
+                  localDisjointBuildCount++;
                   gNear.h_k0[idx] = 0.0;
                   gNear.h_k1[idx] = 0.0;
                   gNear.h_k2[idx] = 0.0;
@@ -1354,10 +2087,12 @@ int buildNearfieldTables(const ssystem *sys) {
               }
             }
           }
+          threadDisjointBuildCounts[(size_t)t] = localDisjointBuildCount;
         });
       }
       for (t = 0; t < nThreads; t++) {
         workers[(size_t)t].join();
+        disjointBuildCount += threadDisjointBuildCounts[(size_t)t];
         if (collectCaseCounts) {
           long long *localCounts = &threadCounts[(size_t)t * 5U];
           gNear.caseDisjointCount += localCounts[0];
@@ -1379,33 +2114,76 @@ int buildNearfieldTables(const ssystem *sys) {
     return 0;
   }
 
-  if (cudaMemcpy(gNear.d_panels, gNear.h_panels,
-                 (size_t)sys->nPnls * sizeof(NearPanelGeom), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_src, gNear.h_src, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_dst, gNear.h_dst, (size_t)totalInteractions * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_pairSrcCount, gNear.h_pairSrcCount, (size_t)sys->nNearPairsFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_pairInteractionOffset, gNear.h_pairInteractionOffset, (size_t)sys->nNearPairsFlat * sizeof(long long), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_leafPanelStart, gNear.h_leafPanelStart, (size_t)sys->nLeafCubesFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_leafPanelCount, gNear.h_leafPanelCount, (size_t)sys->nLeafCubesFlat * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_leafPairOffset, gNear.h_leafPairOffset, ((size_t)sys->nLeafCubesFlat + 1) * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k0, gNear.h_k0, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k1, gNear.h_k1, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k2, gNear.h_k2, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gNear.d_k3, gNear.h_k3, (size_t)totalInteractions * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_panels, gNear.h_panels,
+                           (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                           cudaMemcpyHostToDevice, "h_panels -> d_panels")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src,
+                           (size_t)totalInteractions * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_src -> d_src")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst,
+                           (size_t)totalInteractions * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_dst -> d_dst")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_pairSrcCount, gNear.h_pairSrcCount,
+                           (size_t)sys->nNearPairsFlat * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_pairSrcCount -> d_pairSrcCount")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_pairInteractionOffset, gNear.h_pairInteractionOffset,
+                           (size_t)sys->nNearPairsFlat * sizeof(long long),
+                           cudaMemcpyHostToDevice, "h_pairInteractionOffset -> d_pairInteractionOffset")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_leafPanelStart, gNear.h_leafPanelStart,
+                           (size_t)sys->nLeafCubesFlat * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_leafPanelStart -> d_leafPanelStart")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_leafPanelCount, gNear.h_leafPanelCount,
+                           (size_t)sys->nLeafCubesFlat * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_leafPanelCount -> d_leafPanelCount")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_leafPairOffset, gNear.h_leafPairOffset,
+                           ((size_t)sys->nLeafCubesFlat + 1U) * sizeof(int),
+                           cudaMemcpyHostToDevice, "h_leafPairOffset -> d_leafPairOffset")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k0, gNear.h_k0,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k0 -> d_k0")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k1, gNear.h_k1,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k1 -> d_k1")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k2, gNear.h_k2,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k2 -> d_k2")) return 0;
+  if (!cudaMemcpyNearfield(gNear.d_k3, gNear.h_k3,
+                           (size_t)totalInteractions * sizeof(double),
+                           cudaMemcpyHostToDevice, "h_k3 -> d_k3")) return 0;
   t1 = wall_seconds_cuda_local();
   fmmNearGpuUploadTime += (t1 - t0);
 
-  if (useGpuDisjointBuild && gNear.caseDisjointCount > 0) {
+  if (useGpuDisjointBuild && disjointBuildCount > 0) {
     int blockSize = 256;
     int gridSize = (int)((gNear.nInteractions + blockSize - 1) / blockSize);
-    if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-    if (cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    cudaError_t err = cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      setNearfieldLastError("cudaMemcpyToSymbol c_nearKappa failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      setNearfieldLastError("cudaMemcpyToSymbol c_nearEpsilon failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
     t0 = wall_seconds_cuda_local();
     nearfieldDisjointQ1BuildKernel<<<gridSize, blockSize>>>(
         gNear.nInteractions, gNear.d_panels, gNear.d_src, gNear.d_dst,
         gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3);
-    if (cudaGetLastError() != cudaSuccess) return 0;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield disjoint build kernel launch failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield disjoint build kernel failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
     t1 = wall_seconds_cuda_local();
     fmmNearGpuCoeffTime += (t1 - t0);
   }
@@ -1415,7 +2193,7 @@ int buildNearfieldTables(const ssystem *sys) {
            gNear.caseDisjointCount, gNear.caseOneCommonCount, gNear.caseTwoCommonCount,
            gNear.caseTwoCommonRevCount, gNear.caseSelfCount);
     printf("GPU nearfield stage2 metadata: panels=%d disjoint-interactions=%lld\n",
-           sys->nPnls, gNear.caseDisjointCount);
+           sys->nPnls, disjointBuildCount);
     if (useGpuDisjointBuild) {
       printf("GPU nearfield stage2 mode: disjoint-q1 builder enabled\n");
     }
@@ -1832,6 +2610,127 @@ __global__ void nearfieldDisjointQ1BuildKernel(
   k3[tid] = pnlX->area * pnlY->area * out[3];
 }
 
+/*
+ * Shared body for the two disjoint-pair kernels: one reads the panel indices
+ * from uploaded arrays, the other derives them from the leaf-pair table. Both
+ * call this so the arithmetic cannot drift apart.
+ */
+__device__ __forceinline__ void nearDisjointQ1Apply(
+    int nPnls,
+    int s,
+    int d,
+    const NearPanelGeom *panels,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  const NearPanelGeom *pnlX = &panels[d];
+  const NearPanelGeom *pnlY = &panels[s];
+  double r0[3], r1[3], r[3], out[4];
+  double scale;
+  int k;
+
+  if (!nearDisjointCase(pnlX, pnlY)) return;
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k] - pnlY->vtx[0][k];
+    r1[k] = r0[k] + 0.5 * (pnlX->a2[k] + 0.5 * pnlX->a0[k]);
+    r[k] = r1[k] - 0.5 * (pnlY->a2[k] + 0.5 * pnlY->a0[k]);
+  }
+  kernelKer4Device(r, pnlX->normal, pnlY->normal, out);
+  scale = pnlX->area * pnlY->area;
+#if __CUDA_ARCH__ >= 600
+  atomicAdd(&pot[d], alpha * scale * (out[0] * sgm[s + nPnls] + out[1] * sgm[s]));
+  atomicAdd(&pot[d + nPnls], alpha * scale * (out[2] * sgm[s + nPnls] + out[3] * sgm[s]));
+#else
+  {
+    double addPot = alpha * scale * (out[0] * sgm[s + nPnls] + out[1] * sgm[s]);
+    double addDpdn = alpha * scale * (out[2] * sgm[s + nPnls] + out[3] * sgm[s]);
+    unsigned long long int *addr1 = (unsigned long long int *)&pot[d];
+    unsigned long long int *addr2 = (unsigned long long int *)&pot[d + nPnls];
+    unsigned long long int old1 = *addr1, assumed1;
+    unsigned long long int old2 = *addr2, assumed2;
+    do {
+      assumed1 = old1;
+      old1 = atomicCAS(addr1, assumed1,
+                       __double_as_longlong(addPot + __longlong_as_double(assumed1)));
+    } while (assumed1 != old1);
+    do {
+      assumed2 = old2;
+      old2 = atomicCAS(addr2, assumed2,
+                       __double_as_longlong(addDpdn + __longlong_as_double(assumed2)));
+    } while (assumed2 != old2);
+  }
+#endif
+}
+
+__global__ void nearfieldDisjointQ1ApplyKernel(
+    int nPnls,
+    long long nInteractions,
+    const NearPanelGeom *panels,
+    const int *src,
+    const int *dst,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nInteractions) return;
+  nearDisjointQ1Apply(nPnls, src[tid], dst[tid], panels, alpha, sgm, pot);
+}
+
+/*
+ * Same work, but the panel indices are computed instead of transferred.
+ *
+ * The host used to materialise src/dst for every interaction and upload them
+ * on every matvec -- 3.8 GB per matvec on a 420k-panel mesh, and 62 GB on the
+ * virus, which is more than the card holds. They are a pure function of the
+ * leaf-pair table, so each thread recovers its own pair from the interaction
+ * offsets and derives the two panel indices directly.
+ *
+ * Chunk c covers global interactions [c*chunkCapacity, ...), because the host
+ * loop simply counts interactions and flushes at chunkCapacity.
+ */
+__global__ void nearfieldDisjointQ1GeneratedKernel(
+    int nPnls,
+    long long chunkStart,
+    long long count,
+    int nPairs,
+    const long long *pairOffset,
+    const int *pairSrcStart,
+    const int *pairSrcCount,
+    const int *pairDstStart,
+    const NearPanelGeom *panels,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  long long g;
+  long long local;
+  int lo = 0;
+  int hi = nPairs;
+  int p, sc, i, j;
+
+  if (tid >= count) return;
+  g = chunkStart + tid;
+
+  /* Largest p with pairOffset[p] <= g; pairOffset holds nPairs+1 entries. */
+  while (hi - lo > 1) {
+    int mid = (lo + hi) >> 1;
+    if (pairOffset[mid] <= g) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  p = lo;
+
+  local = g - pairOffset[p];
+  sc = pairSrcCount[p];
+  i = (int)(local / (long long)sc);
+  j = (int)(local - (long long)i * (long long)sc);
+
+  nearDisjointQ1Apply(nPnls, pairSrcStart[p] + j, pairDstStart[p] + i,
+                      panels, alpha, sgm, pot);
+}
+
 __global__ void nearfieldLeafApplyKernel(
     int nPnls,
     const int *leafPanelStart,
@@ -2149,6 +3048,646 @@ __global__ void l2pLeafKernel(
     pot[panelIdx + nPnls] = beta * pot[panelIdx + nPnls] + alpha * sumDpdn;
   }
 }
+
+int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alpha,
+                                 long long chunkIdx, long long *specialTotal) {
+  const int blockSize = 256;
+  int gridSize = (int)((count + blockSize - 1) / blockSize);
+  long long specialCount = 0;
+  size_t indexBytes = (size_t)count * sizeof(int);
+  cudaError_t err;
+  long long idx;
+  /* Replay a previously classified chunk instead of redoing the work. */
+  int useCache = (gNear.specialCacheEnabled && gNear.specialCacheValid &&
+                  chunkIdx < gNear.specialCacheChunks);
+  /* With the cache live the host stops filling h_src/h_dst, so the disjoint
+   * kernel has to derive the indices itself. */
+  int useGenerated = (useCache && gNear.d_streamPairOffset != NULL);
+  const int *upSrc;
+  const int *upDst;
+  const double *upK0;
+  const double *upK1;
+  const double *upK2;
+  const double *upK3;
+
+  if (useGenerated) {
+    nearfieldDisjointQ1GeneratedKernel<<<gridSize, blockSize>>>(
+        gNear.nPnls, chunkIdx * gNear.chunkCapacity, count,
+        gNear.streamPairCount, gNear.d_streamPairOffset,
+        gNear.d_streamPairSrcStart, gNear.d_streamPairSrcCount,
+        gNear.d_streamPairDstStart,
+        gNear.d_panels, alpha, gNear.d_sgm, gNear.d_pot);
+  } else {
+    if (!cudaMemcpyNearfield(gNear.d_src, gNear.h_src, indexBytes,
+                             cudaMemcpyHostToDevice, "stream src") ||
+        !cudaMemcpyNearfield(gNear.d_dst, gNear.h_dst, indexBytes,
+                             cudaMemcpyHostToDevice, "stream dst")) return 0;
+
+    nearfieldDisjointQ1ApplyKernel<<<gridSize, blockSize>>>(
+        gNear.nPnls, count, gNear.d_panels, gNear.d_src, gNear.d_dst,
+        alpha, gNear.d_sgm, gNear.d_pot);
+  }
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("streaming disjoint kernel launch failed: %s",
+                          cudaGetErrorString(err));
+    return 0;
+  }
+
+  /*
+   * Classify every interaction in the chunk and compact the touching/self
+   * ("special") ones to the front of the chunk buffers.
+   *
+   * This is the dominant cost of the streaming path: nrCommonVtx() runs once
+   * per interaction, on every matvec. On a 420k-panel mesh that is 476M calls
+   * per matvec, and it used to run on one thread inside a timer labelled
+   * "kernel", which is why the GPU looked slow when the work was actually on
+   * the host.
+   *
+   * Parallelising needs care because the compaction is in-place: the loop
+   * reads h_src[idx] and writes h_src[specialCount] with specialCount <= idx.
+   * That is safe in a serial pass but not across threads, where one thread's
+   * writes can land in a range another thread has not read yet. So the work is
+   * split: each thread first classifies its own range into thread-local
+   * buffers (reads only), then, after every thread has finished reading, the
+   * results are copied back at prefix-summed offsets. Output order matches the
+   * serial version exactly, so the coefficients uploaded to the GPU are
+   * identical.
+   *
+   * On matvecs after the first this is skipped entirely: the answer depends
+   * only on the mesh, so it is replayed from the cache populated below.
+   */
+  if (useCache) {
+    long long lo = (*gNear.specialOffset)[(size_t)chunkIdx];
+    specialCount = (*gNear.specialOffset)[(size_t)chunkIdx + 1U] - lo;
+    upSrc = specialCount > 0 ? &(*gNear.cacheSrc)[(size_t)lo] : NULL;
+    upDst = specialCount > 0 ? &(*gNear.cacheDst)[(size_t)lo] : NULL;
+    upK0 = specialCount > 0 ? &(*gNear.cacheK0)[(size_t)lo] : NULL;
+    upK1 = specialCount > 0 ? &(*gNear.cacheK1)[(size_t)lo] : NULL;
+    upK2 = specialCount > 0 ? &(*gNear.cacheK2)[(size_t)lo] : NULL;
+    upK3 = specialCount > 0 ? &(*gNear.cacheK3)[(size_t)lo] : NULL;
+  } else {
+    int nThreads = nearfieldBuildThreadCount((int)((count > (long long)INT_MAX)
+                                                   ? (long long)INT_MAX : count));
+    if (nThreads <= 1) {
+      for (idx = 0; idx < count; idx++) {
+        int srcIdx = gNear.h_src[idx];
+        int dstIdx = gNear.h_dst[idx];
+        panel *pnlX = sys->panelByIdx[dstIdx];
+        panel *pnlY = sys->panelByIdx[srcIdx];
+        int idxX[3], idxY[3];
+        int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+        if (nVtx != 0) {
+          double *KER = panelIA0(pnlX, pnlY);
+          gNear.h_src[specialCount] = srcIdx;
+          gNear.h_dst[specialCount] = dstIdx;
+          gNear.h_k0[specialCount] = KER[0];
+          gNear.h_k1[specialCount] = KER[1];
+          gNear.h_k2[specialCount] = KER[2];
+          gNear.h_k3[specialCount] = KER[3];
+          specialCount++;
+        }
+      }
+    } else {
+      std::vector<std::vector<int> > tSrc((size_t)nThreads), tDst((size_t)nThreads);
+      std::vector<std::vector<double> > tK0((size_t)nThreads), tK1((size_t)nThreads),
+                                        tK2((size_t)nThreads), tK3((size_t)nThreads);
+      std::vector<std::thread> workers;
+      std::vector<long long> offset((size_t)nThreads + 1U, 0);
+      int t;
+
+      workers.reserve((size_t)nThreads);
+      for (t = 0; t < nThreads; t++) {
+        workers.push_back(std::thread([&, t]() {
+          long long begin = (count * (long long)t) / (long long)nThreads;
+          long long end = (count * (long long)(t + 1)) / (long long)nThreads;
+          std::vector<int> &vs = tSrc[(size_t)t];
+          std::vector<int> &vd = tDst[(size_t)t];
+          std::vector<double> &v0 = tK0[(size_t)t];
+          std::vector<double> &v1 = tK1[(size_t)t];
+          std::vector<double> &v2 = tK2[(size_t)t];
+          std::vector<double> &v3 = tK3[(size_t)t];
+          long long i;
+          /* Touching/self pairs are a small minority of the chunk (~1% on a
+           * compact protein, ~7% on the virus mesh). Reserving an eighth up
+           * front keeps the common case free of reallocation without holding
+           * much memory; the vectors still grow if a chunk is unusually dense. */
+          size_t guess = (size_t)((end - begin) / 8 + 1);
+          vs.reserve(guess); vd.reserve(guess);
+          v0.reserve(guess); v1.reserve(guess);
+          v2.reserve(guess); v3.reserve(guess);
+
+          for (i = begin; i < end; i++) {
+            int srcIdx = gNear.h_src[i];
+            int dstIdx = gNear.h_dst[i];
+            panel *pnlX = sys->panelByIdx[dstIdx];
+            panel *pnlY = sys->panelByIdx[srcIdx];
+            int idxX[3], idxY[3];
+            int nVtx = nrCommonVtx(pnlX, pnlY, idxX, idxY);
+            if (nVtx != 0) {
+              double *KER = panelIA0(pnlX, pnlY);
+              vs.push_back(srcIdx);
+              vd.push_back(dstIdx);
+              v0.push_back(KER[0]);
+              v1.push_back(KER[1]);
+              v2.push_back(KER[2]);
+              v3.push_back(KER[3]);
+            }
+          }
+        }));
+      }
+      for (t = 0; t < nThreads; t++) {
+        workers[(size_t)t].join();
+      }
+
+      for (t = 0; t < nThreads; t++) {
+        offset[(size_t)t + 1U] = offset[(size_t)t] + (long long)tSrc[(size_t)t].size();
+      }
+      specialCount = offset[(size_t)nThreads];
+
+      /* Every thread has finished reading, so writing back in place is safe. */
+      workers.clear();
+      for (t = 0; t < nThreads; t++) {
+        workers.push_back(std::thread([&, t]() {
+          size_t n = tSrc[(size_t)t].size();
+          long long at = offset[(size_t)t];
+          if (n == 0U) {
+            return;
+          }
+          memcpy(&gNear.h_src[at], &tSrc[(size_t)t][0], n * sizeof(int));
+          memcpy(&gNear.h_dst[at], &tDst[(size_t)t][0], n * sizeof(int));
+          memcpy(&gNear.h_k0[at], &tK0[(size_t)t][0], n * sizeof(double));
+          memcpy(&gNear.h_k1[at], &tK1[(size_t)t][0], n * sizeof(double));
+          memcpy(&gNear.h_k2[at], &tK2[(size_t)t][0], n * sizeof(double));
+          memcpy(&gNear.h_k3[at], &tK3[(size_t)t][0], n * sizeof(double));
+        }));
+      }
+      for (t = 0; t < nThreads; t++) {
+        workers[(size_t)t].join();
+      }
+    }
+
+    /*
+     * Record this chunk for the remaining matvecs. If the cache would exceed
+     * its budget, drop it and keep reclassifying rather than risk pushing the
+     * host into swap on a mesh where the solve itself is already large.
+     */
+    if (gNear.specialCacheEnabled && !gNear.specialCacheValid) {
+      size_t projected = (size_t)(gNear.cacheSrc->size() + (size_t)specialCount) *
+                         NEAR_SPECIAL_CACHE_BYTES_PER_PAIR;
+      if (projected > nearfieldSpecialCacheBudget()) {
+        if (sys->benchmarkMode > 0) {
+          printf("GPU nearfield special cache disabled: %.3f GiB exceeds budget %.3f GiB\n",
+                 bytesToGiB(projected), bytesToGiB(nearfieldSpecialCacheBudget()));
+        }
+        gNear.specialCacheEnabled = 0;
+        freeNearfieldSpecialCache();
+      } else {
+        gNear.cacheSrc->insert(gNear.cacheSrc->end(), gNear.h_src, gNear.h_src + specialCount);
+        gNear.cacheDst->insert(gNear.cacheDst->end(), gNear.h_dst, gNear.h_dst + specialCount);
+        gNear.cacheK0->insert(gNear.cacheK0->end(), gNear.h_k0, gNear.h_k0 + specialCount);
+        gNear.cacheK1->insert(gNear.cacheK1->end(), gNear.h_k1, gNear.h_k1 + specialCount);
+        gNear.cacheK2->insert(gNear.cacheK2->end(), gNear.h_k2, gNear.h_k2 + specialCount);
+        gNear.cacheK3->insert(gNear.cacheK3->end(), gNear.h_k3, gNear.h_k3 + specialCount);
+        gNear.specialOffset->push_back((long long)gNear.cacheSrc->size());
+      }
+    }
+    upSrc = gNear.h_src;
+    upDst = gNear.h_dst;
+    upK0 = gNear.h_k0;
+    upK1 = gNear.h_k1;
+    upK2 = gNear.h_k2;
+    upK3 = gNear.h_k3;
+  }
+
+  if (specialCount > 0) {
+    size_t specialIndexBytes = (size_t)specialCount * sizeof(int);
+    size_t specialCoeffBytes = (size_t)specialCount * sizeof(double);
+    int specialGrid = (int)((specialCount + blockSize - 1) / blockSize);
+    if (!cudaMemcpyNearfield(gNear.d_src, upSrc, specialIndexBytes,
+                             cudaMemcpyHostToDevice, "stream special src") ||
+        !cudaMemcpyNearfield(gNear.d_dst, upDst, specialIndexBytes,
+                             cudaMemcpyHostToDevice, "stream special dst") ||
+        !cudaMemcpyNearfield(gNear.d_k0, upK0, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k0") ||
+        !cudaMemcpyNearfield(gNear.d_k1, upK1, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k1") ||
+        !cudaMemcpyNearfield(gNear.d_k2, upK2, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k2") ||
+        !cudaMemcpyNearfield(gNear.d_k3, upK3, specialCoeffBytes,
+                             cudaMemcpyHostToDevice, "stream special k3")) return 0;
+    nearfieldApplyKernel<<<specialGrid, blockSize>>>(
+        gNear.nPnls, specialCount, gNear.d_src, gNear.d_dst,
+        gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
+        alpha, gNear.d_sgm, gNear.d_pot);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("streaming special-panel kernel launch failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+  }
+  *specialTotal += specialCount;
+  return 1;
+}
+
+int applyNearfieldStreaming(const ssystem *sys, double alpha) {
+  long long count = 0;
+  long long chunks = 0;
+  long long specialTotal = 0;
+  int pairIdx;
+  cudaError_t err;
+
+  kernel = kernelKER4;
+  err = cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double), 0,
+                           cudaMemcpyHostToDevice);
+  if (err == cudaSuccess) {
+    err = cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double), 0,
+                             cudaMemcpyHostToDevice);
+  }
+  if (err != cudaSuccess) {
+    setNearfieldLastError("streaming kernel constant upload failed: %s",
+                          cudaGetErrorString(err));
+    return 0;
+  }
+
+  /*
+   * Once the special cache is populated, nothing downstream reads the host
+   * index arrays: the specials come from the cache and the disjoint kernel
+   * derives its own indices. Skip building them altogether and just walk the
+   * chunk boundaries, which are fixed multiples of chunkCapacity. This removes
+   * both the index writes and their upload -- 3.8 GB per matvec on a
+   * 420k-panel mesh, 62 GB on the virus.
+   */
+  if (gNear.specialCacheValid && gNear.d_streamPairOffset != NULL) {
+    long long remaining = gNear.nInteractions;
+    while (remaining > 0) {
+      long long thisChunk = (remaining < gNear.chunkCapacity) ? remaining
+                                                              : gNear.chunkCapacity;
+      if (!applyNearfieldStreamingChunk(sys, thisChunk, alpha, chunks, &specialTotal)) return 0;
+      remaining -= thisChunk;
+      chunks++;
+    }
+  } else {
+    for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
+      int srcLeaf = sys->nearPairSrc[pairIdx];
+      int dstLeaf = sys->nearPairDst[pairIdx];
+      int srcStart = sys->leafPanelStart[srcLeaf];
+      int srcCount = sys->leafPanelCount[srcLeaf];
+      int dstStart = sys->leafPanelStart[dstLeaf];
+      int dstCount = sys->leafPanelCount[dstLeaf];
+      int i, j;
+      for (i = 0; i < dstCount; i++) {
+        for (j = 0; j < srcCount; j++) {
+          gNear.h_src[count] = srcStart + j;
+          gNear.h_dst[count] = dstStart + i;
+          count++;
+          if (count == gNear.chunkCapacity) {
+            if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
+            count = 0;
+            chunks++;
+          }
+        }
+      }
+    }
+    if (count > 0) {
+      if (!applyNearfieldStreamingChunk(sys, count, alpha, chunks, &specialTotal)) return 0;
+      chunks++;
+    }
+  }
+  /*
+   * The first matvec has now classified every chunk, so later ones can replay
+   * it. Chunk boundaries depend only on geometry and chunkCapacity, so the
+   * count recorded here stays valid for the rest of the solve.
+   */
+  if (gNear.specialCacheEnabled && !gNear.specialCacheValid) {
+    gNear.specialCacheChunks = chunks;
+    gNear.specialCacheValid = 1;
+    if (sys->benchmarkMode > 0) {
+      printf("GPU nearfield special cache: pairs=%lld host=%.3f GiB chunks=%lld\n",
+             (long long)gNear.cacheSrc->size(),
+             bytesToGiB((size_t)gNear.cacheSrc->size() * NEAR_SPECIAL_CACHE_BYTES_PER_PAIR),
+             chunks);
+    }
+  }
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("streaming nearfield execution failed: %s",
+                          cudaGetErrorString(err));
+    return 0;
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield streaming apply: chunks=%lld interactions=%lld special=%lld\n",
+           chunks, gNear.nInteractions, specialTotal);
+  }
+  return 1;
+}
+
+int flushM2LStreamingChunk(int pairCount, int groupCount, int coeffCount) {
+  cudaError_t err;
+  const int blockSize = 128;
+  if (pairCount <= 0 || groupCount <= 0 || coeffCount <= 0) return 1;
+
+#define M2L_CHUNK_UPLOAD(dst, src, count, type) \
+  do { \
+    if (!cudaMemcpyM2L((dst), (src), (size_t)(count) * sizeof(type), cudaMemcpyHostToDevice, #dst)) return 0; \
+  } while (0)
+  M2L_CHUNK_UPLOAD(gM2L.d_pairSrc, gM2L.h_pairSrc, pairCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_pairCoeffOffset, gM2L.h_pairCoeffOffset, pairCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupStart, gM2L.h_groupStart, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupCount, gM2L.h_groupCount, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupDst, gM2L.h_groupDst, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_groupOrder, gM2L.h_groupOrder, groupCount, int);
+  M2L_CHUNK_UPLOAD(gM2L.d_g0, gM2L.h_g0, coeffCount, double);
+  M2L_CHUNK_UPLOAD(gM2L.d_gk, gM2L.h_gk, coeffCount, double);
+#undef M2L_CHUNK_UPLOAD
+
+  m2lGroupedKernel<<<groupCount, blockSize>>>(
+      groupCount, gM2L.maxIdxDim,
+      gM2L.d_groupStart, gM2L.d_groupCount, gM2L.d_groupDst, gM2L.d_groupOrder,
+      gM2L.d_pairSrc, gM2L.d_pairCoeffOffset,
+      gM2L.d_cubeCoeffOffset,
+      gM2L.d_idxI1, gM2L.d_idxI2, gM2L.d_idxI3, gM2L.d_idx3Flat, gM2L.d_sgn3,
+      gM2L.d_g0, gM2L.d_gk, epsilon,
+      gM2L.d_momPot, gM2L.d_momDpdn,
+      gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setM2LLastError("streaming m2lGroupedKernel launch failed: %s",
+                    cudaGetErrorString(err));
+    return 0;
+  }
+  return 1;
+}
+
+/*
+ * A chunk's worth of destination groups, with the output slots each will fill.
+ * Recording these first turns the coefficient build into an independent
+ * scatter, which is what makes it threadable.
+ */
+struct M2LChunkGroup {
+  int globalStart;
+  int count;
+  int order;
+  int nMom;
+  int pairBase;     /* first slot in h_pairSrc / h_pairCoeffOffset */
+  int coeffBase;    /* first slot in h_g0 / h_gk */
+};
+
+static int m2lBuildThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_SETUP_THREADS");
+  long hc;
+  int threads;
+
+  (void)hc;
+  if (env != NULL && env[0] != '\0') threads = atoi(env);
+  else { unsigned int c = std::thread::hardware_concurrency(); threads = (c > 0U) ? (int)c : 1; }
+  if (threads < 1) threads = 1;
+  if (threads > nTasks) threads = nTasks;
+  if (threads > 64) threads = 64;
+  return threads;
+}
+
+/*
+ * Fills the coefficient staging buffers for one chunk.
+ *
+ * setupDerivs() runs once per M2L pair on every matvec -- 546M pairs times 38
+ * matvecs on the virus, 20.8 billion calls -- rebuilding coefficients that
+ * depend only on the (fixed) cube centres. It ran on one thread, and at
+ * sdens=2 that made M2L 950 s, 68% of the matvec.
+ *
+ * Groups average only about a hundred pairs, so threading inside a group would
+ * be all fork/join. Threading across the chunk's groups instead gives each
+ * worker thousands of pairs. Every group writes to slots reserved for it in the
+ * bookkeeping pass, so the threads never overlap and the buffers come out
+ * byte-identical to the serial order.
+ */
+static int fillM2LChunkGroups(const ssystem *sys,
+                              const std::vector<M2LChunkGroup> &groups) {
+  int nGroups = (int)groups.size();
+  int nThreads;
+
+  if (nGroups <= 0) return 1;
+  nThreads = m2lBuildThreadCount(nGroups);
+
+  if (nThreads <= 1) {
+    RhsTreeWorkspace ws;
+    int g;
+    initRhsTreeWorkspace((ssystem *)sys, &ws);
+    for (g = 0; g < nGroups; g++) {
+      const M2LChunkGroup &grp = groups[(size_t)g];
+      int j;
+      for (j = 0; j < grp.count; j++) {
+        int globalPair = grp.globalStart + j;
+        cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[globalPair]];
+        cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[globalPair]];
+        double r[3];
+        int k, at = grp.coeffBase + j * grp.nMom;
+        for (k = 0; k < 3; k++) r[k] = dst->x[k] - src->x[k];
+        setupDerivsWorkspace((ssystem *)sys, &ws, grp.order, r);
+        gM2L.h_pairSrc[grp.pairBase + j] = sys->m2lPairSrc[globalPair];
+        gM2L.h_pairCoeffOffset[grp.pairBase + j] = at;
+        memcpy(&gM2L.h_g0[at], ws.dg0[0], (size_t)grp.nMom * sizeof(double));
+        memcpy(&gM2L.h_gk[at], ws.dgk[0], (size_t)grp.nMom * sizeof(double));
+      }
+    }
+    freeRhsTreeWorkspace(&ws);
+    return 1;
+  }
+
+  {
+    std::vector<std::thread> workers;
+    std::vector<int> ok((size_t)nThreads, 1);
+    int t;
+    workers.reserve((size_t)nThreads);
+    for (t = 0; t < nThreads; t++) {
+      workers.push_back(std::thread([&, t]() {
+        RhsTreeWorkspace ws;
+        int begin = (int)(((long long)nGroups * t) / nThreads);
+        int end = (int)(((long long)nGroups * (t + 1)) / nThreads);
+        int g;
+        initRhsTreeWorkspace((ssystem *)sys, &ws);
+        for (g = begin; g < end; g++) {
+          const M2LChunkGroup &grp = groups[(size_t)g];
+          int j;
+          for (j = 0; j < grp.count; j++) {
+            int globalPair = grp.globalStart + j;
+            cube *src = sys->fmmCubeByIdx[sys->m2lPairSrc[globalPair]];
+            cube *dst = sys->fmmCubeByIdx[sys->m2lPairDst[globalPair]];
+            double r[3];
+            int k, at = grp.coeffBase + j * grp.nMom;
+            for (k = 0; k < 3; k++) r[k] = dst->x[k] - src->x[k];
+            setupDerivsWorkspace((ssystem *)sys, &ws, grp.order, r);
+            gM2L.h_pairSrc[grp.pairBase + j] = sys->m2lPairSrc[globalPair];
+            gM2L.h_pairCoeffOffset[grp.pairBase + j] = at;
+            memcpy(&gM2L.h_g0[at], ws.dg0[0], (size_t)grp.nMom * sizeof(double));
+            memcpy(&gM2L.h_gk[at], ws.dgk[0], (size_t)grp.nMom * sizeof(double));
+          }
+        }
+        freeRhsTreeWorkspace(&ws);
+      }));
+    }
+    for (t = 0; t < nThreads; t++) workers[(size_t)t].join();
+  }
+  return 1;
+}
+
+int applyM2LStreamingChunks(const ssystem *sys) {
+  int groupIdx;
+  int pairCount = 0;
+  int groupCount = 0;
+  int coeffCount = 0;
+  int chunks = 0;
+  std::vector<M2LChunkGroup> chunkGroups;
+
+  for (groupIdx = 0; groupIdx < sys->nM2LDstGroups; groupIdx++) {
+    int globalStart = sys->m2lDstGroupStart[groupIdx];
+    int count = sys->m2lDstGroupCount[groupIdx];
+    int order = sys->m2lPairOrder[globalStart];
+    int nMom = sys->nMom[order];
+    long long neededCoeff = (long long)count * (long long)nMom;
+    M2LChunkGroup grp;
+
+    if (count > gM2L.streamPairCapacity || neededCoeff > gM2L.streamCoeffCapacity) {
+      setM2LLastError("streaming group exceeds chunk capacity: group=%d pairs=%d coeff=%lld pair-capacity=%d coeff-capacity=%d",
+                      groupIdx, count, neededCoeff,
+                      gM2L.streamPairCapacity, gM2L.streamCoeffCapacity);
+      return 0;
+    }
+    if (groupCount == gM2L.streamGroupCapacity ||
+        pairCount + count > gM2L.streamPairCapacity ||
+        (long long)coeffCount + neededCoeff > gM2L.streamCoeffCapacity) {
+      if (!fillM2LChunkGroups(sys, chunkGroups)) return 0;
+      if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
+      chunkGroups.clear();
+      pairCount = 0;
+      groupCount = 0;
+      coeffCount = 0;
+      chunks++;
+    }
+
+    gM2L.h_groupStart[groupCount] = pairCount;
+    gM2L.h_groupCount[groupCount] = count;
+    gM2L.h_groupDst[groupCount] = sys->m2lPairDst[globalStart];
+    gM2L.h_groupOrder[groupCount] = order;
+
+    grp.globalStart = globalStart;
+    grp.count = count;
+    grp.order = order;
+    grp.nMom = nMom;
+    grp.pairBase = pairCount;
+    grp.coeffBase = coeffCount;
+    chunkGroups.push_back(grp);
+
+    pairCount += count;
+    coeffCount += (int)neededCoeff;
+    groupCount++;
+  }
+  if (groupCount > 0) {
+    if (!fillM2LChunkGroups(sys, chunkGroups)) return 0;
+    if (!flushM2LStreamingChunk(pairCount, groupCount, coeffCount)) return 0;
+    chunks++;
+  }
+  {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setM2LLastError("streaming M2L kernels failed: %s", cudaGetErrorString(err));
+      return 0;
+    }
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU M2L streaming apply: chunks=%d pairs=%d coeff=%lld\n",
+           chunks, gM2L.nPairs, gM2L.totalPairCoeff);
+  }
+  return 1;
+}
+
+/*
+ * SM count of the current device, queried once.
+ *
+ * The charge-tree kernels size their scratch from this: their throughput
+ * optimum is a concurrent-thread count, not a byte count (see
+ * chargeTreeScratchThreads), and thread counts only mean anything relative to
+ * the machine's width. Falls back to the measurement device (RTX 6000 Ada) if
+ * the query fails, which only costs a mistuned default, never correctness.
+ */
+int deviceSmCount() {
+  static int smCount = 0;
+  if (smCount == 0) {
+    cudaDeviceProp prop;
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+        prop.multiProcessorCount > 0) {
+      smCount = prop.multiProcessorCount;
+    } else {
+      smCount = 142;
+    }
+  }
+  return smCount;
+}
+
+/*
+ * Concurrent-thread count for a charge-tree kernel's derivative scratch.
+ *
+ * Both kernels give every thread a private slab of slabDoubles and then take
+ * panels in a grid-stride loop, so this is a pure occupancy/cache trade: too
+ * few threads and the machine idles, too many and the slabs stop fitting the
+ * cache. It used to be set by a fixed 256 MiB byte budget, which is wrong,
+ * because slabDoubles grows with derivMax and so the same byte count buys a
+ * different number of threads on every problem. Measured on 7A6A (420,576
+ * panels, RTX 6000 Ada, 142 SMs) by sweeping thread count at three slab sizes:
+ *
+ *   kernel  derivMax  slab(doubles)  best threads  best bytes
+ *   energy  5         251            27,392        55 MB
+ *   energy  6         420            20,096        67 MB
+ *   energy  9         1430           20,480        234 MB
+ *   rhs     9         715            12k-16k       70-94 MB
+ *
+ * The optimum moves by 1.4x in threads across a 5.7x change in slab size, and
+ * by 4.3x in bytes -- so threads is the invariant to hold, scaled by SM count
+ * so it transfers to other cards. perSm is the tuned constant: the energy
+ * kernel tolerates more concurrency than the RHS kernel, which showed a sharp
+ * step up in time past ~16k threads. Both curves are flat near the optimum,
+ * so these sit mid-plateau rather than on a measured peak.
+ *
+ * FABIPB_*_GPU_SCRATCH_MIB still overrides with an explicit byte budget.
+ */
+long long chargeTreeScratchThreads(const char *mibEnv, int perSm,
+                                   double sqrtCoeff,
+                                   long long slabDoubles, long long nPanels,
+                                   int blockSize) {
+  long long stride;
+  const char *env = getenv(mibEnv);
+  double budgetMiB = -1.0;
+
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end != env && *end == '\0' && v > 0.0) budgetMiB = v;
+  }
+  if (budgetMiB > 0.0) {
+    stride = (long long)((budgetMiB * 1024.0 * 1024.0) /
+                         ((double)slabDoubles * sizeof(double)));
+  } else if (sqrtCoeff > 0.0) {
+    /*
+     * threads * sqrt(slab) = const, per SM. Once the rolling-window kernel cut
+     * the slab, a flat per-SM thread count stopped fitting: measured optima on
+     * 7A6A were (slab 224 -> 32,768), (480 -> 22,784), (880 -> 16,384), whose
+     * products with sqrt(slab) are 490k, 499k and 486k -- constant to 3%, where
+     * the thread counts themselves span 2x and the byte budgets span 2x in the
+     * other direction. Fitted on one card, so it is still overridable.
+     */
+    stride = (long long)((double)deviceSmCount() * sqrtCoeff /
+                         sqrt((double)slabDoubles));
+  } else {
+    stride = (long long)deviceSmCount() * perSm;
+  }
+  if (stride < blockSize) stride = blockSize;
+  if (stride > nPanels) stride = nPanels;
+  return ((stride + blockSize - 1) / blockSize) * blockSize;
+}
+
 }  // namespace
 
 int gpuBackendAvailable(void) {
@@ -2165,6 +3704,14 @@ int gpuBackendAvailable(void) {
   return (deviceCount > 0) ? 1 : 0;
 }
 
+const char *gpuNearfieldLastError(void) {
+  return gNearfieldLastError[0] ? gNearfieldLastError : "unknown nearfield GPU failure";
+}
+
+const char *gpuM2LLastError(void) {
+  return gM2LLastError[0] ? gM2LLastError : "unknown M2L GPU failure";
+}
+
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
   cudaError_t err;
   size_t vecBytes;
@@ -2174,8 +3721,10 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   static int printedMode = -1;
 
   if (sys == NULL || sgm == NULL || pot == NULL) {
+    setNearfieldLastError("invalid input pointer");
     return 0;
   }
+  setNearfieldLastError("not attempted");
 
   if (gNear.sys != sys) {
     t0 = wall_seconds_cuda_local();
@@ -2191,9 +3740,17 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   vecBytes = (size_t)(2 * gNear.nPnls) * sizeof(double);
   t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(gNear.d_sgm, sgm, vecBytes, cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy sgm host-to-device failed for %.3f GiB: %s",
+                          bytesToGiB(vecBytes), cudaGetErrorString(err));
+    return 0;
+  }
   err = cudaMemcpy(gNear.d_pot, pot, vecBytes, cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy pot host-to-device failed for %.3f GiB: %s",
+                          bytesToGiB(vecBytes), cudaGetErrorString(err));
+    return 0;
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuH2DTime += (t1 - t0);
 
@@ -2205,7 +3762,9 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
     printedMode = sys->gpuNearfieldMode;
   }
   t0 = wall_seconds_cuda_local();
-  if (sys->gpuNearfieldMode == 1) {
+  if (gNear.streaming) {
+    if (!applyNearfieldStreaming(sys, alpha)) return 0;
+  } else if (sys->gpuNearfieldMode == 1) {
     gridSize = sys->nLeafCubesFlat;
     nearfieldLeafApplyKernel<<<gridSize, blockSize>>>(
         gNear.nPnls,
@@ -2220,16 +3779,30 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
         gNear.d_src, gNear.d_dst, gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
         alpha, gNear.d_sgm, gNear.d_pot);
   }
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return 0;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 0;
+  if (!gNear.streaming) {
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield apply kernel launch failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setNearfieldLastError("nearfield apply kernel failed: %s",
+                            cudaGetErrorString(err));
+      return 0;
+    }
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuKernelTime += (t1 - t0);
 
   t0 = wall_seconds_cuda_local();
   err = cudaMemcpy(pot, gNear.d_pot, vecBytes, cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setNearfieldLastError("cudaMemcpy pot device-to-host failed for %.3f GiB: %s",
+                          bytesToGiB(vecBytes), cudaGetErrorString(err));
+    return 0;
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuD2HTime += (t1 - t0);
   return 1;
@@ -2379,7 +3952,9 @@ int gpuM2LApply(ssystem *sys) {
   cudaError_t err;
   int blockSize;
 
+  setM2LLastError("not attempted");
   if (sys == NULL || sys->nM2LPairsFlat <= 0) {
+    setM2LLastError("invalid input or empty M2L pair list");
     return 0;
   }
 
@@ -2402,51 +3977,71 @@ int gpuM2LApply(ssystem *sys) {
   err = cudaMemcpy(gM2L.d_momPot, gM2L.h_momPot,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMemcpy momPot host-to-device failed for %.3f GiB: %s",
+                    bytesToGiB((size_t)gM2L.totalCubeCoeff * sizeof(double)),
+                    cudaGetErrorString(err));
+    return 0;
+  }
   err = cudaMemcpy(gM2L.d_momDpdn, gM2L.h_momDpdn,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyHostToDevice);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) {
+    setM2LLastError("cudaMemcpy momDpdn host-to-device failed for %.3f GiB: %s",
+                    bytesToGiB((size_t)gM2L.totalCubeCoeff * sizeof(double)),
+                    cudaGetErrorString(err));
+    return 0;
+  }
   err = cudaMemset(gM2L.d_lec1, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec1 failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemset(gM2L.d_lec2, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec2 failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemset(gM2L.d_lec3, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec3 failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemset(gM2L.d_lec4, 0, (size_t)gM2L.totalCubeCoeff * sizeof(double));
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemset lec4 failed: %s", cudaGetErrorString(err)); return 0; }
 
-  blockSize = 128;
-  m2lGroupedKernel<<<gM2L.nGroups, blockSize>>>(
-      gM2L.nGroups, gM2L.maxIdxDim,
-      gM2L.d_groupStart, gM2L.d_groupCount, gM2L.d_groupDst, gM2L.d_groupOrder,
-      gM2L.d_pairSrc, gM2L.d_pairCoeffOffset,
-      gM2L.d_cubeCoeffOffset,
-      gM2L.d_idxI1, gM2L.d_idxI2, gM2L.d_idxI3, gM2L.d_idx3Flat, gM2L.d_sgn3,
-      gM2L.d_g0, gM2L.d_gk, epsilon,
-      gM2L.d_momPot, gM2L.d_momDpdn,
-      gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return 0;
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return 0;
+  if (gM2L.streaming) {
+    if (!applyM2LStreamingChunks(sys)) return 0;
+  } else {
+    blockSize = 128;
+    m2lGroupedKernel<<<gM2L.nGroups, blockSize>>>(
+        gM2L.nGroups, gM2L.maxIdxDim,
+        gM2L.d_groupStart, gM2L.d_groupCount, gM2L.d_groupDst, gM2L.d_groupOrder,
+        gM2L.d_pairSrc, gM2L.d_pairCoeffOffset,
+        gM2L.d_cubeCoeffOffset,
+        gM2L.d_idxI1, gM2L.d_idxI2, gM2L.d_idxI3, gM2L.d_idx3Flat, gM2L.d_sgn3,
+        gM2L.d_g0, gM2L.d_gk, epsilon,
+        gM2L.d_momPot, gM2L.d_momDpdn,
+        gM2L.d_lec1, gM2L.d_lec2, gM2L.d_lec3, gM2L.d_lec4);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      setM2LLastError("m2lGroupedKernel launch failed: %s", cudaGetErrorString(err));
+      return 0;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      setM2LLastError("m2lGroupedKernel failed: %s", cudaGetErrorString(err));
+      return 0;
+    }
+  }
 
   err = cudaMemcpy(gM2L.h_lec1, gM2L.d_lec1,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec1 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemcpy(gM2L.h_lec2, gM2L.d_lec2,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec2 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemcpy(gM2L.h_lec3, gM2L.d_lec3,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec3 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
   err = cudaMemcpy(gM2L.h_lec4, gM2L.d_lec4,
                    (size_t)gM2L.totalCubeCoeff * sizeof(double),
                    cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return 0;
+  if (err != cudaSuccess) { setM2LLastError("cudaMemcpy lec4 device-to-host failed: %s", cudaGetErrorString(err)); return 0; }
 
   for (cubeIdx = 0; cubeIdx < sys->nFmmCubesFlat; cubeIdx++) {
     cube *cb = sys->fmmCubeByIdx[cubeIdx];
@@ -2612,6 +4207,164 @@ int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
   return 1;
 }
 
+/*
+ * Batched preconditioner block build.
+ *
+ * gpuBuildPrecondDisjointBlock below does one cube at a time: it takes a global
+ * mutex, uploads that cube's panel geometry and index lists, launches, calls
+ * cudaDeviceSynchronize, and copies four result arrays back -- about ten
+ * synchronous CUDA calls per block. With 11,257 blocks on 7A6A that is ~112k
+ * synchronous calls, and the mutex serialises them across all 72 setup threads,
+ * which is why the GPU path beat the pure-CPU one by only 1.43x (1.296 s
+ * against 1.851 s) on work a GPU should finish in milliseconds.
+ *
+ * The pairs themselves are not new work either: every pair inside a level
+ * depth-1 cube is also a nearfield pair, since children of one parent are
+ * always neighbours, and the nearfield computes the same panelIA0 with the same
+ * four KER components. This entry point shares that machinery -- the same
+ * nearfieldDisjointQ1BuildKernel, one resident copy of the panel geometry
+ * indexed by pnl->idx, and chunking sized like the nearfield's -- so the whole
+ * preconditioner is built in a handful of launches instead of one per block.
+ *
+ * Geometry is cached across calls and rebuilt only when the system changes.
+ */
+namespace {
+struct PrecondBatchCache {
+  const ssystem *sys;
+  int nPnls;
+  NearPanelGeom *d_geom;
+  int *d_src;
+  int *d_dst;
+  double *d_k[4];
+  long long capacity;
+};
+PrecondBatchCache gPcBatch = {NULL, 0, NULL, NULL, NULL, {NULL, NULL, NULL, NULL}, 0};
+
+void freePrecondBatch() {
+  int i;
+  cudaFree(gPcBatch.d_geom);
+  cudaFree(gPcBatch.d_src);
+  cudaFree(gPcBatch.d_dst);
+  for (i = 0; i < 4; i++) cudaFree(gPcBatch.d_k[i]);
+  gPcBatch.d_geom = NULL;
+  gPcBatch.d_src = NULL;
+  gPcBatch.d_dst = NULL;
+  for (i = 0; i < 4; i++) gPcBatch.d_k[i] = NULL;
+  gPcBatch.sys = NULL;
+  gPcBatch.nPnls = 0;
+  gPcBatch.capacity = 0;
+}
+
+long long precondBatchCapacity() {
+  const char *env = getenv("FABIPB_GPU_PRECOND_CHUNK_MIB");
+  double mib = 512.0;
+  long long perPair = (long long)(2 * sizeof(int) + 4 * sizeof(double));
+  long long cap;
+
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end != env && *end == '\0' && v > 0.0) mib = v;
+  }
+  cap = (long long)((mib * 1024.0 * 1024.0) / (double)perPair);
+  if (cap < 65536) cap = 65536;
+  return cap;
+}
+}  // namespace
+
+extern "C"
+int gpuBuildPrecondPairsBatched(struct ssystem *sys,
+                                const int *pairSrc, const int *pairDst,
+                                long long nPairs,
+                                double *k0, double *k1, double *k2, double *k3) {
+  std::lock_guard<std::mutex> lock(gPrecondMutex);
+  long long done;
+  long long cap;
+
+  if (sys == NULL || pairSrc == NULL || pairDst == NULL || nPairs <= 0) return 0;
+  if (k0 == NULL || k1 == NULL || k2 == NULL || k3 == NULL) return 0;
+  if (!gpuBackendAvailable()) return 0;
+
+  cap = precondBatchCapacity();
+  if (cap > nPairs) cap = nPairs;
+
+  if (gPcBatch.sys != sys || gPcBatch.nPnls != sys->nPnls || gPcBatch.capacity < cap) {
+    panel *pnl;
+    std::vector<NearPanelGeom> geom;
+    int i;
+
+    freePrecondBatch();
+    geom.resize((size_t)sys->nPnls);
+    /* Indexed by pnl->idx so no reverse lookup is needed anywhere. */
+    for (pnl = sys->pnlLst; pnl != NULL; pnl = pnl->nextC) {
+      NearPanelGeom *g = &geom[(size_t)pnl->idx];
+      int a, b;
+      for (a = 0; a < 3; a++) {
+        for (b = 0; b < 3; b++) g->vtx[a][b] = pnl->vtx[a][b];
+        g->a0[a] = pnl->a[0][a];
+        g->a1[a] = pnl->a[1][a];
+        g->a2[a] = pnl->a[2][a];
+        g->normal[a] = pnl->normal[a];
+      }
+      g->area = pnl->area;
+    }
+    if (cudaMalloc((void **)&gPcBatch.d_geom,
+                   (size_t)sys->nPnls * sizeof(NearPanelGeom)) != cudaSuccess ||
+        cudaMalloc((void **)&gPcBatch.d_src, (size_t)cap * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void **)&gPcBatch.d_dst, (size_t)cap * sizeof(int)) != cudaSuccess) {
+      freePrecondBatch();
+      return 0;
+    }
+    for (i = 0; i < 4; i++) {
+      if (cudaMalloc((void **)&gPcBatch.d_k[i], (size_t)cap * sizeof(double)) != cudaSuccess) {
+        freePrecondBatch();
+        return 0;
+      }
+    }
+    if (cudaMemcpy(gPcBatch.d_geom, &geom[0],
+                   (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      freePrecondBatch();
+      return 0;
+    }
+    gPcBatch.sys = sys;
+    gPcBatch.nPnls = sys->nPnls;
+    gPcBatch.capacity = cap;
+  }
+
+  if (cudaMemcpyToSymbol(c_nearKappa, &kappa, sizeof(double)) != cudaSuccess) return 0;
+  if (cudaMemcpyToSymbol(c_nearEpsilon, &epsilon, sizeof(double)) != cudaSuccess) return 0;
+
+  for (done = 0; done < nPairs; ) {
+    long long n = nPairs - done;
+    int blockSize = 256, gridSize;
+
+    if (n > gPcBatch.capacity) n = gPcBatch.capacity;
+    if (cudaMemcpy(gPcBatch.d_src, pairSrc + done, (size_t)n * sizeof(int),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(gPcBatch.d_dst, pairDst + done, (size_t)n * sizeof(int),
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+
+    gridSize = (int)((n + blockSize - 1) / blockSize);
+    nearfieldDisjointQ1BuildKernel<<<gridSize, blockSize>>>(
+        n, gPcBatch.d_geom, gPcBatch.d_src, gPcBatch.d_dst,
+        gPcBatch.d_k[0], gPcBatch.d_k[1], gPcBatch.d_k[2], gPcBatch.d_k[3]);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+
+    if (cudaMemcpy(k0 + done, gPcBatch.d_k[0], (size_t)n * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    if (cudaMemcpy(k1 + done, gPcBatch.d_k[1], (size_t)n * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    if (cudaMemcpy(k2 + done, gPcBatch.d_k[2], (size_t)n * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    if (cudaMemcpy(k3 + done, gPcBatch.d_k[3], (size_t)n * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    done += n;
+  }
+  return 1;
+}
+
 int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
                                  const int *dstLocal, const int *srcLocal,
                                  int nPairs, double *block) {
@@ -2695,6 +4448,1049 @@ int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
     block[dst * msize + src + hm] = -gPrecond.h_k0[i];
     block[(dst + hm) * msize + src] = -gPrecond.h_k3[i];
     block[(dst + hm) * msize + src + hm] = -gPrecond.h_k2[i];
+  }
+  return 1;
+}
+
+/* ===================================================================
+ * GPU charge-tree energy evaluator
+ *
+ * The post-solve energy walks the charge tree once per panel: accept a
+ * cluster if it is far enough (eRad < theta*dist) and evaluate its multipole
+ * expansion, otherwise descend, and sum charges directly in the leaves. On the
+ * virus that was the single largest stage of the solve (445 s of ~983 s) and
+ * the largest piece still on the CPU.
+ *
+ * The tree is flattened once into contiguous arrays. The traversal itself uses
+ * an explicit stack rather than recursion.
+ *
+ * One WARP handles one panel, not one thread. The screened-derivative
+ * recurrence needs a scratch tensor per target -- about 2 KB at the order 4
+ * that most accepted nodes use -- which is far too much to give every thread,
+ * but fits comfortably in shared memory once per warp. The warp also splits
+ * the moment sum and the leaf charge sum across its lanes.
+ * =================================================================== */
+
+#define CTE_MAX_STACK 64
+
+/*
+ * Row geometry of the Cartesian derivative tensor, from the nMom table already
+ * on the device. nMom[m] counts rows 0..m, so row m starts at nMom[m-1] and
+ * holds nMom[m]-nMom[m-1] = (m+1)(m+2)/2 entries. Used to convert the global
+ * indices in idx3 into offsets within a single row.
+ */
+#define CTE_ROWOFF(nm, m) (((m) <= 0) ? 0 : (nm)[(m) - 1])
+#define CTE_ROWLEN(nm, m) ((nm)[m] - CTE_ROWOFF(nm, m))
+#define CTE_WARP 32
+
+struct ChargeTreeGpu {
+  const ssystem *sys;
+  int nNodes;
+  int nCharges;
+  int nPanels;
+  int derivOrderMax;        /* largest order+1 used by any accepted node */
+  int idxDim;               /* idx3 flattened as idxDim^3 */
+  int nMomMax;              /* nMom[derivOrderMax] */
+  /* node arrays */
+  double *d_nodeCtr;        /* 3 per node */
+  double *d_nodeRad;
+  int *d_nodeLevel;
+  int *d_nodeKidStart;
+  int *d_nodeKidCount;
+  int *d_nodeChgStart;
+  int *d_nodeChgCount;
+  int *d_nodeMomOff;
+  int *d_nodeOrder;         /* rhsChargeExpansionOrder for this node's level */
+  int *d_kidIdx;
+  int *d_chgIdx;
+  double *d_moments;
+  /* charges and panels */
+  double *d_pos;
+  double *d_chr;
+  NearPanelGeom *d_panels;
+  int *d_panelIdx;
+  /* small tables */
+  int *d_idx3;
+  int *d_sgn3;
+  int *d_nMom;
+  /* results */
+  double *d_out;            /* 2 per panel: y0, y1 */
+};
+
+static ChargeTreeGpu gCTE = {};
+
+static void freeChargeTreeGpu(void) {
+  cudaFree(gCTE.d_nodeCtr);      cudaFree(gCTE.d_nodeRad);
+  cudaFree(gCTE.d_nodeLevel);    cudaFree(gCTE.d_nodeKidStart);
+  cudaFree(gCTE.d_nodeKidCount); cudaFree(gCTE.d_nodeChgStart);
+  cudaFree(gCTE.d_nodeChgCount); cudaFree(gCTE.d_nodeMomOff);
+  cudaFree(gCTE.d_nodeOrder);    cudaFree(gCTE.d_kidIdx);
+  cudaFree(gCTE.d_chgIdx);       cudaFree(gCTE.d_moments);
+  cudaFree(gCTE.d_pos);          cudaFree(gCTE.d_chr);
+  cudaFree(gCTE.d_panels);       cudaFree(gCTE.d_panelIdx);
+  cudaFree(gCTE.d_idx3);
+  cudaFree(gCTE.d_sgn3);         cudaFree(gCTE.d_nMom);
+  cudaFree(gCTE.d_out);
+  memset(&gCTE, 0, sizeof(gCTE));
+}
+
+extern "C" void gpuReleaseChargeTreeCache(void) {
+  freeChargeTreeGpu();
+}
+
+/* Depth-first flatten of the charge tree into contiguous arrays. */
+static int buildChargeTreeGpu(const ssystem *sys) {
+  std::vector<const cube *> order;
+  std::vector<int> nodeOf;           /* scratch: index of each visited node */
+  std::vector<double> ctr, rad, mom;
+  std::vector<int> lev, kidStart, kidCount, chgStart, chgCount, momOff, nodeOrd;
+  std::vector<int> kidIdx, chgIdx;
+  std::vector<const cube *> stack;
+  size_t i;
+  int derivMax = 0;
+
+  if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) {
+    setNearfieldLastError("charge tree not built");
+    return 0;
+  }
+
+  /* First pass: assign an index to every node, breadth-first from the root. */
+  order.push_back(sys->chgCubeList[0]);
+  for (i = 0; i < order.size(); i++) {
+    const cube *cb = order[i];
+    int k;
+    for (k = 0; k < cb->nKids; k++) {
+      order.push_back(cb->kids[k]);
+    }
+  }
+
+  /* Map each node pointer to its index so kid lists can be flattened. */
+  {
+    std::vector<std::pair<const cube *, int> > lookup;
+    lookup.reserve(order.size());
+    for (i = 0; i < order.size(); i++) lookup.push_back(std::make_pair(order[i], (int)i));
+    std::sort(lookup.begin(), lookup.end());
+
+    for (i = 0; i < order.size(); i++) {
+      const cube *cb = order[i];
+      int ordHere = rhsChargeExpansionOrder((ssystem *)sys, cb->level);
+      int nMomHere = sys->nMom[ordHere];
+      int k;
+
+      ctr.push_back(cb->x[0]); ctr.push_back(cb->x[1]); ctr.push_back(cb->x[2]);
+      rad.push_back(cb->eRad);
+      lev.push_back(cb->level);
+      nodeOrd.push_back(ordHere);
+      if (ordHere + 1 > derivMax) derivMax = ordHere + 1;
+
+      kidStart.push_back((int)kidIdx.size());
+      kidCount.push_back(cb->nKids);
+      for (k = 0; k < cb->nKids; k++) {
+        std::pair<const cube *, int> probe(cb->kids[k], 0);
+        std::vector<std::pair<const cube *, int> >::iterator it =
+            std::lower_bound(lookup.begin(), lookup.end(), probe);
+        if (it == lookup.end() || it->first != cb->kids[k]) {
+          setNearfieldLastError("charge tree flatten: child not found");
+          return 0;
+        }
+        kidIdx.push_back(it->second);
+      }
+
+      chgStart.push_back((int)chgIdx.size());
+      if (cb->level == sys->chgDepth && cb->chgIdx != NULL) {
+        chgCount.push_back(cb->nChgs);
+        for (k = 0; k < cb->nChgs; k++) chgIdx.push_back(cb->chgIdx[k]);
+      } else {
+        chgCount.push_back(0);
+      }
+
+      momOff.push_back((int)mom.size());
+      if (cb->mom_chr != NULL) {
+        for (k = 0; k < nMomHere; k++) mom.push_back(cb->mom_chr[k]);
+      } else {
+        for (k = 0; k < nMomHere; k++) mom.push_back(0.0);
+      }
+    }
+  }
+
+  gCTE.nNodes = (int)order.size();
+  gCTE.nCharges = sys->nChar;
+  gCTE.nPanels = sys->nPnls;
+  gCTE.derivOrderMax = derivMax;
+  gCTE.nMomMax = sys->nMom[derivMax];
+  /* idx3 was allocated by mkIndex(maxOrder+1), so its valid extent is
+   * maxOrder+2 per dimension. The kernel reads it at i1+1 with
+   * i1+i2+i3 <= order <= maxOrder, so maxOrder+1 is the largest index needed
+   * and that extent is exactly right. Deriving the dimension from derivMax
+   * instead would read past the table. */
+  gCTE.idxDim = sys->maxOrder + 2;
+
+  /* Flatten idx3 and sgn3 for the device. */
+  {
+    int D = gCTE.idxDim;
+    std::vector<int> fidx((size_t)D * D * D, 0);
+    std::vector<int> fsgn((size_t)gCTE.nMomMax, 0);
+    int a, b, c;
+    for (a = 0; a < D; a++)
+      for (b = 0; b < D; b++)
+        for (c = 0; c < D; c++)
+          if (a + b + c <= sys->maxOrder + 1) fidx[((size_t)a * D + b) * D + c] = idx3[a][b][c];
+    for (a = 0; a < gCTE.nMomMax; a++) fsgn[a] = sgn3[a];
+
+    std::vector<int> fnmom((size_t)derivMax + 2, 0);
+    for (a = 0; a <= derivMax + 1; a++) fnmom[a] = sys->nMom[a];
+
+    if (!cudaMallocNearfield((void **)&gCTE.d_idx3, fidx.size() * sizeof(int), "cte idx3") ||
+        !cudaMallocNearfield((void **)&gCTE.d_sgn3, fsgn.size() * sizeof(int), "cte sgn3") ||
+        !cudaMallocNearfield((void **)&gCTE.d_nMom, fnmom.size() * sizeof(int), "cte nMom") ||
+        !cudaMemcpyNearfield(gCTE.d_idx3, &fidx[0], fidx.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte idx3") ||
+        !cudaMemcpyNearfield(gCTE.d_sgn3, &fsgn[0], fsgn.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte sgn3") ||
+        !cudaMemcpyNearfield(gCTE.d_nMom, &fnmom[0], fnmom.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte nMom")) return 0;
+  }
+
+#define CTE_UP(dst, vec, type, tag)                                              \
+  do {                                                                           \
+    if (!cudaMallocNearfield((void **)&(dst), (vec).size() * sizeof(type), tag) ||\
+        !cudaMemcpyNearfield((dst), &(vec)[0], (vec).size() * sizeof(type),       \
+                             cudaMemcpyHostToDevice, tag)) return 0;              \
+  } while (0)
+
+  CTE_UP(gCTE.d_nodeCtr, ctr, double, "cte ctr");
+  CTE_UP(gCTE.d_nodeRad, rad, double, "cte rad");
+  CTE_UP(gCTE.d_nodeLevel, lev, int, "cte lev");
+  CTE_UP(gCTE.d_nodeKidStart, kidStart, int, "cte kidStart");
+  CTE_UP(gCTE.d_nodeKidCount, kidCount, int, "cte kidCount");
+  CTE_UP(gCTE.d_nodeChgStart, chgStart, int, "cte chgStart");
+  CTE_UP(gCTE.d_nodeChgCount, chgCount, int, "cte chgCount");
+  CTE_UP(gCTE.d_nodeMomOff, momOff, int, "cte momOff");
+  CTE_UP(gCTE.d_nodeOrder, nodeOrd, int, "cte order");
+  CTE_UP(gCTE.d_moments, mom, double, "cte moments");
+  if (!kidIdx.empty()) CTE_UP(gCTE.d_kidIdx, kidIdx, int, "cte kidIdx");
+  if (!chgIdx.empty()) CTE_UP(gCTE.d_chgIdx, chgIdx, int, "cte chgIdx");
+#undef CTE_UP
+
+  /* charges */
+  if (!cudaMallocNearfield((void **)&gCTE.d_pos, (size_t)3 * sys->nChar * sizeof(double), "cte pos") ||
+      !cudaMallocNearfield((void **)&gCTE.d_chr, (size_t)sys->nChar * sizeof(double), "cte chr") ||
+      !cudaMemcpyNearfield(gCTE.d_pos, sys->pos, (size_t)3 * sys->nChar * sizeof(double),
+                           cudaMemcpyHostToDevice, "cte pos") ||
+      !cudaMemcpyNearfield(gCTE.d_chr, sys->chr, (size_t)sys->nChar * sizeof(double),
+                           cudaMemcpyHostToDevice, "cte chr")) return 0;
+
+  /* panel geometry: same layout the nearfield already uses */
+  {
+    std::vector<NearPanelGeom> geom((size_t)sys->nPnls);
+    std::vector<int> panelIdx((size_t)sys->nPnls);
+    panel *pnl;
+    int idx, k;
+    for (idx = 0, pnl = sys->pnlLst; pnl != NULL && idx < sys->nPnls; pnl = pnl->nextC, idx++) {
+      for (k = 0; k < 3; k++) {
+        geom[(size_t)idx].vtx[0][k] = pnl->vtx[0][k];
+        geom[(size_t)idx].a0[k] = pnl->a[0][k];
+        geom[(size_t)idx].a2[k] = pnl->a[2][k];
+        geom[(size_t)idx].normal[k] = pnl->normal[k];
+      }
+      geom[(size_t)idx].area = pnl->area;
+      panelIdx[(size_t)idx] = pnl->idx;
+    }
+    if (!cudaMallocNearfield((void **)&gCTE.d_panels,
+                             (size_t)sys->nPnls * sizeof(NearPanelGeom), "cte panels") ||
+        !cudaMemcpyNearfield(gCTE.d_panels, &geom[0],
+                             (size_t)sys->nPnls * sizeof(NearPanelGeom),
+                             cudaMemcpyHostToDevice, "cte panels") ||
+        !cudaMallocNearfield((void **)&gCTE.d_panelIdx,
+                             (size_t)sys->nPnls * sizeof(int), "cte panelIdx") ||
+        !cudaMemcpyNearfield(gCTE.d_panelIdx, &panelIdx[0],
+                             (size_t)sys->nPnls * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte panelIdx")) return 0;
+  }
+
+  if (!cudaMallocNearfield((void **)&gCTE.d_out,
+                           (size_t)2 * sys->nPnls * sizeof(double), "cte out")) return 0;
+
+  gCTE.sys = sys;
+  if (sys->benchmarkMode > 0) {
+    printf("GPU charge-tree energy: nodes=%d charges=%d panels=%d derivMax=%d "
+           "moments=%.3f GiB\n",
+           gCTE.nNodes, gCTE.nCharges, gCTE.nPanels, gCTE.derivOrderMax,
+           bytesToGiB(mom.size() * sizeof(double)));
+  }
+  return 1;
+}
+
+/* Radial derivatives of G0 and Gk; port of kernelDG0DGk() in kernel.c. */
+__device__ __forceinline__ void cteRadialDerivs(double r, int p, double kap,
+                                                double fourPiIv,
+                                                double *G0, double *Gk) {
+  double kappa2 = kap * kap;
+  double rexp = exp(-kap * r);
+  double r1 = 1.0 / r;
+  double r2 = r1 * r1;
+  double nr2 = -r2;
+  int k;
+
+  G0[0] = r1 * fourPiIv;
+  Gk[0] = rexp * G0[0];
+  G0[1] = nr2 * G0[0];
+  Gk[1] = -Gk[0] * (r2 + kap * r1);
+  for (k = 1; k < p; k++) {
+    G0[k + 1] = (2 * k + 1) * nr2 * G0[k];
+    Gk[k + 1] = r2 * (kappa2 * Gk[k - 1] - (2 * k + 1) * Gk[k]);
+  }
+}
+
+/*
+ * Cartesian derivative tensors of G0/Gk about a cluster centre; port of
+ * setupScreenedDerivsLocal() in treecode.c. Lane 0 of the warp drives the
+ * recurrence: each order p is built from p+1, so the levels are sequential,
+ * and the per-level work is far too small to be worth splitting across lanes.
+ */
+__device__ void cteSetupDerivsStrided(int order, const double *x,
+                               double kap, double fourPiIv,
+                               const int *fidx3, int D,
+                               double *gv0, double *gvk,
+                               double **dg0, double **dgk, long long S) {
+  int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2;
+  double r = sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+
+  cteRadialDerivs(r, order, kap, fourPiIv, gv0, gvk);
+  for (p = 0; p <= order; p++) { dg0[p][(long long)(0) * S] = gv0[p]; dgk[p][(long long)(0) * S] = gvk[p]; }
+  for (p = 0; p < order; p++) {
+    p1 = p + 1;
+    dg0[p][(long long)(1) * S] = dg0[p1][(long long)(0) * S] * x[2];  dg0[p][(long long)(2) * S] = dg0[p1][(long long)(0) * S] * x[1];  dg0[p][(long long)(3) * S] = dg0[p1][(long long)(0) * S] * x[0];
+    dgk[p][(long long)(1) * S] = dgk[p1][(long long)(0) * S] * x[2];  dgk[p][(long long)(2) * S] = dgk[p1][(long long)(0) * S] * x[1];  dgk[p][(long long)(3) * S] = dgk[p1][(long long)(0) * S] * x[0];
+  }
+#define CTE_IDX(a,b,c) fidx3[(((a) * D) + (b)) * D + (c)]
+  for (iRow = 2; iRow <= order; iRow++) {
+    for (p = 0; p <= order - iRow; p++) {
+      p1 = p + 1;
+      idx = CTE_IDX(0, 0, iRow);
+      iRow1 = iRow - 1;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      idx2 = CTE_IDX(0, 0, iRow - 2);
+      dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[2] + dg0[p1][(long long)(idx2) * S] * iRow1;
+      dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[2] + dgk[p1][(long long)(idx2) * S] * iRow1;
+      idx++;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[1];
+      dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[1];
+      idx++;
+      for (i2 = 2; i2 <= iRow; i2++, idx++) {
+        i3 = iRow - i2;
+        idx1 = CTE_IDX(0, i2 - 1, i3);
+        idx2 = CTE_IDX(0, i2 - 2, i3);
+        dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[1] + dg0[p1][(long long)(idx2) * S] * (i2 - 1);
+        dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[1] + dgk[p1][(long long)(idx2) * S] * (i2 - 1);
+      }
+      for (i2 = 0; i2 <= iRow1; i2++, idx++) {
+        i3 = iRow1 - i2;
+        idx1 = CTE_IDX(0, i2, i3);
+        dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[0];
+        dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[0];
+      }
+      for (i1 = 2; i1 <= iRow; i1++) {
+        for (i2 = 0; i2 <= iRow - i1; i2++, idx++) {
+          i3 = iRow - i1 - i2;
+          idx1 = CTE_IDX(i1 - 1, i2, i3);
+          idx2 = CTE_IDX(i1 - 2, i2, i3);
+          dg0[p][(long long)(idx) * S] = dg0[p1][(long long)(idx1) * S] * x[0] + dg0[p1][(long long)(idx2) * S] * (i1 - 1);
+          dgk[p][(long long)(idx) * S] = dgk[p1][(long long)(idx1) * S] * x[0] + dgk[p1][(long long)(idx2) * S] * (i1 - 1);
+        }
+      }
+    }
+  }
+#undef CTE_IDX
+}
+
+/*
+ * One thread per panel, grid-stride.
+ *
+ * The first version gave a warp to each panel with the derivative scratch in
+ * shared memory. That was correct but 5.6x slower than 72 CPU threads: all 32
+ * lanes walked the same tree redundantly, lane 0 ran the derivative recurrence
+ * alone while the rest idled, and 43 KB of shared memory per block held
+ * occupancy to a single block per SM.
+ *
+ * Here each thread owns a panel and its own scratch slab in global memory. The
+ * slabs are interleaved -- entry i of thread t lives at [i * stride + t] -- so
+ * lanes touching the same tensor entry hit consecutive addresses. Concurrency
+ * is capped and panels are taken in a grid-stride loop, which bounds the
+ * scratch: the whole point is that it is proportional to the number of resident
+ * threads, not to the panel count.
+ *
+ * Storage is a rolling window, not the whole pyramid. The recurrence builds row
+ * iRow of level p from rows iRow-1 and iRow-2 of level p+1, and the loop already
+ * runs iRow outermost, so only two rows per level ever need to be live. Level 0
+ * is the only level the contraction reads, and term n of it needs rows n and
+ * n+1, so the contraction is fused into the row loop and level 0 needs no more
+ * storage than any other level.
+ *
+ * That takes the slab from sum_m nMom[m] = C(derivMax+4,4) down to
+ * 2*nMom[derivMax] per array -- 715 -> 440 doubles at derivMax=9. It matters
+ * because the kernel is footprint-bound: holding threads, arithmetic and
+ * coalescing fixed and varying only the footprint gave 248.6 MiB -> 37.17 s
+ * against 2.8 MiB -> 14.92 s on 7A6A, so roughly 2.5x is the ceiling for any
+ * footprint reduction (see docs/6co8_gpu_fabipb_milestone.md).
+ *
+ * Row m lives in slot m&1, so writing row iRow reuses the slot holding row
+ * iRow-2, which is dead by then. Levels are visited with p ascending, and level
+ * p reads only level p+1, so level p's overwrite of its own iRow-2 slot always
+ * happens after level p-1 has read it.
+ *
+ * Every arithmetic operation and its order are unchanged from the pyramid
+ * version -- only where the values are stored -- so the output is bit-identical.
+ */
+__global__ void chargeTreeEnergyKernel(
+    int nPanels, int derivMax, int idxDim, int chgDepth, int height,
+    double theta, double kap, double eps, double fourPiIv,
+    const NearPanelGeom *panels,
+    const double *nodeCtr, const double *nodeRad, const int *nodeLevel,
+    const int *nodeKidStart, const int *nodeKidCount,
+    const int *nodeChgStart, const int *nodeChgCount,
+    const int *nodeMomOff, const int *nodeOrder,
+    const int *kidIdx, const int *chgIdx, const double *moments,
+    const double *pos, const double *chr,
+    const int *fidx3, const int *sgn3d, const int *levOff,
+    const int *nMomT,
+    const int *panelOrigIdx, const double *sgm,
+    double *scratch, long long stride,
+    double *partial) {
+  const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
+  /* Base of each level's two-row window; slot m&1 holds row m. */
+  double *lev0[16];
+  double *levk[16];
+  int rowCap[16];            /* allocated row length at this level */
+  double gv0[18], gvk[18];
+  const long long halfOff = (long long)levOff[derivMax + 1];
+  extern __shared__ double blockSum[];
+  double threadSum = 0.0;
+  int p;
+  int panelIdx;
+
+  if (tid >= stride) return;
+  for (p = 0; p <= derivMax && p < 16; p++) {
+    lev0[p] = scratch + (long long)levOff[p] * stride + tid;
+    levk[p] = scratch + (halfOff + levOff[p]) * stride + tid;
+    /* Level p never holds a row longer than row(derivMax - p). */
+    rowCap[p] = CTE_ROWLEN(nMomT, derivMax - p);
+  }
+
+  for (panelIdx = (int)tid; panelIdx < nPanels; panelIdx += (int)nThreadsTotal) {
+    const NearPanelGeom *pn = &panels[panelIdx];
+    double qpt[3], nrm[3];
+    double y0 = 0.0, y1 = 0.0;
+    int stack[CTE_MAX_STACK];
+    int sp = 0;
+    int k;
+
+    for (k = 0; k < 3; k++) {
+      qpt[k] = pn->vtx[0][k] + 0.5 * (pn->a2[k] + 0.5 * pn->a0[k]);
+      nrm[k] = pn->normal[k];
+    }
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+      int node = stack[--sp];
+      double r[3], dist;
+      for (k = 0; k < 3; k++) r[k] = qpt[k] - nodeCtr[3 * node + k];
+      dist = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+
+      if (nodeRad[node] < theta * dist && nodeLevel[node] >= height) {
+        int ordHere = nodeOrder[node];
+        const double *mom = &moments[nodeMomOff[node]];
+        int i, i1, i2, n;
+
+        int order = ordHere + 1;
+        int iRow;
+        double rr = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+
+#define CTE_IDX(a,b,c) fidx3[(((a) * idxDim) + (b)) * idxDim + (c)]
+/* Address of local entry `l` of row `m` at level `q`, in each half. */
+#define CTE_A0(q,m,l) (lev0[q] + (long long)(((m) & 1) * rowCap[q] + (l)) * stride)
+#define CTE_AK(q,m,l) (levk[q] + (long long)(((m) & 1) * rowCap[q] + (l)) * stride)
+
+        cteRadialDerivs(rr, order, kap, fourPiIv, gv0, gvk);
+
+        /* Row 0 of every level is the radial derivative itself. */
+        for (p = 0; p <= order; p++) {
+          *CTE_A0(p, 0, 0) = gv0[p];
+          *CTE_AK(p, 0, 0) = gvk[p];
+        }
+        /* Row 1: three entries, each level p from level p+1's single row-0. */
+        for (p = 0; p < order; p++) {
+          double a0 = *CTE_A0(p + 1, 0, 0), ak = *CTE_AK(p + 1, 0, 0);
+          *CTE_A0(p, 1, 0) = a0 * r[2];  *CTE_AK(p, 1, 0) = ak * r[2];
+          *CTE_A0(p, 1, 1) = a0 * r[1];  *CTE_AK(p, 1, 1) = ak * r[1];
+          *CTE_A0(p, 1, 2) = a0 * r[0];  *CTE_AK(p, 1, 2) = ak * r[0];
+        }
+
+        /*
+         * Rows 2..order, then the contraction of term n = iRow-1, which needs
+         * exactly level 0's rows n and n+1 -- both live at this point. Doing it
+         * here keeps the n ordering of the accumulation identical to the
+         * unfused version, so y0/y1 come out bit-identical.
+         */
+        for (iRow = 1; iRow <= order; iRow++) {
+          if (iRow >= 2) {
+            for (p = 0; p <= order - iRow; p++) {
+              int p1 = p + 1;
+              int off  = CTE_ROWOFF(nMomT, iRow);
+              int off1 = CTE_ROWOFF(nMomT, iRow - 1);
+              int off2 = CTE_ROWOFF(nMomT, iRow - 2);
+              int iRow1 = iRow - 1;
+              int l = CTE_IDX(0, 0, iRow) - off;
+              int l1 = CTE_IDX(0, 0, iRow1) - off1;
+              int l2 = CTE_IDX(0, 0, iRow - 2) - off2;
+
+              *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[2]
+                                  + *CTE_A0(p1, iRow - 2, l2) * iRow1;
+              *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[2]
+                                  + *CTE_AK(p1, iRow - 2, l2) * iRow1;
+              l++;
+              l1 = CTE_IDX(0, 0, iRow1) - off1;
+              *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[1];
+              *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[1];
+              l++;
+              for (i2 = 2; i2 <= iRow; i2++, l++) {
+                int i3 = iRow - i2;
+                l1 = CTE_IDX(0, i2 - 1, i3) - off1;
+                l2 = CTE_IDX(0, i2 - 2, i3) - off2;
+                *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[1]
+                                    + *CTE_A0(p1, iRow - 2, l2) * (i2 - 1);
+                *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[1]
+                                    + *CTE_AK(p1, iRow - 2, l2) * (i2 - 1);
+              }
+              for (i2 = 0; i2 <= iRow1; i2++, l++) {
+                int i3 = iRow1 - i2;
+                l1 = CTE_IDX(0, i2, i3) - off1;
+                *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[0];
+                *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[0];
+              }
+              for (i1 = 2; i1 <= iRow; i1++) {
+                for (i2 = 0; i2 <= iRow - i1; i2++, l++) {
+                  int i3 = iRow - i1 - i2;
+                  l1 = CTE_IDX(i1 - 1, i2, i3) - off1;
+                  l2 = CTE_IDX(i1 - 2, i2, i3) - off2;
+                  *CTE_A0(p, iRow, l) = *CTE_A0(p1, iRow1, l1) * r[0]
+                                      + *CTE_A0(p1, iRow - 2, l2) * (i1 - 1);
+                  *CTE_AK(p, iRow, l) = *CTE_AK(p1, iRow1, l1) * r[0]
+                                      + *CTE_AK(p1, iRow - 2, l2) * (i1 - 1);
+                }
+              }
+            }
+          }
+
+          n = iRow - 1;
+          if (n <= ordHere) {
+            int offN  = CTE_ROWOFF(nMomT, n);
+            int offN1 = CTE_ROWOFF(nMomT, n + 1);
+            i = offN;
+            for (i1 = 0; i1 <= n; i1++) {
+              for (i2 = 0; i2 <= n - i1; i2++, i++) {
+                int i3 = n - i1 - i2;
+                int lA = CTE_IDX(i1 + 1, i2, i3) - offN1;
+                int lB = CTE_IDX(i1, i2 + 1, i3) - offN1;
+                int lC = CTE_IDX(i1, i2, i3 + 1) - offN1;
+                int l  = i - offN;
+                double dnG0, dnGk;
+
+                dnG0 = nrm[0] * *CTE_A0(0, n + 1, lA)
+                     + nrm[1] * *CTE_A0(0, n + 1, lB)
+                     + nrm[2] * *CTE_A0(0, n + 1, lC);
+                dnGk = nrm[0] * *CTE_AK(0, n + 1, lA)
+                     + nrm[1] * *CTE_AK(0, n + 1, lB)
+                     + nrm[2] * *CTE_AK(0, n + 1, lC);
+                y0 += sgn3d[i] * mom[i] * (*CTE_A0(0, n, l) - *CTE_AK(0, n, l));
+                y1 += sgn3d[i] * mom[i] * (eps * dnGk - dnG0);
+              }
+            }
+          }
+        }
+#undef CTE_A0
+#undef CTE_AK
+#undef CTE_IDX
+        continue;
+      }
+
+      if (nodeLevel[node] == chgDepth) {
+        int start = nodeChgStart[node];
+        int cnt = nodeChgCount[node];
+        int i;
+        for (i = 0; i < cnt; i++) {
+          int j = chgIdx[start + i];
+          double x[3], r2, rn, G0, Gk, coef, ip, dG0dn, dGkdn;
+          for (k = 0; k < 3; k++) x[k] = qpt[k] - pos[3 * j + k];
+          r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+          rn = sqrt(r2);
+          G0 = fourPiIv / rn;
+          Gk = exp(-kap * rn) * G0;
+          coef = (kap * rn + 1.0) * exp(-kap * rn);
+          ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
+          dG0dn = -ip * G0 / r2;
+          dGkdn = coef * dG0dn;
+          y0 += chr[j] * (G0 - Gk);
+          y1 += chr[j] * (eps * dGkdn - dG0dn);
+        }
+        continue;
+      }
+
+      {
+        /* Push children in reverse so they pop in ascending order, matching the
+         * order the CPU recursion visits them. Without this the subtrees are
+         * summed back-to-front and the result differs at roundoff (4.2e-12
+         * measured on the virus RHS) for no reason. */
+        int ks = nodeKidStart[node];
+        int kc = nodeKidCount[node];
+        int i;
+        for (i = kc - 1; i >= 0 && sp < CTE_MAX_STACK; i--) stack[sp++] = kidIdx[ks + i];
+      }
+    }
+
+    {
+      int idx = panelOrigIdx[panelIdx];
+      /* qOrd==1: weight 0.5 then the 2*area factor, so net = area. */
+      threadSum += (y0 * pn->area) * sgm[idx + nPanels] +
+                   (y1 * pn->area) * sgm[idx];
+    }
+  }
+  blockSum[threadIdx.x] = threadSum;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      blockSum[threadIdx.x] += blockSum[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    partial[blockIdx.x] = blockSum[0];
+  }
+}
+
+extern "C" double energyTreeTheta(void);
+
+int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
+  int blockSize = 128, gridSize;
+  long long stride, slabDoubles;
+  size_t scratchBytes;
+  cudaError_t err;
+  std::vector<double> hostPartial;
+  std::vector<int> levOff;
+  double total = 0.0;
+  int p, i;
+  static double *d_scratch = NULL;
+  static int *d_levOff = NULL;
+  static double *d_sgm = NULL;
+  static size_t d_sgmBytes = 0;
+  static double *d_partial = NULL;
+  static int d_partialCount = 0;
+  static long long scratchStride = 0;
+  double tBuild0, tBuild1, tScratch0, tScratch1, tUpload0, tUpload1;
+  double tKernel0, tKernel1, tCopy0, tCopy1, tReduce0, tReduce1;
+  int rebuiltTree = 0;
+
+  if (sys == NULL || sgm == NULL || pot == NULL) return 0;
+  if (!gpuBackendAvailable()) return 0;
+  if (sys->maxQuadOrder != 1) return 0;   /* kernel assumes the 1-point rule */
+  if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) return 0;
+
+  tBuild0 = wall_seconds_cuda_local();
+  if (gCTE.sys != sys) {
+    freeChargeTreeGpu();
+    cudaFree(d_scratch); d_scratch = NULL;
+    cudaFree(d_levOff);  d_levOff = NULL;
+    scratchStride = 0;
+    if (!buildChargeTreeGpu(sys)) { freeChargeTreeGpu(); return 0; }
+    rebuiltTree = 1;
+  }
+  tBuild1 = wall_seconds_cuda_local();
+  if (gCTE.derivOrderMax + 1 >= 16) return 0;   /* fixed pointer arrays */
+
+  /* Two rows per level, each sized for the longest row that level can hold:
+   * row(derivMax - p). levOff[derivMax+1] is the per-array total, which also
+   * separates the dg0 half from the dgk half. Summed, that is 2*nMom[derivMax]
+   * against the old pyramid's sum_m nMom[m]. */
+  levOff.resize((size_t)gCTE.derivOrderMax + 2);
+  levOff[0] = 0;
+  for (p = 0; p <= gCTE.derivOrderMax; p++) {
+    int m = gCTE.derivOrderMax - p;
+    int rowLen = sys->nMom[m] - ((m <= 0) ? 0 : sys->nMom[m - 1]);
+    levOff[(size_t)p + 1] = levOff[(size_t)p] + 2 * rowLen;
+  }
+  slabDoubles = 2LL * levOff[(size_t)gCTE.derivOrderMax + 1];
+
+  /* Cap concurrency so the scratch stays bounded; panels are then taken in a
+   * grid-stride loop. See chargeTreeScratchThreads for how perSm was measured. */
+  stride = chargeTreeScratchThreads("FABIPB_ENERGY_GPU_SCRATCH_MIB", 0, 3465.0,
+                                    slabDoubles, gCTE.nPanels, blockSize);
+  scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
+  gridSize = (int)(stride / blockSize);
+
+  tScratch0 = wall_seconds_cuda_local();
+  if (scratchStride != stride) {
+    cudaFree(d_scratch); d_scratch = NULL;
+    if (!cudaMallocNearfield((void **)&d_scratch, scratchBytes, "cte scratch")) {
+      scratchStride = 0;
+      return 0;
+    }
+    scratchStride = stride;
+  }
+  if (d_levOff == NULL) {
+    if (!cudaMallocNearfield((void **)&d_levOff, levOff.size() * sizeof(int), "cte levOff") ||
+        !cudaMemcpyNearfield(d_levOff, &levOff[0], levOff.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "cte levOff")) return 0;
+  }
+  if (d_sgmBytes < (size_t)2 * sys->nPnls * sizeof(double)) {
+    cudaFree(d_sgm);
+    d_sgm = NULL;
+    d_sgmBytes = (size_t)2 * sys->nPnls * sizeof(double);
+    if (!cudaMallocNearfield((void **)&d_sgm, d_sgmBytes, "cte sgm")) return 0;
+  }
+  if (d_partialCount < gridSize) {
+    cudaFree(d_partial);
+    d_partial = NULL;
+    d_partialCount = gridSize;
+    if (!cudaMallocNearfield((void **)&d_partial,
+                             (size_t)gridSize * sizeof(double),
+                             "cte partial")) return 0;
+  }
+  tScratch1 = wall_seconds_cuda_local();
+
+  tUpload0 = wall_seconds_cuda_local();
+  if (!cudaMemcpyNearfield(d_sgm, sgm, d_sgmBytes,
+                           cudaMemcpyHostToDevice, "cte sgm")) return 0;
+  tUpload1 = wall_seconds_cuda_local();
+
+  tKernel0 = wall_seconds_cuda_local();
+  chargeTreeEnergyKernel<<<gridSize, blockSize, (size_t)blockSize * sizeof(double)>>>(
+      gCTE.nPanels, gCTE.derivOrderMax, gCTE.idxDim, sys->chgDepth, sys->height,
+      energyTreeTheta(), kappa, epsilon, fourPiI,
+      gCTE.d_panels,
+      gCTE.d_nodeCtr, gCTE.d_nodeRad, gCTE.d_nodeLevel,
+      gCTE.d_nodeKidStart, gCTE.d_nodeKidCount,
+      gCTE.d_nodeChgStart, gCTE.d_nodeChgCount,
+      gCTE.d_nodeMomOff, gCTE.d_nodeOrder,
+      gCTE.d_kidIdx, gCTE.d_chgIdx, gCTE.d_moments,
+      gCTE.d_pos, gCTE.d_chr,
+      gCTE.d_idx3, gCTE.d_sgn3, d_levOff, gCTE.d_nMom,
+      gCTE.d_panelIdx, d_sgm,
+      d_scratch, stride,
+      d_partial);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("charge-tree energy launch failed: %s", cudaGetErrorString(err));
+    return 0;
+  }
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("charge-tree energy kernel failed: %s", cudaGetErrorString(err));
+    return 0;
+  }
+  tKernel1 = wall_seconds_cuda_local();
+
+  tCopy0 = wall_seconds_cuda_local();
+  hostPartial.resize((size_t)gridSize);
+  if (!cudaMemcpyNearfield(&hostPartial[0], d_partial,
+                           (size_t)gridSize * sizeof(double),
+                           cudaMemcpyDeviceToHost, "cte partial")) return 0;
+  tCopy1 = wall_seconds_cuda_local();
+
+  tReduce0 = wall_seconds_cuda_local();
+  for (i = 0; i < gridSize; i++) total += hostPartial[(size_t)i];
+  tReduce1 = wall_seconds_cuda_local();
+  *pot = total;
+  if (sys->benchmarkMode > 0) {
+    printf("GPU charge-tree energy: threads=%lld grid=%d scratch=%.3f GiB slab=%lld doubles\n",
+           stride, gridSize, bytesToGiB(scratchBytes), slabDoubles);
+    printf("GPU charge-tree energy breakdown (s): build=%.6f scratch=%.6f sgm_h2d=%.6f kernel=%.6f partial_d2h=%.6f reduce=%.6f rebuilt=%d\n",
+           tBuild1 - tBuild0, tScratch1 - tScratch0, tUpload1 - tUpload0,
+           tKernel1 - tKernel0, tCopy1 - tCopy0, tReduce1 - tReduce0,
+           rebuiltTree);
+  }
+  return 1;
+}
+
+
+/* Coulomb-only derivative tensor; port of setupCoulombDerivsLocal(). Half the
+ * work and half the scratch of the screened version -- no Gk half. */
+__device__ void cteSetupCoulombDerivsStrided(int order, const double *x,
+                                             double fourPiIv,
+                                             const int *fidx3, int D,
+                                             double *gv0, double **dg0,
+                                             long long S) {
+  int p, p1, iRow, iRow1, i1, i2, i3, idx, idx1, idx2, k;
+  double r = sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+  double r2;
+
+  gv0[0] = fourPiIv / r;
+  r2 = -1.0 / (r * r);
+  for (k = 0; k < order; k++) gv0[k + 1] = (2 * k + 1) * r2 * gv0[k];
+  for (p = 0; p <= order; p++) dg0[p][0] = gv0[p];
+  for (p = 0; p < order; p++) {
+    p1 = p + 1;
+    dg0[p][(long long)1 * S] = dg0[p1][0] * x[2];
+    dg0[p][(long long)2 * S] = dg0[p1][0] * x[1];
+    dg0[p][(long long)3 * S] = dg0[p1][0] * x[0];
+  }
+#define CTE_IDX(a,b,c) fidx3[(((a) * D) + (b)) * D + (c)]
+  for (iRow = 2; iRow <= order; iRow++) {
+    for (p = 0; p <= order - iRow; p++) {
+      p1 = p + 1;
+      idx = CTE_IDX(0, 0, iRow);
+      iRow1 = iRow - 1;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      idx2 = CTE_IDX(0, 0, iRow - 2);
+      dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[2]
+                                 + dg0[p1][(long long)idx2 * S] * iRow1;
+      idx++;
+      idx1 = CTE_IDX(0, 0, iRow1);
+      dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[1];
+      idx++;
+      for (i2 = 2; i2 <= iRow; i2++, idx++) {
+        i3 = iRow - i2;
+        idx1 = CTE_IDX(0, i2 - 1, i3);
+        idx2 = CTE_IDX(0, i2 - 2, i3);
+        dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[1]
+                                   + dg0[p1][(long long)idx2 * S] * (i2 - 1);
+      }
+      for (i2 = 0; i2 <= iRow1; i2++, idx++) {
+        i3 = iRow1 - i2;
+        idx1 = CTE_IDX(0, i2, i3);
+        dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[0];
+      }
+      for (i1 = 2; i1 <= iRow; i1++) {
+        for (i2 = 0; i2 <= iRow - i1; i2++, idx++) {
+          i3 = iRow - i1 - i2;
+          idx1 = CTE_IDX(i1 - 1, i2, i3);
+          idx2 = CTE_IDX(i1 - 2, i2, i3);
+          dg0[p][(long long)idx * S] = dg0[p1][(long long)idx1 * S] * x[0]
+                                     + dg0[p1][(long long)idx2 * S] * (i1 - 1);
+        }
+      }
+    }
+  }
+#undef CTE_IDX
+}
+
+/*
+ * setupRHS's charge-tree walk. Same traversal as the energy kernel, but the
+ * Coulomb-only kernel: no screening, no epsilon, and half the scratch, so more
+ * of the working set stays in cache.
+ */
+__global__ void chargeTreeRhsKernel(
+    int nPanels, int derivMax, int idxDim, int chgDepth, int height,
+    double theta, double fourPiIv, double fac,
+    const NearPanelGeom *panels,
+    const double *nodeCtr, const double *nodeRad, const int *nodeLevel,
+    const int *nodeKidStart, const int *nodeKidCount,
+    const int *nodeChgStart, const int *nodeChgCount,
+    const int *nodeMomOff, const int *nodeOrder,
+    const int *kidIdx, const int *chgIdx, const double *moments,
+    const double *pos, const double *chr,
+    const int *fidx3, const int *sgn3d, const int *levOff,
+    double *scratch, long long stride,
+    double *out) {
+  const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
+  double *dg0[16];
+  double gv0[18];
+  int p, panelIdx;
+
+  if (tid >= stride) return;
+  for (p = 0; p <= derivMax && p < 16; p++) {
+    dg0[p] = scratch + (long long)levOff[p] * stride + tid;
+  }
+
+  for (panelIdx = (int)tid; panelIdx < nPanels; panelIdx += (int)nThreadsTotal) {
+    const NearPanelGeom *pn = &panels[panelIdx];
+    double qpt[3], nrm[3];
+    double y0 = 0.0, y1 = 0.0;
+    int stack[CTE_MAX_STACK];
+    int sp = 0;
+    int k;
+
+    for (k = 0; k < 3; k++) {
+      qpt[k] = pn->vtx[0][k] + 0.5 * (pn->a2[k] + 0.5 * pn->a0[k]);
+      nrm[k] = pn->normal[k];
+    }
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+      int node = stack[--sp];
+      double r[3], dist;
+      for (k = 0; k < 3; k++) r[k] = qpt[k] - nodeCtr[3 * node + k];
+      dist = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+
+      if (nodeRad[node] < theta * dist && nodeLevel[node] >= height) {
+        int ordHere = nodeOrder[node];
+        const double *mom = &moments[nodeMomOff[node]];
+        double c0 = 0.0, c1 = 0.0;
+        int i, i1, i2, n;
+
+        cteSetupCoulombDerivsStrided(ordHere + 1, r, fourPiIv, fidx3, idxDim,
+                                     gv0, dg0, stride);
+        i = 0;
+        for (n = 0; n <= ordHere; n++) {
+          for (i1 = 0; i1 <= n; i1++) {
+            for (i2 = 0; i2 <= n - i1; i2++, i++) {
+              int i3 = n - i1 - i2;
+              double dn;
+#define CTE_IDX(a,b,c) fidx3[(((a) * idxDim) + (b)) * idxDim + (c)]
+              dn = nrm[0] * dg0[0][(long long)CTE_IDX(i1 + 1, i2, i3) * stride]
+                 + nrm[1] * dg0[0][(long long)CTE_IDX(i1, i2 + 1, i3) * stride]
+                 + nrm[2] * dg0[0][(long long)CTE_IDX(i1, i2, i3 + 1) * stride];
+#undef CTE_IDX
+              c0 += sgn3d[i] * mom[i] * dg0[0][(long long)i * stride];
+              c1 += sgn3d[i] * mom[i] * dn;
+            }
+          }
+        }
+        /* chgClusterEvalLocal divides both components by fourPiI */
+        y0 += c0 / fourPiIv;
+        y1 += c1 / fourPiIv;
+        continue;
+      }
+
+      if (nodeLevel[node] == chgDepth) {
+        int start = nodeChgStart[node];
+        int cnt = nodeChgCount[node];
+        int i;
+        for (i = 0; i < cnt; i++) {
+          int j = chgIdx[start + i];
+          double x[3], r2, ri, r3i, ip;
+          for (k = 0; k < 3; k++) x[k] = qpt[k] - pos[3 * j + k];
+          r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+          ri = 1.0 / sqrt(r2);
+          r3i = ri / r2;
+          ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
+          y0 += chr[j] * ri;
+          y1 += chr[j] * (-ip * r3i);
+        }
+        continue;
+      }
+
+      {
+        /* Push children in reverse so they pop in ascending order, matching the
+         * order the CPU recursion visits them. Without this the subtrees are
+         * summed back-to-front and the result differs at roundoff (4.2e-12
+         * measured on the virus RHS) for no reason. */
+        int ks = nodeKidStart[node];
+        int kc = nodeKidCount[node];
+        int i;
+        for (i = kc - 1; i >= 0 && sp < CTE_MAX_STACK; i--) stack[sp++] = kidIdx[ks + i];
+      }
+    }
+
+    /* qOrd==1: weight 0.5 then 2*area gives area; setupRHS then applies fac. */
+    out[panelIdx] = y0 * pn->area * fac;
+    out[nPanels + panelIdx] = y1 * pn->area * fac;
+  }
+}
+
+extern "C" double rhsTreeTheta(void);
+
+int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
+  int blockSize = 128, gridSize;
+  long long stride, slabDoubles;
+  size_t scratchBytes;
+  cudaError_t err;
+  std::vector<double> host;
+  std::vector<int> levOff;
+  int p, i;
+  static double *d_scratch = NULL;
+  static int *d_levOff = NULL;
+  static long long scratchStride = 0;
+  static const ssystem *scratchSys = NULL;
+
+  if (sys == NULL || sgm == NULL) return 0;
+  if (!gpuBackendAvailable()) return 0;
+  if (qOrder != 1) return 0;              /* kernel assumes the 1-point rule */
+  if (sys->chgCubeList == NULL || sys->chgCubeList[0] == NULL) return 0;
+  if (envFlagEnabled("FABIPB_RHS_GPU_DISABLE")) return 0;
+
+  if (gCTE.sys != sys) {
+    freeChargeTreeGpu();
+    if (!buildChargeTreeGpu(sys)) { freeChargeTreeGpu(); return 0; }
+  }
+  if (gCTE.derivOrderMax + 1 >= 16) return 0;
+
+  if (scratchSys != sys) {
+    cudaFree(d_scratch); d_scratch = NULL;
+    cudaFree(d_levOff);  d_levOff = NULL;
+    scratchStride = 0;
+    scratchSys = sys;
+  }
+
+  /* Only the Coulomb half is needed here, so the slab is half the energy
+   * kernel's and more of it stays resident. */
+  levOff.resize((size_t)gCTE.derivOrderMax + 2);
+  levOff[0] = 0;
+  for (p = 0; p <= gCTE.derivOrderMax; p++) {
+    levOff[(size_t)p + 1] = levOff[(size_t)p] + sys->nMom[gCTE.derivOrderMax - p];
+  }
+  slabDoubles = levOff[(size_t)gCTE.derivOrderMax + 1];
+
+  /* Lower perSm than the energy kernel: this one steps up sharply in time past
+   * roughly 16k threads on the measurement card. */
+  stride = chargeTreeScratchThreads("FABIPB_RHS_GPU_SCRATCH_MIB", 112, 0.0,
+                                    slabDoubles, gCTE.nPanels, blockSize);
+  scratchBytes = (size_t)stride * (size_t)slabDoubles * sizeof(double);
+
+  if (scratchStride != stride) {
+    cudaFree(d_scratch); d_scratch = NULL;
+    if (!cudaMallocNearfield((void **)&d_scratch, scratchBytes, "rhs scratch")) {
+      scratchStride = 0; return 0;
+    }
+    scratchStride = stride;
+  }
+  if (d_levOff == NULL) {
+    if (!cudaMallocNearfield((void **)&d_levOff, levOff.size() * sizeof(int), "rhs levOff") ||
+        !cudaMemcpyNearfield(d_levOff, &levOff[0], levOff.size() * sizeof(int),
+                             cudaMemcpyHostToDevice, "rhs levOff")) return 0;
+    }
+
+  gridSize = (int)(stride / blockSize);
+  chargeTreeRhsKernel<<<gridSize, blockSize>>>(
+      gCTE.nPanels, gCTE.derivOrderMax, gCTE.idxDim, sys->chgDepth, sys->height,
+      rhsTreeTheta(), fourPiI, fac,
+      gCTE.d_panels,
+      gCTE.d_nodeCtr, gCTE.d_nodeRad, gCTE.d_nodeLevel,
+      gCTE.d_nodeKidStart, gCTE.d_nodeKidCount,
+      gCTE.d_nodeChgStart, gCTE.d_nodeChgCount,
+      gCTE.d_nodeMomOff, gCTE.d_nodeOrder,
+      gCTE.d_kidIdx, gCTE.d_chgIdx, gCTE.d_moments,
+      gCTE.d_pos, gCTE.d_chr,
+      gCTE.d_idx3, gCTE.d_sgn3, d_levOff,
+      d_scratch, stride,
+      gCTE.d_out);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    setNearfieldLastError("charge-tree RHS launch failed: %s", cudaGetErrorString(err));
+    return 0;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    setNearfieldLastError("charge-tree RHS kernel failed");
+    return 0;
+  }
+
+  /* d_out is sized 2*nPanels, which is exactly the RHS layout. */
+  host.resize((size_t)2 * gCTE.nPanels);
+  if (!cudaMemcpyNearfield(&host[0], gCTE.d_out,
+                           (size_t)2 * gCTE.nPanels * sizeof(double),
+                           cudaMemcpyDeviceToHost, "rhs out")) return 0;
+
+  /* The kernel indexes panels in pnlLst order; sgm is indexed by pnl->idx. */
+  for (i = 0; i < gCTE.nPanels; i++) {
+    panel *pnl = sys->panelByIdx[i];
+    sgm[pnl->idx] = host[i];
+    sgm[pnl->idx + sys->nPnls] = host[gCTE.nPanels + i];
+  }
+  if (sys->benchmarkMode > 0) {
+    printf("GPU charge-tree RHS: threads=%lld scratch=%.3f GiB slab=%lld doubles theta=%g\n",
+           stride, bytesToGiB(scratchBytes), slabDoubles, rhsTreeTheta());
   }
   return 1;
 }

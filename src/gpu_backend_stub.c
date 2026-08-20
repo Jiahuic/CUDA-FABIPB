@@ -5,6 +5,14 @@ int gpuBackendAvailable(void) {
   return 0;
 }
 
+const char *gpuNearfieldLastError(void) {
+  return "CUDA backend not compiled";
+}
+
+const char *gpuM2LLastError(void) {
+  return "CUDA backend not compiled";
+}
+
 int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot) {
   (void)sys;
   (void)alpha;
@@ -41,6 +49,12 @@ int gpuL2PApply(ssystem *sys, double alpha, double beta, double *pot) {
   return 0;
 }
 
+void gpuReleaseMatvecCaches(void) {
+}
+
+void gpuReleaseChargeTreeCache(void) {
+}
+
 int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
   (void)sys;
   (void)qOrder;
@@ -58,5 +72,15 @@ int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
   (void)srcLocal;
   (void)nPairs;
   (void)block;
+  return 0;
+}
+
+int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
+  (void)sys; (void)sgm; (void)pot;
+  return 0;
+}
+
+int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
+  (void)sys; (void)qOrder; (void)fac; (void)sgm;
   return 0;
 }

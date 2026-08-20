@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 
 if [ "$#" -lt 1 ]; then
@@ -16,23 +18,20 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   exit 1
 fi
 
+mesh_control_init
+
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/nearfield_build_logs/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/nearfield_build_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
-prep_log="$OUT_DIR/prep.log"
+prep_log="$OUT_DIR/mesh_control.txt"
 base_log="$OUT_DIR/baseline.log"
 disjoint_log="$OUT_DIR/disjoint_q1.log"
+mesh_control_write_summary "$prep_log" "$panel"
 
-mesh_vert="${panel}.vert"
-mesh_face="${panel}.face"
-if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" "$@" >"$prep_log" 2>&1
-fi
-
-./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -m=0 "$panel" "$@" >"$base_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$base_log" 2>&1
 FABIPB_GPU_NEARFIELD_BUILD_DISJOINT=1 \
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -m=0 "$panel" "$@" >"$disjoint_log" 2>&1
+  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$disjoint_log" 2>&1
 
 extract_metric() {
   log="$1"
@@ -95,9 +94,8 @@ energy_delta="$(awk -v a="$baseline_energy" -v b="$disjoint_energy" 'BEGIN{d=a-b
 
 echo "Nearfield build comparison"
 echo "  panel: $panel"
-if [ -f "$prep_log" ]; then
-  echo "  prep:  $prep_log"
-fi
+echo "  mesh:  $MESH_BACKEND via $MESH_CONTROL_LABEL=$MESH_CONTROL_VALUE"
+echo "  mesh control log: $prep_log"
 echo "  baseline: ttl=${baseline_ttl}s its=${baseline_its} energy=${baseline_energy} gmres=${baseline_gmres}s near-build=${baseline_build}s coeff=${baseline_coeff}s upload=${baseline_upload}s near-ms=${baseline_near_ms}"
 echo "  disjoint: ttl=${disjoint_ttl}s its=${disjoint_its} energy=${disjoint_energy} gmres=${disjoint_gmres}s near-build=${disjoint_build}s coeff=${disjoint_coeff}s upload=${disjoint_upload}s near-ms=${disjoint_near_ms} enabled=${disjoint_mode}"
 echo "  delta:    |energy|=${energy_delta}"

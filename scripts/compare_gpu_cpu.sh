@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 
 if [ "$#" -lt 1 ]; then
@@ -21,23 +23,19 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   exit 2
 fi
 
+mesh_control_init
+
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/compare_logs/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/gpu_cpu_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 cpu_log="$OUT_DIR/cpu.log"
 gpu_log="$OUT_DIR/gpu.log"
-prep_log="$OUT_DIR/prep.log"
+prep_log="$OUT_DIR/mesh_control.txt"
+mesh_control_write_summary "$prep_log" "$panel"
 
-mesh_vert="${panel}.vert"
-mesh_face="${panel}.face"
-if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
-  echo "Preparing mesh artifacts for $panel ..."
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" "$@" >"$prep_log" 2>&1
-fi
-
-./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -m=0 "$panel" "$@" >"$cpu_log" 2>&1
-./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -m=0 "$panel" "$@" >"$gpu_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$cpu_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$gpu_log" 2>&1
 
 extract_metric() {
   log="$1"
@@ -77,9 +75,8 @@ speedup="$(awk -v c="$cpu_ttl" -v g="$gpu_ttl" 'BEGIN{if(g==0){print "inf"}else{
 
 echo "Comparison run"
 echo "  panel: $panel"
-if [ -f "$prep_log" ]; then
-  echo "  prep:  $prep_log"
-fi
+echo "  mesh:  $MESH_BACKEND via $MESH_CONTROL_LABEL=$MESH_CONTROL_VALUE"
+echo "  mesh control log: $prep_log"
 echo "  cpu:   ttl=${cpu_ttl}s its=${cpu_its} energy=${cpu_energy} calls=${cpu_calls} near_ms=${cpu_near_ms}"
 echo "  gpu:   ttl=${gpu_ttl}s its=${gpu_its} energy=${gpu_energy} calls=${gpu_calls} near_ms=${gpu_near_ms}"
 echo "  delta: |energy_cpu-energy_gpu|=${abs_energy_delta} speedup(cpu/gpu)=${speedup}x"

@@ -9,12 +9,34 @@ extern "C" {
 #endif
 
 int gpuBackendAvailable(void);
+const char *gpuNearfieldLastError(void);
+const char *gpuM2LLastError(void);
 int gpuNearfieldApply(struct ssystem *sys, double alpha, const double *sgm, double *pot);
 int gpuDirectApply(struct ssystem *sys, double alpha, double beta, const double *sgm, double *pot);
 int gpuM2LApply(struct ssystem *sys);
 int gpuQ2MApply(struct ssystem *sys, const double *sgm);
 int gpuL2PApply(struct ssystem *sys, double alpha, double beta, double *pot);
+void gpuReleaseMatvecCaches(void);
+void gpuReleaseChargeTreeCache(void);
 int gpuSetupRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
+/*
+ * Post-solve solvation energy by walking the charge tree on the device, one
+ * warp per panel. Returns 0 if the GPU path is unavailable, leaving the caller
+ * to fall back to the threaded CPU evaluator.
+ */
+int gpuPanelChargeTreeEnergy(struct ssystem *sys, const double *sgm, double *pot);
+/* setupRHS via the same charge-tree walk on the device. 0 => use the CPU path. */
+int gpuChargeTreeRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
+/*
+ * Batched preconditioner build: computes the disjoint-pair KER values for many
+ * blocks in one pass, sharing the nearfield kernel and one resident copy of the
+ * panel geometry. Pair indices are pnl->idx. Returns 0 if unavailable, leaving
+ * the caller on the CPU path.
+ */
+int gpuBuildPrecondPairsBatched(struct ssystem *sys,
+                                const int *pairSrc, const int *pairDst,
+                                long long nPairs,
+                                double *k0, double *k1, double *k2, double *k3);
 int gpuBuildPrecondDisjointBlock(struct panel **panels, int nPanels,
                                  const int *dstLocal, const int *srcLocal,
                                  int nPairs, double *block);

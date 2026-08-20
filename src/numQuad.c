@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <pthread.h>
 #include "gkGlobal.h"
 #include "gk.h"
 
@@ -31,8 +32,96 @@ static FABIPB_THREAD_LOCAL double intgrRHS[2], intgrPtl[2];
 static FABIPB_THREAD_LOCAL double *fcn1, *fcn2, *fcn3, *fcn4, *fcn5, *fcn6;
 static FABIPB_THREAD_LOCAL int quadWorkspaceSize;
 
+#define PANEL_CASE_ONE  1
+#define PANEL_CASE_TWO  2
+#define PANEL_CASE_SELF 4
+
+static pthread_once_t panelCaseSkipOnce = PTHREAD_ONCE_INIT;
+static int panelCaseSkipMask;
+
 void kernelRHS( double *x, double *y);
 void kernelPtl( double *x, double *y);
+void rhsTreeWalk(ssystem *sys, cube *chgCb, double *quadPt, panel *pnlX, double *y);
+
+static int panelCaseTokenEquals(const char *start, size_t length,
+                                const char *expected) {
+  return strlen(expected) == length && strncmp(start, expected, length) == 0;
+}
+
+static int panelCaseSeparator(char c) {
+  return c == ',' || c == '+' || c == ':' || c == ';' ||
+         c == ' ' || c == '\t';
+}
+
+static void initializePanelCaseSkipMask(void) {
+  const char *env = getenv("FABIPB_SKIP_PANEL_CASES");
+  const char *cursor;
+
+  if (env == NULL || env[0] == '\0' || strcmp(env, "none") == 0) {
+    return;
+  }
+
+  cursor = env;
+  while (*cursor != '\0') {
+    const char *start;
+    size_t length;
+
+    while (*cursor != '\0' && panelCaseSeparator(*cursor)) {
+      cursor++;
+    }
+    start = cursor;
+    while (*cursor != '\0' && !panelCaseSeparator(*cursor)) {
+      cursor++;
+    }
+    length = (size_t)(cursor - start);
+    if (length == 0) {
+      continue;
+    }
+
+    if (panelCaseTokenEquals(start, length, "all")) {
+      panelCaseSkipMask = PANEL_CASE_ONE | PANEL_CASE_TWO | PANEL_CASE_SELF;
+    } else if (panelCaseTokenEquals(start, length, "one") ||
+               panelCaseTokenEquals(start, length, "vertex") ||
+               panelCaseTokenEquals(start, length, "pnlOne0")) {
+      panelCaseSkipMask |= PANEL_CASE_ONE;
+    } else if (panelCaseTokenEquals(start, length, "two") ||
+               panelCaseTokenEquals(start, length, "edge") ||
+               panelCaseTokenEquals(start, length, "pnlTwo0")) {
+      panelCaseSkipMask |= PANEL_CASE_TWO;
+    } else if (panelCaseTokenEquals(start, length, "self") ||
+               panelCaseTokenEquals(start, length, "three") ||
+               panelCaseTokenEquals(start, length, "pnlThr0")) {
+      panelCaseSkipMask |= PANEL_CASE_SELF;
+    } else {
+      fprintf(stderr,
+              "Warning: ignoring unknown FABIPB_SKIP_PANEL_CASES token '%.*s'\n",
+              (int)length, start);
+    }
+  }
+
+  if (panelCaseSkipMask != 0) {
+    printf("Panel case diagnostic: FABIPB_SKIP_PANEL_CASES=%s "
+           "(one=%s two=%s self=%s)\n",
+           env,
+           (panelCaseSkipMask & PANEL_CASE_ONE) ? "skip" : "include",
+           (panelCaseSkipMask & PANEL_CASE_TWO) ? "skip" : "include",
+           (panelCaseSkipMask & PANEL_CASE_SELF) ? "skip" : "include");
+  }
+}
+
+static int skipPanelCase(int nCommonVertices) {
+  int caseMask = 0;
+
+  pthread_once(&panelCaseSkipOnce, initializePanelCaseSkipMask);
+  if (nCommonVertices == 1) {
+    caseMask = PANEL_CASE_ONE;
+  } else if (nCommonVertices == 2 || nCommonVertices == -2) {
+    caseMask = PANEL_CASE_TWO;
+  } else if (nCommonVertices == 3) {
+    caseMask = PANEL_CASE_SELF;
+  }
+  return (panelCaseSkipMask & caseMask) != 0;
+}
 
 static void ensureQuadThreadWorkspace(void) {
   if (quadWorkspaceSize == nKerl &&
@@ -537,6 +626,10 @@ double *panelIA0(panel *pnlX, panel *pnlY ) {
   nVtx = nrCommonVtx( pnlX, pnlY, idxX, idxY );
   //printf("%d\n",nVtx);
 
+  if (skipPanelCase(nVtx)) {
+    return intgrP;
+  }
+
   if ( nVtx==0 ) {
 //    qOrder = MAX(maxQuadOrder-2,2);
     qOrder = maxQuadOrder;
@@ -610,6 +703,10 @@ double *panelIA1(panel *pnlX, panel *pnlY ) {
 
   nVtx = nrCommonVtx( pnlX, pnlY, idxX, idxY );
   //printf("%d\n",nVtx);
+
+  if (skipPanelCase(nVtx)) {
+    return intgrP;
+  }
 
   if ( nVtx==0 ) {
 //    qOrder = MAX(maxQuadOrder-2,2);
@@ -704,6 +801,49 @@ double *panelRHS( int qOrder, panel *pnlX, double *chrY ) {
 
   return intgrRHS;
 } /* singlepanel */
+
+/*
+ * Tree-accelerated analogue of panelRHS(): instead of integrating a
+ * single fixed charge's contribution, evaluates the aggregate effect
+ * of every charge (near or far) at each quadrature point via
+ * rhsTreeWalk(), which walks the charge tree built by
+ * buildChargeTree()/computeChgMoments() (chargeTree.c).
+ */
+double *panelRHSTree( ssystem *sys, int qOrder, panel *pnlX, cube *chgRoot ) {
+  int ix, jx, k;
+  double r0[3], r[3], *ax2, *ax0;
+  double *tLeg, *wLeg;
+  double y[2];
+
+  tLeg = tLegA[qOrder];
+  wLeg = wLegA[qOrder];
+  ensureQuadThreadWorkspace();
+
+  ax2 = pnlX->a[2];
+  ax0 = pnlX->a[0];
+
+  nrmX = pnlX->normal;
+
+  for ( k=0; k<3; k++ ) {
+    r0[k] = pnlX->vtx[0][k];
+  }
+
+  intgrRHS[0] = 0.0; intgrRHS[1] = 0.0;
+  for ( ix=0; ix<qOrder; ix++ ) {
+    for ( jx=0; jx<qOrder; jx++ ) {
+      for ( k=0; k<3; k++ )
+        r[k] = r0[k] + tLeg[ix]*(ax2[k] + tLeg[jx]*ax0[k]);
+      y[0] = 0.0; y[1] = 0.0;
+      rhsTreeWalk(sys, chgRoot, r, pnlX, y);
+      intgrRHS[0] += y[0]*tLeg[ix]*wLeg[ix]*wLeg[jx];
+      intgrRHS[1] += y[1]*tLeg[ix]*wLeg[ix]*wLeg[jx];
+    }
+  }
+  intgrRHS[0] *= 2.0*pnlX->area;
+  intgrRHS[1] *= 2.0*pnlX->area;
+
+  return intgrRHS;
+} /* panelRHSTree */
 
 double *panelPotential( int qOrder, double *chrX, panel *pnlY ) {
   int ix, jx, k, nVtx;

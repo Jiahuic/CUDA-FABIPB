@@ -1,14 +1,17 @@
 #!/usr/bin/env sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 DEPTHS="${DEPTHS:-5 6 7 8}"
 HEIGHTS="${HEIGHTS:-1 2 3}"
 SEPRATS="${SEPRATS:-0.6 0.8 1.0}"
 ORDER_CASES="${ORDER_CASES:-baseline}"
+CONFIGS="${CONFIGS:-cpu_serial gpu_full hybrid_best}"
 HYBRID_SETUP_THREADS="${HYBRID_SETUP_THREADS:-8}"
 REPEATS="${REPEATS:-10}"
-MESH_DENSITY="${MESH_DENSITY:-10}"
+PREP_MESH="${PREP_MESH:-1}"
 
 if [ "$#" -lt 1 ]; then
   echo "Usage: $0 <panel-base-or-pqr-path> [solver options...]" >&2
@@ -28,6 +31,8 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   echo "  cmake -S . -B $BUILD_DIR && cmake --build $BUILD_DIR" >&2
   exit 2
 fi
+
+mesh_control_init
 
 order_case_args() {
   case "$1" in
@@ -66,17 +71,14 @@ order_case_values() {
 }
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/fmm_param_matrix/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/fmm_param_matrix/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 raw_repeats_csv="$OUT_DIR/results_raw.csv"
 raw_csv="$OUT_DIR/results.csv"
 summary_csv="$OUT_DIR/summary.csv"
-prep_log="$OUT_DIR/prep.log"
-
-echo "Preparing mesh artifacts for $panel at density $MESH_DENSITY ..."
-FABIPB_SETUP_THREADS=1 \
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -m=1 -d="$MESH_DENSITY" "$panel" >"$prep_log" 2>&1
+prep_log="$OUT_DIR/mesh_control.txt"
+mesh_control_write_summary "$prep_log" "$panel"
 
 cat >"$raw_repeats_csv" <<'EOF'
 case_name,depth,height,seprat,order_case,order_arg,ordermom_arg,config,repeat,gpu_mode,gpu_q2m_mode,setup_threads,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,setupFMM_leaf,setupFMM_cube_alloc,setupFMM_layout,setupFMM_apply,setupFMM_panel_index,setupFMM_cubes,setupFMM_m2l_pairs,setupFMM_m2l_groups,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other,applyFMM,Q2M,M2M,M2L,L2L,L2P,Near,near_build,near_h2d,near_kernel,near_d2h,near_meta,near_coeff,near_upload,near_other
@@ -230,18 +232,18 @@ run_case() {
   if [ -n "$solver_args" ] && [ -n "$order_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args $solver_args >"$log" 2>&1
   elif [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" $solver_args >"$log" 2>&1
   elif [ -n "$order_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" $order_args >"$log" 2>&1
   else
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" -H="$height" -S="$seprat" "$panel" >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" -H="$height" -S="$seprat" "$panel" >"$log" 2>&1
   fi
 
   echo "$log"
@@ -359,10 +361,12 @@ echo "  depths: $DEPTHS"
 echo "  heights: $HEIGHTS"
 echo "  SepRat values: $SEPRATS"
 echo "  order cases: $ORDER_CASES"
+echo "  configs: $CONFIGS"
 echo "  repeats: $REPEATS"
-echo "  mesh density: $MESH_DENSITY"
+echo "  mesh backend: $MESH_BACKEND"
+echo "  mesh control: $MESH_CONTROL_LABEL = $MESH_CONTROL_VALUE"
 echo "  hybrid setup threads: $HYBRID_SETUP_THREADS"
-echo "  prep: $prep_log"
+echo "  mesh control log: $prep_log"
 echo
 
 for depth in $DEPTHS; do
@@ -374,54 +378,52 @@ for depth in $DEPTHS; do
       for order_case in $ORDER_CASES; do
         rep=1
         while [ "$rep" -le "$REPEATS" ]; do
-          echo "  running d=$depth H=$height S=$seprat order=$order_case repeat $rep/$REPEATS cpu_serial"
-          cpu_log="$(run_case cpu_serial "$depth" "$height" "$seprat" "$order_case" "$rep")"
-          append_raw_row cpu_serial "$depth" "$height" "$seprat" "$order_case" "$rep" "$cpu_log"
-
-          echo "  running d=$depth H=$height S=$seprat order=$order_case repeat $rep/$REPEATS gpu_full"
-          gpu_log="$(run_case gpu_full "$depth" "$height" "$seprat" "$order_case" "$rep")"
-          append_raw_row gpu_full "$depth" "$height" "$seprat" "$order_case" "$rep" "$gpu_log"
-
-          echo "  running d=$depth H=$height S=$seprat order=$order_case repeat $rep/$REPEATS hybrid_best"
-          hybrid_log="$(run_case hybrid_best "$depth" "$height" "$seprat" "$order_case" "$rep")"
-          append_raw_row hybrid_best "$depth" "$height" "$seprat" "$order_case" "$rep" "$hybrid_log"
+          for config in $CONFIGS; do
+            echo "  running d=$depth H=$height S=$seprat order=$order_case repeat $rep/$REPEATS $config"
+            log="$(run_case "$config" "$depth" "$height" "$seprat" "$order_case" "$rep")"
+            append_raw_row "$config" "$depth" "$height" "$seprat" "$order_case" "$rep" "$log"
+          done
           rep=$((rep + 1))
         done
 
-        append_avg_row cpu_serial "$depth" "$height" "$seprat" "$order_case"
-        append_avg_row gpu_full "$depth" "$height" "$seprat" "$order_case"
-        append_avg_row hybrid_best "$depth" "$height" "$seprat" "$order_case"
+        for config in $CONFIGS; do
+          append_avg_row "$config" "$depth" "$height" "$seprat" "$order_case"
+        done
 
-        order_vals="$(order_case_values "$order_case")"
-        order_arg="${order_vals%,*}"
-        ordermom_arg="${order_vals#*,}"
-        cpu_ttl="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" ttl)"
-        gpu_ttl="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" ttl)"
-        hybrid_ttl="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" ttl)"
-        cpu_apply="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" applyFMM)"
-        gpu_apply="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" applyFMM)"
-        hybrid_apply="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" applyFMM)"
-        cpu_m2l="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" M2L)"
-        gpu_m2l="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" M2L)"
-        hybrid_m2l="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" M2L)"
-        cpu_near="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" Near)"
-        gpu_near="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" Near)"
-        hybrid_near="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" Near)"
-        cpu_its="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" its)"
-        gpu_its="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" its)"
-        hybrid_its="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" its)"
+        if printf '%s\n' "$CONFIGS" | grep -qx 'cpu_serial' &&
+           printf '%s\n' "$CONFIGS" | grep -qx 'gpu_full' &&
+           printf '%s\n' "$CONFIGS" | grep -qx 'hybrid_best'; then
+          order_vals="$(order_case_values "$order_case")"
+          order_arg="${order_vals%,*}"
+          ordermom_arg="${order_vals#*,}"
+          cpu_ttl="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" ttl)"
+          gpu_ttl="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" ttl)"
+          hybrid_ttl="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" ttl)"
+          cpu_apply="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" applyFMM)"
+          gpu_apply="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" applyFMM)"
+          hybrid_apply="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" applyFMM)"
+          cpu_m2l="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" M2L)"
+          gpu_m2l="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" M2L)"
+          hybrid_m2l="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" M2L)"
+          cpu_near="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" Near)"
+          gpu_near="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" Near)"
+          hybrid_near="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" Near)"
+          cpu_its="$(average_metric cpu_serial "$depth" "$height" "$seprat" "$order_case" its)"
+          gpu_its="$(average_metric gpu_full "$depth" "$height" "$seprat" "$order_case" its)"
+          hybrid_its="$(average_metric hybrid_best "$depth" "$height" "$seprat" "$order_case" its)"
 
-        printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
-          "$panel" "$depth" "$height" "$seprat" "$order_case" "$order_arg" "$ordermom_arg" \
-          "$cpu_ttl" "$gpu_ttl" "$hybrid_ttl" \
-          "$cpu_apply" "$gpu_apply" "$hybrid_apply" \
-          "$cpu_m2l" "$gpu_m2l" "$hybrid_m2l" \
-          "$cpu_near" "$gpu_near" "$hybrid_near" \
-          "$cpu_its" "$gpu_its" "$hybrid_its" \
-          "$(ratio "$cpu_ttl" "$gpu_ttl")" "$(ratio "$cpu_ttl" "$hybrid_ttl")" \
-          "$(ratio "$cpu_apply" "$gpu_apply")" "$(ratio "$cpu_apply" "$hybrid_apply")" \
-          "$(ratio "$cpu_m2l" "$gpu_m2l")" "$(ratio "$cpu_m2l" "$hybrid_m2l")" \
-          "$(ratio "$cpu_near" "$gpu_near")" "$(ratio "$cpu_near" "$hybrid_near")" >>"$summary_csv"
+          printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+            "$panel" "$depth" "$height" "$seprat" "$order_case" "$order_arg" "$ordermom_arg" \
+            "$cpu_ttl" "$gpu_ttl" "$hybrid_ttl" \
+            "$cpu_apply" "$gpu_apply" "$hybrid_apply" \
+            "$cpu_m2l" "$gpu_m2l" "$hybrid_m2l" \
+            "$cpu_near" "$gpu_near" "$hybrid_near" \
+            "$cpu_its" "$gpu_its" "$hybrid_its" \
+            "$(ratio "$cpu_ttl" "$gpu_ttl")" "$(ratio "$cpu_ttl" "$hybrid_ttl")" \
+            "$(ratio "$cpu_apply" "$gpu_apply")" "$(ratio "$cpu_apply" "$hybrid_apply")" \
+            "$(ratio "$cpu_m2l" "$gpu_m2l")" "$(ratio "$cpu_m2l" "$hybrid_m2l")" \
+            "$(ratio "$cpu_near" "$gpu_near")" "$(ratio "$cpu_near" "$hybrid_near")" >>"$summary_csv"
+        fi
       done
     done
   done

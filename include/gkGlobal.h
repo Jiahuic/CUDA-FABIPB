@@ -73,29 +73,47 @@
 
 
 
+/*
+ * Allocation failure is fatal.
+ *
+ * This macro used to print "out of memory" to stdout and then carry on with a
+ * NULL pointer (the 3-argument CALLOC below hardcodes FLAG=OFF, so that was
+ * the behaviour at every one of its ~60 call sites). At virus scale the
+ * realistic outcome was a partial OOM followed by a segfault inside a BLAS
+ * call hundreds of log lines later, with the actual cause long scrolled away.
+ * Failing immediately, on stderr, naming the file, line and requested size, is
+ * far easier to act on. A zero-element request now also assigns NULL instead
+ * of leaving the caller's pointer indeterminate.
+ */
 #define CALLOC_FULL(PNTR, NUM, TYPE, FLAG, MTYP)                            \
 {                                                                           \
-     if((NUM)*sizeof(TYPE)==0)                                              \
+     size_t _gk_num = (size_t)(NUM);                                        \
+     size_t _gk_bytes = _gk_num * sizeof(TYPE);                             \
+     if(_gk_num == 0) {                                                     \
+       (PNTR) = NULL;                                                       \
        (void)fprintf(stdout,                                                \
 		     "zero element request in file `%s' at line %d\n",      \
 		     __FILE__, __LINE__);	                            \
-     else if(((PNTR)=(TYPE*)calloc(NUM, sizeof(TYPE)))==NULL) {             \
-       (void)fprintf(stdout,                                                \
-	 "\ngk: out of memory in file `%s' at line %d\n",                   \
-	       __FILE__, __LINE__);                                         \
+     }                                                                      \
+     else if(((PNTR)=(TYPE*)calloc(_gk_num, sizeof(TYPE)))==NULL) {         \
        (void)fflush(stdout);                                                \
-       (void)fflush(stdout);                                                \
-       if(FLAG == ON) exit(0);                                              \
+       (void)fprintf(stderr,                                                \
+	 "\ngk: out of memory in file `%s' at line %d "                     \
+	 "(requested %zu elements, %.3f GiB)\n",                            \
+	       __FILE__, __LINE__, _gk_num,                                 \
+	       (double)_gk_bytes / (1024.0*1024.0*1024.0));                 \
+       (void)fflush(stderr);                                                \
+       exit(1);                                                             \
      }                                                                      \
      else {                                                                 \
-       memcount += ((NUM)*sizeof(TYPE));                                    \
-       if(MTYP == APVE) memPVE += ((NUM)*sizeof(TYPE));                     \
-       else if(MTYP == ACUBES) memCUBES += ((NUM)*sizeof(TYPE));            \
-       else if(MTYP == AQ2P) memQ2P += ((NUM)*sizeof(TYPE));                \
-       else if(MTYP == AQ2M) memQ2M += ((NUM)*sizeof(TYPE));                \
-       else if(MTYP == AM2L) memM2L += ((NUM)*sizeof(TYPE));                \
-       else if(MTYP == ASOLVER) memSOLVER += ((NUM)*sizeof(TYPE));          \
-       else if(MTYP == AMISC) memMISC += ((NUM)*sizeof(TYPE));              \
+       memcount += _gk_bytes;                                               \
+       if(MTYP == APVE) memPVE += _gk_bytes;                                \
+       else if(MTYP == ACUBES) memCUBES += _gk_bytes;                       \
+       else if(MTYP == AQ2P) memQ2P += _gk_bytes;                           \
+       else if(MTYP == AQ2M) memQ2M += _gk_bytes;                           \
+       else if(MTYP == AM2L) memM2L += _gk_bytes;                           \
+       else if(MTYP == ASOLVER) memSOLVER += _gk_bytes;                     \
+       else if(MTYP == AMISC) memMISC += _gk_bytes;                         \
        else {                                                               \
          (void)fprintf(stdout, "CALLOC: unknown memory type %d\n", MTYP);   \
          exit(0);                                                           \

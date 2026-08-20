@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 HYBRID_SETUP_THREADS="${HYBRID_SETUP_THREADS:-8}"
 
@@ -22,28 +24,24 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   exit 2
 fi
 
+mesh_control_init
+
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/direct_compare_logs/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/direct_compare/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 cpu_fmm_log="$OUT_DIR/cpu_fmm.log"
 cpu_direct_log="$OUT_DIR/cpu_direct.log"
 gpu_direct_log="$OUT_DIR/gpu_direct.log"
 hybrid_fmm_log="$OUT_DIR/hybrid_fmm.log"
-prep_log="$OUT_DIR/prep.log"
+prep_log="$OUT_DIR/mesh_control.txt"
+mesh_control_write_summary "$prep_log" "$panel"
 
-mesh_vert="${panel}.vert"
-mesh_face="${panel}.face"
-if [ ! -f "$mesh_vert" ] || [ ! -f "$mesh_face" ]; then
-  echo "Preparing mesh artifacts for $panel ..."
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 "$panel" "$@" >"$prep_log" 2>&1
-fi
-
-./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -r=0 -m=0 "$panel" "$@" >"$cpu_fmm_log" 2>&1
-./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -r=2 -m=0 "$panel" "$@" >"$cpu_direct_log" 2>&1
-./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 -m=0 "$panel" "$@" >"$gpu_direct_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -r=0 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$cpu_fmm_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -r=2 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$cpu_direct_log" 2>&1
+./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$gpu_direct_log" 2>&1
 FABIPB_SETUP_THREADS="$HYBRID_SETUP_THREADS" \
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -Q=0 -r=0 -m=0 "$panel" "$@" >"$hybrid_fmm_log" 2>&1
+  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -Q=0 -r=0 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" "$panel" "$@" >"$hybrid_fmm_log" 2>&1
 
 extract_metric() {
   log="$1"
@@ -108,9 +106,8 @@ abs_fmm_delta="$(awk -v a="$cpu_fmm_energy" -v b="$hybrid_fmm_energy" 'BEGIN{d=a
 
 echo "Direct/FMM comparison run"
 echo "  panel: $panel"
-if [ -f "$prep_log" ]; then
-  echo "  prep:  $prep_log"
-fi
+echo "  mesh:  $MESH_BACKEND via $MESH_CONTROL_LABEL=$MESH_CONTROL_VALUE"
+echo "  mesh control log: $prep_log"
 echo "  cpu-fmm:    ttl=${cpu_fmm_ttl}s its=${cpu_fmm_its} energy=${cpu_fmm_energy} near_ms=${cpu_fmm_near_ms}"
 echo "  cpu-direct: ttl=${cpu_direct_ttl}s its=${cpu_direct_its} energy=${cpu_direct_energy}"
 echo "  gpu-direct: ttl=${gpu_direct_ttl}s its=${gpu_direct_its} energy=${gpu_direct_energy} fit=${gpu_direct_fit}"

@@ -43,6 +43,12 @@ typedef struct {
   double scale1;
   double scale2;
   int buildLU;
+  /*
+   * Precomputed disjoint-pair kernel values for this batch, or NULL to compute
+   * them here. Pair (i,j) of block idx lives at pairOffset[idx] + i*HMsize + j.
+   */
+  const double *k0, *k1, *k2, *k3;
+  const long long *pairOffset;
 } PrecondSetupTask;
 
 typedef struct {
@@ -59,6 +65,29 @@ typedef struct {
   int info;
   int failedIdx;
 } PrecondApplyTask;
+
+typedef struct {
+  double *pot;
+  const double *sgm;
+  const double *area;
+  int nPnls;
+  int begin;
+  int end;
+  double scale1;
+  double scale2;
+} DiagPrecondTask;
+
+static void *diagPrecondWorker(void *arg) {
+  DiagPrecondTask *task = (DiagPrecondTask *)arg;
+  int nPnls = task->nPnls;
+  int i;
+
+  for (i = task->begin; i < task->end; i++) {
+    task->pot[i] = task->sgm[i] / (task->scale1 * task->area[i]);
+    task->pot[nPnls + i] = task->sgm[nPnls + i] / (task->scale2 * task->area[i]);
+  }
+  return NULL;
+}
 
 static double wall_seconds_pc(void) {
   struct timeval tv;
@@ -118,255 +147,6 @@ static int useGpuPrecondDisjoint(const ssystem *sys) {
           !(env != NULL && atoi(env) == 0));
 }
 
-static int precondDebugEnabled(void) {
-  static int initialized = 0;
-  static int enabled = 0;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG");
-    enabled = (env != NULL && atoi(env) != 0);
-    initialized = 1;
-  }
-  return enabled;
-}
-
-static int precondDebugLimit(void) {
-  static int initialized = 0;
-  static int limit = 8;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG_LIMIT");
-    if (env != NULL && atoi(env) > 0) {
-      limit = atoi(env);
-    }
-    initialized = 1;
-  }
-  return limit;
-}
-
-static int precondDebugTargetBlock(void) {
-  static int initialized = 0;
-  static int target = -1;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG_BLOCK");
-    if (env != NULL) {
-      target = atoi(env);
-    }
-    initialized = 1;
-  }
-  return target;
-}
-
-static int precondDebugBlockEnabled(int idx) {
-  if (!precondDebugEnabled()) {
-    return 0;
-  }
-  return idx < precondDebugLimit() || idx == precondDebugTargetBlock();
-}
-
-static int precondFirstApplyDebugEnabled(void) {
-  static int initialized = 0;
-  static int enabled = 0;
-  const char *env;
-
-  if (!initialized) {
-    env = getenv("FABIPB_PRECOND_DEBUG_FIRST_APPLY");
-    enabled = (env != NULL && atoi(env) != 0);
-    initialized = 1;
-  }
-  return enabled;
-}
-
-static void printVectorPreview(const char *tag, int idx, const double *x, int n) {
-  int i;
-  int limit = (n < 6) ? n : 6;
-
-  printf("PRECOND vec %s: block=%d n=%d", tag, idx, n);
-  for (i = 0; i < limit; i++) {
-    printf(" x[%d]=%e", i, x[i]);
-  }
-  printf("\n");
-}
-
-static double vecInfNorm(const double *x, int n) {
-  int i;
-  double vmax = 0.0;
-
-  for (i = 0; i < n; i++) {
-    double ax = fabs(x[i]);
-    if (ax > vmax) {
-      vmax = ax;
-    }
-  }
-  return vmax;
-}
-
-static void printMatrixDiagnostics(const char *tag, int idx, int Msize, const double *amat) {
-  int i, j;
-  int maxRow = 0;
-  int maxCol = 0;
-  double diagMin = 0.0;
-  double diagMax = 0.0;
-  double rowSumInf = 0.0;
-  double maxAbs = 0.0;
-  double trace = 0.0;
-
-  for (i = 0; i < Msize; i++) {
-    double rowSum = 0.0;
-    double di = fabs(amat[i * Msize + i]);
-    if (i == 0 || di < diagMin) {
-      diagMin = di;
-    }
-    if (di > diagMax) {
-      diagMax = di;
-    }
-    trace += amat[i * Msize + i];
-    for (j = 0; j < Msize; j++) {
-      double aij = fabs(amat[i * Msize + j]);
-      rowSum += aij;
-      if (aij > maxAbs) {
-        maxAbs = aij;
-        maxRow = i;
-        maxCol = j;
-      }
-    }
-    if (rowSum > rowSumInf) {
-      rowSumInf = rowSum;
-    }
-  }
-
-  printf("PRECOND matrix %s: block=%d size=%d row_sum_inf=%e diag_abs_min=%e diag_abs_max=%e max_abs=%e max_pos=(%d,%d) trace=%e\n",
-         tag, idx, Msize, rowSumInf, diagMin, diagMax, maxAbs, maxRow, maxCol, trace);
-}
-
-static void printMatrixSvdDiagnostics(const char *tag, int idx, int Msize, const double *amat) {
-  char jobz = 'N';
-  int m = Msize;
-  int n = Msize;
-  int lda = Msize;
-  int ldu = 1;
-  int ldvt = 1;
-  int info = 0;
-  int lwork = -1;
-  int minmn = Msize;
-  int *iwork;
-  double wkopt = 0.0;
-  double *acopy;
-  double *s;
-  double *u_dummy;
-  double *vt_dummy;
-  double *work;
-  double sigmaMax;
-  double sigmaMin;
-  double condEst;
-
-  acopy = (double *)malloc((size_t)Msize * (size_t)Msize * sizeof(double));
-  s = (double *)malloc((size_t)minmn * sizeof(double));
-  iwork = (int *)malloc((size_t)(8 * minmn) * sizeof(int));
-  u_dummy = (double *)malloc(sizeof(double));
-  vt_dummy = (double *)malloc(sizeof(double));
-  if (acopy == NULL || s == NULL || iwork == NULL || u_dummy == NULL || vt_dummy == NULL) {
-    free(acopy);
-    free(s);
-    free(iwork);
-    free(u_dummy);
-    free(vt_dummy);
-    return;
-  }
-  memcpy(acopy, amat, (size_t)Msize * (size_t)Msize * sizeof(double));
-  dgesdd_(&jobz, &m, &n, acopy, &lda, s, u_dummy, &ldu, vt_dummy, &ldvt, &wkopt, &lwork, iwork, &info);
-  if (info != 0) {
-    printf("PRECOND svd %s: block=%d size=%d info=%d\n", tag, idx, Msize, info);
-    free(acopy);
-    free(s);
-    free(iwork);
-    free(u_dummy);
-    free(vt_dummy);
-    return;
-  }
-  lwork = (int)wkopt;
-  if (lwork < 1) {
-    lwork = 1;
-  }
-  work = (double *)malloc((size_t)lwork * sizeof(double));
-  if (work == NULL) {
-    free(acopy);
-    free(s);
-    free(iwork);
-    free(u_dummy);
-    free(vt_dummy);
-    return;
-  }
-  memcpy(acopy, amat, (size_t)Msize * (size_t)Msize * sizeof(double));
-  dgesdd_(&jobz, &m, &n, acopy, &lda, s, u_dummy, &ldu, vt_dummy, &ldvt, work, &lwork, iwork, &info);
-  if (info != 0) {
-    printf("PRECOND svd %s: block=%d size=%d info=%d\n", tag, idx, Msize, info);
-  } else {
-    sigmaMax = s[0];
-    sigmaMin = s[minmn - 1];
-    condEst = (sigmaMin > 0.0) ? (sigmaMax / sigmaMin) : INFINITY;
-    printf("PRECOND svd %s: block=%d size=%d sigma_max=%e sigma_min=%e cond2_est=%e\n",
-           tag, idx, Msize, sigmaMax, sigmaMin, condEst);
-  }
-  free(work);
-  free(acopy);
-  free(s);
-  free(iwork);
-  free(u_dummy);
-  free(vt_dummy);
-}
-
-static void printLuDiagnostics(const char *tag, int idx, int Msize, const double *lu, const int *ipiv, int info) {
-  int i;
-  int pivSwaps = 0;
-  double udiagMin = 0.0;
-  double udiagMax = 0.0;
-
-  for (i = 0; i < Msize; i++) {
-    double du = fabs(lu[i * Msize + i]);
-    if (i == 0 || du < udiagMin) {
-      udiagMin = du;
-    }
-    if (du > udiagMax) {
-      udiagMax = du;
-    }
-    if (ipiv != NULL && ipiv[i] != i + 1) {
-      pivSwaps++;
-    }
-  }
-
-  printf("PRECOND LU %s: block=%d size=%d info=%d udiag_min=%e udiag_max=%e piv_swaps=%d\n",
-         tag, idx, Msize, info, udiagMin, udiagMax, pivSwaps);
-}
-
-static void printSolveDiagnostics(const char *tag, int idx, int Msize, const double *amat, const double *rhsOrig, const double *sol) {
-  int i, j;
-  double rhsInf = vecInfNorm(rhsOrig, Msize);
-  double solInf = vecInfNorm(sol, Msize);
-  double residInf = 0.0;
-
-  for (i = 0; i < Msize; i++) {
-    double ax = 0.0;
-    for (j = 0; j < Msize; j++) {
-      ax += amat[i * Msize + j] * sol[j];
-    }
-    {
-      double ri = fabs(ax - rhsOrig[i]);
-      if (ri > residInf) {
-        residInf = ri;
-      }
-    }
-  }
-
-  printf("PRECOND solve %s: block=%d size=%d rhs_inf=%e sol_inf=%e resid_inf=%e rel_resid_inf=%e\n",
-         tag, idx, Msize, rhsInf, solInf, residInf,
-         residInf / ((rhsInf > 0.0) ? rhsInf : 1.0));
-}
-
 static void *precondSetupWorker(void *arg) {
   PrecondSetupTask *task = (PrecondSetupTask *)arg;
   int idx;
@@ -382,7 +162,7 @@ static void *precondSetupWorker(void *arg) {
     int Msize = 2 * HMsize;
     panel *pnlX, *pnlY;
     int i, j;
-    int useGpuDisjoint = useGpuPrecondDisjoint(task->sys);
+    int useGpuDisjoint = (task->k0 == NULL) && useGpuPrecondDisjoint(task->sys);
     panel **blockPanels = NULL;
     int *disjointDst = NULL;
     int *disjointSrc = NULL;
@@ -419,7 +199,14 @@ static void *precondSetupWorker(void *arg) {
           else if (nVtx == -2) localTwoCommonRev++;
           else if (nVtx == 3) localSelf++;
         }
-        if (useGpuDisjoint && nVtx == 0) {
+        if (task->k0 != NULL && nVtx == 0) {
+          /* Already computed on the device for the whole batch. */
+          long long at = task->pairOffset[idx] + (long long)i * HMsize + j;
+          pcBlocks[idx][i*Msize+j]                 = -task->k1[at];
+          pcBlocks[idx][i*Msize+j+HMsize]          = -task->k0[at];
+          pcBlocks[idx][(i+HMsize)*Msize+j]        = -task->k3[at];
+          pcBlocks[idx][(i+HMsize)*Msize+j+HMsize] = -task->k2[at];
+        } else if (useGpuDisjoint && nVtx == 0) {
           disjointDst[nDisjoint] = i;
           disjointSrc[nDisjoint] = j;
           nDisjoint++;
@@ -459,15 +246,8 @@ static void *precondSetupWorker(void *arg) {
 
     if (task->buildLU) {
       int info;
-      if (precondDebugBlockEnabled(idx)) {
-        printMatrixDiagnostics("setup-cached-lu-raw", idx, Msize, pcBlocks[idx]);
-        printMatrixSvdDiagnostics("setup-cached-lu-raw", idx, Msize, pcBlocks[idx]);
-      }
       memcpy(pcLUBlocks[idx], pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
       dgetrf_(&Msize, &Msize, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], &info);
-      if (precondDebugBlockEnabled(idx)) {
-        printLuDiagnostics("setup-cached-lu", idx, Msize, pcLUBlocks[idx], pcIpivBlocks[idx], info);
-      }
       if (info != 0) {
         fprintf(stderr, "Error: dgetrf failed in cached LU setup for leaf %d (info=%d)\n",
                 idx, info);
@@ -483,6 +263,254 @@ static void *precondSetupWorker(void *arg) {
     __sync_fetch_and_add(&pcCaseSelfCount, localSelf);
   }
   return NULL;
+}
+
+/*
+ * Runs precondSetupWorker over [begin,end) with the given thread count.
+ * kArrays/pairOffset may be NULL, in which case each worker computes its own
+ * disjoint pairs as before.
+ */
+static void runPrecondSetupRange(ssystem *sys, cube **cubes, int begin, int end,
+                                 double scale1, double scale2, int buildLU,
+                                 const double *k0, const double *k1,
+                                 const double *k2, const double *k3,
+                                 const long long *pairOffset) {
+  int nBlocks = end - begin;
+  int nThreads = setupThreadCountPc(nBlocks);
+  int t;
+
+  if (nBlocks <= 0) return;
+  if (nThreads <= 1) {
+    PrecondSetupTask task;
+    memset(&task, 0, sizeof(task));
+    task.sys = sys; task.cubes = cubes;
+    task.begin = begin; task.end = end;
+    task.scale1 = scale1; task.scale2 = scale2; task.buildLU = buildLU;
+    task.k0 = k0; task.k1 = k1; task.k2 = k2; task.k3 = k3;
+    task.pairOffset = pairOffset;
+    precondSetupWorker(&task);
+    return;
+  }
+  {
+    pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+    PrecondSetupTask *tasks =
+        (PrecondSetupTask *)calloc((size_t)nThreads, sizeof(PrecondSetupTask));
+    int created = 0;
+    ASSERT(threads != NULL);
+    ASSERT(tasks != NULL);
+    for (t = 0; t < nThreads; t++) {
+      tasks[t].sys = sys; tasks[t].cubes = cubes;
+      tasks[t].begin = begin + (int)(((long long)nBlocks * t) / nThreads);
+      tasks[t].end   = begin + (int)(((long long)nBlocks * (t + 1)) / nThreads);
+      tasks[t].scale1 = scale1; tasks[t].scale2 = scale2;
+      tasks[t].buildLU = buildLU;
+      tasks[t].k0 = k0; tasks[t].k1 = k1; tasks[t].k2 = k2; tasks[t].k3 = k3;
+      tasks[t].pairOffset = pairOffset;
+    }
+    for (t = 0; t < nThreads - 1; t++) {
+      if (pthread_create(&threads[created], NULL, precondSetupWorker, &tasks[t]) != 0) break;
+      created++;
+    }
+    if (created < nThreads - 1) {
+      /* Fold the un-launched ranges into this thread's task. */
+      tasks[created].end = end;
+    }
+    precondSetupWorker(&tasks[created]);
+    for (t = 0; t < created; t++) pthread_join(threads[t], NULL);
+    free(tasks);
+    free(threads);
+  }
+}
+
+typedef struct {
+  cube **cubes;
+  const long long *pairOffset;
+  int *pairSrc;
+  int *pairDst;
+  int begin;
+  int end;
+} PrecondFillTask;
+
+static void *precondFillWorker(void *arg) {
+  PrecondFillTask *task = (PrecondFillTask *)arg;
+  int idx;
+
+  for (idx = task->begin; idx < task->end; idx++) {
+    cube *cb = task->cubes[idx];
+    int HMsize = cb->nPnls;
+    long long base = task->pairOffset[idx];
+    panel *pnlY;
+    int a, b;
+
+    for (a = 0, pnlY = cb->pnls; a < HMsize; a++, pnlY = pnlY->nextC) {
+      panel *pnlX;
+      long long row = base + (long long)a * HMsize;
+      for (b = 0, pnlX = cb->pnls; b < HMsize; b++, pnlX = pnlX->nextC) {
+        task->pairDst[row + b] = pnlY->idx;
+        task->pairSrc[row + b] = pnlX->idx;
+      }
+    }
+  }
+  return NULL;
+}
+
+/* Fills [begin,end) across the setup pool; segments are disjoint by offset. */
+static void runPrecondFill(PrecondFillTask *proto, int begin, int end) {
+  int nBlocks = end - begin;
+  int nThreads = setupThreadCountPc(nBlocks);
+  int t, created = 0;
+  pthread_t *threads;
+  PrecondFillTask *tasks;
+
+  if (nBlocks <= 0) return;
+  if (nThreads <= 1) {
+    proto->begin = begin; proto->end = end;
+    precondFillWorker(proto);
+    return;
+  }
+  threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+  tasks = (PrecondFillTask *)calloc((size_t)nThreads, sizeof(PrecondFillTask));
+  ASSERT(threads != NULL);
+  ASSERT(tasks != NULL);
+  for (t = 0; t < nThreads; t++) {
+    tasks[t] = *proto;
+    tasks[t].begin = begin + (int)(((long long)nBlocks * t) / nThreads);
+    tasks[t].end   = begin + (int)(((long long)nBlocks * (t + 1)) / nThreads);
+  }
+  for (t = 0; t < nThreads - 1; t++) {
+    if (pthread_create(&threads[created], NULL, precondFillWorker, &tasks[t]) != 0) break;
+    created++;
+  }
+  if (created < nThreads - 1) tasks[created].end = end;
+  precondFillWorker(&tasks[created]);
+  for (t = 0; t < created; t++) pthread_join(threads[t], NULL);
+  free(tasks);
+  free(threads);
+}
+
+/* Host budget for one batch, in pairs: 2 ints in, 4 doubles out per pair. */
+static long long precondBatchPairCap(void) {
+  const char *env = getenv("FABIPB_PRECOND_BATCH_MIB");
+  double mib = 1024.0;
+  long long perPair = (long long)(2 * sizeof(int) + 4 * sizeof(double));
+  long long cap;
+
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end != env && *end == '\0' && v > 0.0) mib = v;
+  }
+  cap = (long long)((mib * 1024.0 * 1024.0) / (double)perPair);
+  if (cap < 65536) cap = 65536;
+  return cap;
+}
+
+/*
+ * Build every block with the batched GPU path.
+ *
+ * Each block's pairs are a subset of the nearfield's -- children of one parent
+ * cube are always neighbours -- so this reuses the nearfield kernel and one
+ * resident copy of the panel geometry rather than the per-block path, which
+ * took a global mutex and issued about ten synchronous CUDA calls per block.
+ *
+ * All HMsize^2 pairs of a block go to the device, not just the disjoint ones.
+ * Sorting them out first would need either a second nrCommonVtx pass or a
+ * compaction step, and the shared-vertex, shared-edge and self cases are only a
+ * few percent of the pairs, so computing values that are then ignored is
+ * cheaper than the bookkeeping to avoid it.
+ *
+ * Returns 0 if anything is unavailable, leaving the caller to run the original
+ * path over the whole range.
+ */
+static int precondSetupBatchedGpu(ssystem *sys, cube **cubes, int nBlocks,
+                                  double scale1, double scale2, int buildLU) {
+  long long cap = precondBatchPairCap();
+  long long *pairOffset = NULL;
+  int *pairSrc = NULL, *pairDst = NULL;
+  double *k[4] = {NULL, NULL, NULL, NULL};
+  int b0, i, ok = 1;
+
+  if (!useGpuPrecondDisjoint(sys) || nBlocks <= 0) return 0;
+  /*
+   * Below this the per-block path is faster and this one is declined.
+   *
+   * The per-block build issues its CUDA calls from the setup pool under a
+   * mutex, so while one thread is inside the driver the other 71 are doing
+   * nrCommonVtx, allocation and dgetrf. That overlap is worth more than the
+   * launch overhead removed here until there are enough blocks for the
+   * overhead to dominate. Measured setupPC, per-block against batched:
+   *
+   *      11,257 blocks   1.276 s | 1.401 s   (0.91x -- per-block wins)
+   *      45,444 blocks   2.375 s | 0.701 s   (3.39x)
+   *     161,005 blocks   1.191 s | 0.439 s   (2.71x)
+   *   1,391,176 blocks 111.961 s | 78.932 s  (1.42x, capsid sdens=2)
+   *
+   * The crossover sits between the first two, so the threshold is placed
+   * between them rather than at a measured point. Block counts here are not a
+   * proxy for problem size: more blocks means smaller blocks, which is why the
+   * per-block column is not monotonic.
+   */
+  {
+    const char *env = getenv("FABIPB_PRECOND_BATCH_MIN_BLOCKS");
+    long minBlocks = 32768;
+    if (env != NULL && env[0] != '\0') {
+      char *end = NULL;
+      long v = strtol(env, &end, 10);
+      if (end != env && *end == '\0' && v >= 0) minBlocks = v;
+    }
+    if ((long)nBlocks < minBlocks) return 0;
+  }
+
+  pairOffset = (long long *)calloc((size_t)nBlocks, sizeof(long long));
+  pairSrc = (int *)malloc((size_t)cap * sizeof(int));
+  pairDst = (int *)malloc((size_t)cap * sizeof(int));
+  for (i = 0; i < 4; i++) k[i] = (double *)malloc((size_t)cap * sizeof(double));
+  if (pairOffset == NULL || pairSrc == NULL || pairDst == NULL ||
+      k[0] == NULL || k[1] == NULL || k[2] == NULL || k[3] == NULL) {
+    ok = 0;
+  }
+
+  for (b0 = 0; ok && b0 < nBlocks; ) {
+    long long used = 0;
+    int b1 = b0;
+    int idx;
+
+    /* Grow the batch while it fits; always take at least one block. */
+    while (b1 < nBlocks) {
+      long long need = (long long)cubes[b1]->nPnls * (long long)cubes[b1]->nPnls;
+      if (b1 > b0 && used + need > cap) break;
+      pairOffset[b1] = used;
+      used += need;
+      b1++;
+      if (used >= cap) break;
+    }
+    if (used > cap) { ok = 0; break; }
+
+    /* Threaded: blocks write disjoint segments of the pair arrays. */
+    {
+      PrecondFillTask fill;
+      fill.cubes = cubes;
+      fill.pairOffset = pairOffset;
+      fill.pairSrc = pairSrc;
+      fill.pairDst = pairDst;
+      runPrecondFill(&fill, b0, b1);
+    }
+
+    if (!gpuBuildPrecondPairsBatched(sys, pairSrc, pairDst, used,
+                                     k[0], k[1], k[2], k[3])) {
+      ok = 0;
+      break;
+    }
+    runPrecondSetupRange(sys, cubes, b0, b1, scale1, scale2, buildLU,
+                         k[0], k[1], k[2], k[3], pairOffset);
+    b0 = b1;
+  }
+
+  free(pairOffset);
+  free(pairSrc);
+  free(pairDst);
+  for (i = 0; i < 4; i++) free(k[i]);
+  return ok;
 }
 
 static void *precondApplyLUWorker(void *arg) {
@@ -563,12 +591,29 @@ void setupPreconditioning(ssystem *sys) {
 
   nPrecondBlocks = idx;
   maxnPnls *= 2;
-  CALLOC_FULL(matrixA, maxnPnls * maxnPnls, double, OFF, ASOLVER);
+  /*
+   * The dense block is indexed as pcBlocks[idx][i*Msize+j] with int arithmetic
+   * throughout, so a leaf holding more than 2^31/2 panels per side wraps the
+   * index negative and writes outside the block. That needs ~23k panels in one
+   * leaf cube, which only happens when a very large mesh is run on a shallow
+   * tree (the 41M-panel production run peaked at 105 per leaf). Catch it here
+   * with an actionable message rather than corrupting the heap.
+   */
+  if (maxnPnls > 46340) {
+    fprintf(stderr,
+            "Error: preconditioner leaf block is %d x %d, too large to index with "
+            "32-bit arithmetic.\n"
+            "       The tree is too shallow for this mesh: increase -t (current depth %d) "
+            "or use -P=3 (diagonal preconditioner).\n",
+            maxnPnls, maxnPnls, sys->depth);
+    exit(1);
+  }
+  CALLOC_FULL(matrixA, (size_t)maxnPnls * (size_t)maxnPnls, double, OFF, ASOLVER);
   CALLOC_FULL(ipiv, maxnPnls, int, OFF, ASOLVER);
   CALLOC_FULL(rhs, maxnPnls, double, OFF, ASOLVER);
-  if (sys->precondCacheMode > 0 || sys->debugComparePrecond > 0) {
+  if ((sys->precondCacheMode > 0 && sys->precondCacheMode != 3) ||
+      sys->debugComparePrecond > 0) {
     cube **precondCubes;
-    int nThreads;
     CALLOC_FULL(pcBlocks, nPrecondBlocks, double *, OFF, ASOLVER);
     CALLOC_FULL(pcBlockSize, nPrecondBlocks, int, OFF, ASOLVER);
     if (sys->precondCacheMode > 1 || sys->debugComparePrecond > 0) {
@@ -583,43 +628,23 @@ void setupPreconditioning(ssystem *sys) {
 
       precondCubes[idx] = cb;
       pcBlockSize[idx] = Msize;
-      CALLOC_FULL(pcBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
+      CALLOC_FULL(pcBlocks[idx], (size_t)Msize * (size_t)Msize, double, OFF, ASOLVER);
       if (pcLUBlocks != NULL) {
-        CALLOC_FULL(pcLUBlocks[idx], Msize * Msize, double, OFF, ASOLVER);
+        CALLOC_FULL(pcLUBlocks[idx], (size_t)Msize * (size_t)Msize, double, OFF, ASOLVER);
         CALLOC_FULL(pcIpivBlocks[idx], Msize, int, OFF, ASOLVER);
       }
     }
-    nThreads = setupThreadCountPc(nPrecondBlocks);
-    if (nThreads <= 1) {
-      PrecondSetupTask task;
-      task.sys = sys;
-      task.cubes = precondCubes;
-      task.begin = 0;
-      task.end = nPrecondBlocks;
-      task.scale1 = scale1;
-      task.scale2 = scale2;
-      task.buildLU = (pcLUBlocks != NULL);
-      precondSetupWorker(&task);
-    } else {
-      pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
-      PrecondSetupTask *tasks = (PrecondSetupTask *)calloc((size_t)nThreads, sizeof(PrecondSetupTask));
-      ASSERT(threads != NULL);
-      ASSERT(tasks != NULL);
-      for (idx = 0; idx < nThreads; idx++) {
-        tasks[idx].sys = sys;
-        tasks[idx].cubes = precondCubes;
-        tasks[idx].begin = (nPrecondBlocks * idx) / nThreads;
-        tasks[idx].end = (nPrecondBlocks * (idx + 1)) / nThreads;
-        tasks[idx].scale1 = scale1;
-        tasks[idx].scale2 = scale2;
-        tasks[idx].buildLU = (pcLUBlocks != NULL);
-        pthread_create(&threads[idx], NULL, precondSetupWorker, &tasks[idx]);
-      }
-      for (idx = 0; idx < nThreads; idx++) {
-        pthread_join(threads[idx], NULL);
-      }
-      free(tasks);
-      free(threads);
+    /*
+     * Batched GPU build first: the block pairs duplicate nearfield pairs, so it
+     * shares that kernel and one resident panel-geometry upload instead of the
+     * per-block path's mutex and ~10 synchronous CUDA calls per block. Falls
+     * back to the original per-block build if anything is unavailable.
+     */
+    if (!precondSetupBatchedGpu(sys, precondCubes, nPrecondBlocks,
+                                scale1, scale2, (pcLUBlocks != NULL))) {
+      runPrecondSetupRange(sys, precondCubes, 0, nPrecondBlocks,
+                           scale1, scale2, (pcLUBlocks != NULL),
+                           NULL, NULL, NULL, NULL, NULL);
     }
     free(precondCubes);
   }
@@ -629,6 +654,81 @@ void setupPreconditioning(ssystem *sys) {
   }
 }
 
+
+/*
+ * Pure diagonal (Jacobi) preconditioner: divides each unknown by its own
+ * diagonal system entry (scale1*area for the potential block, scale2*area
+ * for the normal-derivative block -- see the identical scale1*pnl->area /
+ * scale2*pnl->area terms added in MtVmain), with zero inter-panel coupling.
+ * This mirrors TABI-PB's default `precondition_diagonal` (precondition.cpp),
+ * adapted to root's own Galerkin diagonal, which is area-weighted where
+ * TABI-PB's node-patch collocation diagonal is a bare constant.
+ */
+int PtVfmmDiagonal(double *pot, double *sgm) {
+  int nPnls = sys->nPnls;
+  double scale1 = (1.0 + epsilon) / 2.0;
+  double scale2 = (1.0 + 1.0 / epsilon) / 2.0;
+  const double *area = sys->panelArea;
+  int i;
+
+  /* Indexed over the contiguous area array rather than walking the panel list;
+   * see buildPanelIndex() in fmm.c. Entries are independent, so the loop is
+   * split across threads with disjoint output ranges -- the result does not
+   * depend on the thread count. */
+  {
+    int nThreads = applyThreadCountPc(nPnls);
+    if (nThreads <= 1) {
+      for (i = 0; i < nPnls; i++) {
+        pot[i] = sgm[i] / (scale1 * area[i]);
+        pot[nPnls + i] = sgm[nPnls + i] / (scale2 * area[i]);
+      }
+    } else {
+      pthread_t *threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+      DiagPrecondTask *tasks =
+          (DiagPrecondTask *)calloc((size_t)nThreads, sizeof(DiagPrecondTask));
+      int t, created = 0;
+
+      if (threads == NULL || tasks == NULL) {
+        free(threads);
+        free(tasks);
+        for (i = 0; i < nPnls; i++) {
+          pot[i] = sgm[i] / (scale1 * area[i]);
+          pot[nPnls + i] = sgm[nPnls + i] / (scale2 * area[i]);
+        }
+        return 0;
+      }
+      for (t = 0; t < nThreads; t++) {
+        tasks[t].pot = pot;
+        tasks[t].sgm = sgm;
+        tasks[t].area = area;
+        tasks[t].nPnls = nPnls;
+        tasks[t].scale1 = scale1;
+        tasks[t].scale2 = scale2;
+        tasks[t].begin = (int)(((long long)nPnls * t) / nThreads);
+        tasks[t].end = (int)(((long long)nPnls * (t + 1)) / nThreads);
+        if (pthread_create(&threads[t], NULL, diagPrecondWorker, &tasks[t]) != 0) {
+          break;
+        }
+        created++;
+      }
+      for (t = 0; t < created; t++) {
+        pthread_join(threads[t], NULL);
+      }
+      if (created < nThreads) {
+        /* Cover whatever the unstarted threads would have done. */
+        int from = (created > 0) ? tasks[created - 1].end : 0;
+        for (i = from; i < nPnls; i++) {
+          pot[i] = sgm[i] / (scale1 * area[i]);
+          pot[nPnls + i] = sgm[nPnls + i] / (scale2 * area[i]);
+        }
+      }
+      free(tasks);
+      free(threads);
+    }
+  }
+
+  return 0;
+} /* PtVfmmDiagonal */
 
 /*
  * Preconditioner by using the direct summation matrix
@@ -646,12 +746,8 @@ int PtVfmm(double *pot, double *sgm) {
   scale2 = (1.0+1.0/epsilon)/2.0;
 
   for ( idx=0, cb=sys->cubeList[nlevel]; cb != NULL; cb=cb->next ) {
-    double *debugA = NULL;
-    double *debugRhs = NULL;
-    int debugThisBlock;
     Msize = 2*cb->nPnls;
     HMsize = cb->nPnls;
-    debugThisBlock = precondDebugBlockEnabled(idx);
 
     t0 = wall_seconds_pc();
     for ( i=0, pnlY=cb->pnls; i<HMsize; i++, pnlY=pnlY->nextC ) {
@@ -669,27 +765,25 @@ int PtVfmm(double *pot, double *sgm) {
       rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
     }
     pcAssembleTime += wall_seconds_pc() - t0;
-    if (debugThisBlock) {
-      debugA = (double *)malloc((size_t)Msize * (size_t)Msize * sizeof(double));
-      debugRhs = (double *)malloc((size_t)Msize * sizeof(double));
-      ASSERT(debugA != NULL);
-      ASSERT(debugRhs != NULL);
-      memcpy(debugA, matrixA, (size_t)Msize * (size_t)Msize * sizeof(double));
-      memcpy(debugRhs, rhs, (size_t)Msize * sizeof(double));
-    }
 
     t0 = wall_seconds_pc();
+    /* inc doubles as the LAPACK INFO out-parameter here and was never
+     * inspected: a singular leaf block left a zero pivot in U, and the dgetrs
+     * below then divided by it, seeding inf/NaN into the preconditioned vector
+     * and silently poisoning the Krylov basis. PtVfmmCachedLU already checks. */
     dgetrf_( &Msize, &Msize, matrixA, &Msize, ipiv, &inc );
-    if (debugThisBlock) {
-      printLuDiagnostics("apply-original", idx, Msize, matrixA, ipiv, inc);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrf failed in preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcFactorTime += wall_seconds_pc() - t0;
     t0 = wall_seconds_pc();
     dgetrs_( &nChr, &Msize, &oneI, matrixA, &Msize, ipiv, rhs, &Msize, &inc );
-    if (debugThisBlock) {
-      printSolveDiagnostics("apply-original", idx, Msize, debugA, debugRhs, rhs);
-      free(debugA);
-      free(debugRhs);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrs failed in preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcSolveTime += wall_seconds_pc() - t0;
 
@@ -725,11 +819,8 @@ int PtVfmmCached(double *pot, double *sgm) {
   ASSERT(pcBlockSize != NULL);
 
   for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
-    double *debugRhs = NULL;
-    int debugThisBlock;
     Msize = pcBlockSize[idx];
     HMsize = cb->nPnls;
-    debugThisBlock = precondDebugBlockEnabled(idx);
 
     t0 = wall_seconds_pc();
     memcpy(matrixA, pcBlocks[idx], (size_t)Msize * (size_t)Msize * sizeof(double));
@@ -738,23 +829,21 @@ int PtVfmmCached(double *pot, double *sgm) {
       rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
     }
     pcAssembleTime += wall_seconds_pc() - t0;
-    if (debugThisBlock) {
-      debugRhs = (double *)malloc((size_t)Msize * sizeof(double));
-      ASSERT(debugRhs != NULL);
-      memcpy(debugRhs, rhs, (size_t)Msize * sizeof(double));
-    }
 
     t0 = wall_seconds_pc();
     dgetrf_(&Msize, &Msize, matrixA, &Msize, ipiv, &inc);
-    if (debugThisBlock) {
-      printLuDiagnostics("apply-cached", idx, Msize, matrixA, ipiv, inc);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrf failed in cached preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcFactorTime += wall_seconds_pc() - t0;
     t0 = wall_seconds_pc();
     dgetrs_(&nChr, &Msize, &oneI, matrixA, &Msize, ipiv, rhs, &Msize, &inc);
-    if (debugThisBlock) {
-      printSolveDiagnostics("apply-cached", idx, Msize, pcBlocks[idx], debugRhs, rhs);
-      free(debugRhs);
+    if (inc != 0) {
+      fprintf(stderr, "Error: dgetrs failed in cached preconditioner apply for leaf %d (info=%d)\n",
+              idx, inc);
+      exit(1);
     }
     pcSolveTime += wall_seconds_pc() - t0;
 
@@ -773,13 +862,8 @@ int PtVfmmCached(double *pot, double *sgm) {
 }
 
 int PtVfmmCachedLU(double *pot, double *sgm) {
-  static int firstApplyLogged = 0;
   int i, idx, Msize, HMsize, info;
   int nPnls = sys->nPnls;
-  int debugFirstApply = precondFirstApplyDebugEnabled() && !firstApplyLogged;
-  int firstApplyMaxBlock = -1;
-  int firstApplyMaxLocal = -1;
-  double firstApplyMaxAbs = 0.0;
   cube *cb;
   double t0;
 
@@ -805,8 +889,8 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       for (idx = 0; idx < nThreads; idx++) {
         int maxRhs = 2 * pcBlockSizeMax;
         tasks[idx].cubes = applyCubes;
-        tasks[idx].begin = (nPrecondBlocks * idx) / nThreads;
-        tasks[idx].end = (nPrecondBlocks * (idx + 1)) / nThreads;
+        tasks[idx].begin = (int)(((long long)nPrecondBlocks * idx) / nThreads);
+        tasks[idx].end = (int)(((long long)nPrecondBlocks * (idx + 1)) / nThreads);
         tasks[idx].nPnls = nPnls;
         tasks[idx].sgm = sgm;
         tasks[idx].pot = pot;
@@ -838,11 +922,8 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
   }
 
   for (idx = 0, cb = sys->cubeList[nlevel]; cb != NULL; cb = cb->next, idx++) {
-    double *debugRhs = NULL;
-    int debugThisBlock;
     Msize = pcBlockSize[idx];
     HMsize = cb->nPnls;
-    debugThisBlock = precondDebugBlockEnabled(idx);
 
     t0 = wall_seconds_pc();
     for (i = 0; i < HMsize; i++) {
@@ -850,48 +931,9 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       rhs[i+HMsize] = sgm[nPnls+cb->pnls->idx+i];
     }
     pcAssembleTime += wall_seconds_pc() - t0;
-    if (debugThisBlock || (debugFirstApply && idx < precondDebugLimit())) {
-      debugRhs = (double *)malloc((size_t)Msize * sizeof(double));
-      ASSERT(debugRhs != NULL);
-      memcpy(debugRhs, rhs, (size_t)Msize * sizeof(double));
-    }
-    if (debugThisBlock) {
-      printLuDiagnostics("apply-cached-lu", idx, Msize, pcLUBlocks[idx], pcIpivBlocks[idx], 0);
-    }
 
     t0 = wall_seconds_pc();
     dgetrs_(&nChr, &Msize, &oneI, pcLUBlocks[idx], &Msize, pcIpivBlocks[idx], rhs, &Msize, &info);
-    if (debugThisBlock) {
-      printSolveDiagnostics("apply-cached-lu", idx, Msize, pcBlocks[idx], debugRhs, rhs);
-    }
-    if (debugFirstApply) {
-      int localMaxIdx = 0;
-      double localMaxAbs = 0.0;
-      for (i = 0; i < Msize; i++) {
-        double av = fabs(rhs[i]);
-        if (av > localMaxAbs) {
-          localMaxAbs = av;
-          localMaxIdx = i;
-        }
-      }
-      if (idx < precondDebugLimit() && debugRhs != NULL) {
-        printf("PRECOND first-apply block=%d rhs_inf=%e out_inf=%e max_abs=%e local_idx=%d\n",
-               idx, vecInfNorm(debugRhs, Msize), vecInfNorm(rhs, Msize), localMaxAbs, localMaxIdx);
-      }
-      if (localMaxAbs > firstApplyMaxAbs) {
-        if (debugFirstApply) {
-          double rhsInf = (debugRhs != NULL) ? vecInfNorm(debugRhs, Msize) : -1.0;
-          printf("PRECOND first-apply new-max block=%d size=%d rhs_inf=%e out_inf=%e max_abs=%e local_idx=%d\n",
-                 idx, Msize, rhsInf, vecInfNorm(rhs, Msize), localMaxAbs, localMaxIdx);
-        }
-        firstApplyMaxAbs = localMaxAbs;
-        firstApplyMaxBlock = idx;
-        firstApplyMaxLocal = localMaxIdx;
-      }
-    }
-    if (debugRhs != NULL) {
-      free(debugRhs);
-    }
     if (info != 0) {
       fprintf(stderr, "Error: dgetrs failed in cached LU apply for leaf %d (info=%d)\n",
               idx, info);
@@ -908,12 +950,6 @@ int PtVfmmCachedLU(double *pot, double *sgm) {
       rhs[i] = 0.0;
     }
     pcScatterTime += wall_seconds_pc() - t0;
-  }
-
-  if (debugFirstApply) {
-    printf("PRECOND first-apply summary: max_block=%d max_local_idx=%d max_abs=%e\n",
-           firstApplyMaxBlock, firstApplyMaxLocal, firstApplyMaxAbs);
-    firstApplyLogged = 1;
   }
 
   return 0;

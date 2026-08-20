@@ -1,11 +1,12 @@
 #!/usr/bin/env sh
 set -eu
 
+. "$(dirname "$0")/mesh_control.sh"
+
 BUILD_DIR="${BUILD_DIR:-build}"
 DEPTHS="${DEPTHS:-5 6 7 8}"
 HYBRID_SETUP_THREADS="${HYBRID_SETUP_THREADS:-8}"
 REPEATS="${REPEATS:-10}"
-MESH_DENSITY="${MESH_DENSITY:-10}"
 DIRECT_APPENDIX="${DIRECT_APPENDIX:-1}"
 DIRECT_DEPTH="${DIRECT_DEPTH:-5}"
 
@@ -28,8 +29,10 @@ if [ ! -x "$BUILD_DIR/fabipb" ]; then
   exit 2
 fi
 
+mesh_control_init
+
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$BUILD_DIR/benchmark_matrix/$timestamp}"
+OUT_DIR="${OUT_DIR:-results/benchmark_matrix/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 raw_csv="$OUT_DIR/results.csv"
@@ -37,11 +40,8 @@ summary_csv="$OUT_DIR/summary.csv"
 raw_repeats_csv="$OUT_DIR/results_raw.csv"
 direct_raw_csv="$OUT_DIR/direct_results_raw.csv"
 direct_csv="$OUT_DIR/direct_results.csv"
-prep_log="$OUT_DIR/prep.log"
-
-echo "Preparing mesh artifacts for $panel at density $MESH_DENSITY ..."
-FABIPB_SETUP_THREADS=1 \
-  ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=0 -m=1 -d="$MESH_DENSITY" "$panel" >"$prep_log" 2>&1
+prep_log="$OUT_DIR/mesh_control.txt"
+mesh_control_write_summary "$prep_log" "$panel"
 
 cat >"$raw_repeats_csv" <<'EOF'
 case_name,depth,config,repeat,gpu_mode,gpu_q2m_mode,setup_threads,ttl,its,energy,loadPanel,gkInit,setupFMM,setupPC,setupRHS,gmres,treecode,setupFMM_leaf,setupFMM_cube_alloc,setupFMM_layout,setupFMM_apply,setupFMM_panel_index,setupFMM_cubes,setupFMM_m2l_pairs,setupFMM_m2l_groups,gmres_matvec,gmres_psolve,gmres_basis,gmres_update,gmres_residual,gmres_other,pc_assemble,pc_factor,pc_solve,pc_scatter,pc_other,applyFMM,Q2M,M2M,M2L,L2L,L2P,Near,near_build,near_h2d,near_kernel,near_d2h,near_meta,near_coeff,near_upload,near_other
@@ -195,10 +195,10 @@ run_case() {
   if [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" "$panel" $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" "$panel" $solver_args >"$log" 2>&1
   else
     FABIPB_SETUP_THREADS="$setup_threads" \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" -m=0 -t="$depth" "$panel" >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g="$gpu_mode" -Q="$q2m_mode" "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$depth" "$panel" >"$log" 2>&1
   fi
 
   echo "$log"
@@ -211,10 +211,10 @@ run_direct_case() {
   if [ -n "$solver_args" ]; then
     # shellcheck disable=SC2086
     FABIPB_SETUP_THREADS=1 \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 -m=0 -t="$DIRECT_DEPTH" "$panel" $solver_args >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$DIRECT_DEPTH" "$panel" $solver_args >"$log" 2>&1
   else
     FABIPB_SETUP_THREADS=1 \
-      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 -m=0 -t="$DIRECT_DEPTH" "$panel" >"$log" 2>&1
+      ./scripts/with_benchmark_env.sh "$BUILD_DIR/fabipb" -B=1 -g=1 -r=1 "$MESH_ARG_MODE" "$MESH_ARG_PARAM" -t="$DIRECT_DEPTH" "$panel" >"$log" 2>&1
   fi
 
   echo "$log"
@@ -398,13 +398,12 @@ echo "Benchmark matrix"
 echo "  panel: $panel"
 echo "  depths: $DEPTHS"
 echo "  repeats: $REPEATS"
-echo "  mesh density: $MESH_DENSITY"
+echo "  mesh backend: $MESH_BACKEND"
+echo "  mesh control: $MESH_CONTROL_LABEL = $MESH_CONTROL_VALUE"
 echo "  hybrid setup threads: $HYBRID_SETUP_THREADS"
 echo "  direct appendix: $DIRECT_APPENDIX"
 echo "  direct depth: $DIRECT_DEPTH"
-if [ -f "$prep_log" ]; then
-  echo "  prep: $prep_log"
-fi
+echo "  mesh control log: $prep_log"
 echo
 
 for depth in $DEPTHS; do
