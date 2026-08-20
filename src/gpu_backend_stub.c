@@ -75,6 +75,21 @@ int gpuBuildPrecondDisjointBlock(panel **panels, int nPanels,
   return 0;
 }
 
+int gpuBuildPrecondPairsBatched(ssystem *sys,
+                                const int *pairSrc, const int *pairDst,
+                                long long nPairs,
+                                double *k0, double *k1, double *k2, double *k3) {
+  (void)sys;
+  (void)pairSrc;
+  (void)pairDst;
+  (void)nPairs;
+  (void)k0;
+  (void)k1;
+  (void)k2;
+  (void)k3;
+  return 0;
+}
+
 int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   (void)sys; (void)sgm; (void)pot;
   return 0;
