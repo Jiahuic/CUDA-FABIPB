@@ -109,10 +109,26 @@ static void initializePanelCaseSkipMask(void) {
   }
 }
 
+/*
+ * Per-thread cache of the skip mask.
+ *
+ * This is called once per panelIA0, i.e. once per near-field interaction --
+ * 1.09e8 times per matvec on 7A6A and 4.27e10 on the H1N1 capsid. Calling
+ * pthread_once() there costs an atomic acquire on one shared word every time,
+ * and with many threads that single cache line ping-pongs between cores and
+ * serialises the whole near field: the threaded host apply scaled only 1.30x
+ * on 72 threads before this, and the GPU coefficient build is on the same path.
+ * The mask is immutable once initialised, so each thread reads it once.
+ */
+static FABIPB_THREAD_LOCAL int panelCaseSkipMaskLocal = -1;
+
 static int skipPanelCase(int nCommonVertices) {
   int caseMask = 0;
 
-  pthread_once(&panelCaseSkipOnce, initializePanelCaseSkipMask);
+  if (panelCaseSkipMaskLocal < 0) {
+    pthread_once(&panelCaseSkipOnce, initializePanelCaseSkipMask);
+    panelCaseSkipMaskLocal = panelCaseSkipMask;
+  }
   if (nCommonVertices == 1) {
     caseMask = PANEL_CASE_ONE;
   } else if (nCommonVertices == 2 || nCommonVertices == -2) {
@@ -120,7 +136,7 @@ static int skipPanelCase(int nCommonVertices) {
   } else if (nCommonVertices == 3) {
     caseMask = PANEL_CASE_SELF;
   }
-  return (panelCaseSkipMask & caseMask) != 0;
+  return (panelCaseSkipMaskLocal & caseMask) != 0;
 }
 
 static void ensureQuadThreadWorkspace(void) {

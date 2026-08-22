@@ -122,6 +122,14 @@ struct ssystem {
   int nNearPairsFlat;       /* flattened leaf-neighbor pair count */
   int *nearPairSrc;         /* flattened nearfield source leaf index */
   int *nearPairDst;         /* flattened nearfield target leaf index */
+  /*
+   * First near-pair index of each destination leaf, nLeafCubesFlat+1 entries.
+   * buildApplyLayout emits pairs destination-major -- the destination cube is
+   * the outer loop and leafFlatIdx is assigned in the same cubeList order -- so
+   * this is a running offset, not a sort. It lets the host near-field apply be
+   * split across threads by destination leaf, giving disjoint pot[] output.
+   */
+  int *nearLeafPairOffset;
   int nFmmCubesFlat;        /* flattened FMM cube count across active levels */
   struct cube **fmmCubeByIdx; /* flattened cube lookup by active FMM index */
   int nM2LPairsFlat;        /* flattened M2L interaction count */

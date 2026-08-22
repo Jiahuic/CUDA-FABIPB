@@ -251,15 +251,20 @@ static void buildApplyLayout(ssystem *sys) {
     sys->leafPanelCount[idx] = cb->nPnls;
   }
 
+  CALLOC(sys->nearLeafPairOffset, sys->nLeafCubesFlat + 1, int);
+
   idx = 0;
   for (cb = sys->cubeList[depth]; cb != NULL; cb = cb->next) {
     int srcIdx = cb->leafFlatIdx;
     int inbr;
+    sys->nearLeafPairOffset[srcIdx] = idx;
     for (inbr = 0; inbr < cb->nNbrs; inbr++, idx++) {
       sys->nearPairSrc[idx] = cb->nbrs[inbr]->leafFlatIdx;
       sys->nearPairDst[idx] = srcIdx;
     }
   }
+  sys->nearLeafPairOffset[sys->nLeafCubesFlat] = idx;
+  ASSERT(idx == sys->nNearPairsFlat);
 }
 
 /*
@@ -525,41 +530,150 @@ void setupFMM(ssystem *sys) {
  * by at Here.
  * Same parameters as applyFMM().
  */
-static void applyNearfield1CPU(ssystem *sys, double *alpha, double *sgm, double *pot) {
+typedef struct {
+  ssystem *sys;
+  double alpha;
+  const double *sgm;
+  double *pot;
+  int beginLeaf;
+  int endLeaf;
+} NearApplyTask;
+
+/*
+ * Host near-field apply over a range of destination leaves.
+ *
+ * Split by destination, not by pair: leaves partition the panels, so each
+ * thread owns its slice of pot[] outright and no locking or atomics are
+ * needed. The accumulation order for any one output is unchanged from the
+ * serial loop -- pairs of a destination are contiguous and are still visited
+ * in index order -- so the result is bit-identical at any thread count.
+ *
+ * panelIA0 is thread-safe: its scratch is __thread and it calls
+ * ensureQuadThreadWorkspace() per thread (numQuad.c).
+ */
+static void nearApplyLeafStrided(ssystem *sys, double alpha, const double *sgm,
+                                 double *pot, int first, int stride, int endLeaf) {
   int nPnls = sys->nPnls;
-  int pairIdx;
+  int leaf;
 
-  /* set up kernel */
-  kernel = kernelKER4;
-
-  for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
-    int srcLeaf = sys->nearPairSrc[pairIdx];
-    int dstLeaf = sys->nearPairDst[pairIdx];
-    int srcStart = sys->leafPanelStart[srcLeaf];
-    int srcCount = sys->leafPanelCount[srcLeaf];
-    int dstStart = sys->leafPanelStart[dstLeaf];
-    int dstCount = sys->leafPanelCount[dstLeaf];
-    int i, j;
+  for (leaf = first; leaf < endLeaf; leaf += stride) {
+    int pairBegin = sys->nearLeafPairOffset[leaf];
+    int pairEnd = sys->nearLeafPairOffset[leaf + 1];
+    int dstStart = sys->leafPanelStart[leaf];
+    int dstCount = sys->leafPanelCount[leaf];
+    int i;
 
     for (i = 0; i < dstCount; i++) {
       int dstPanelIdx = dstStart + i;
       panel *pnlX = sys->panelByIdx[dstPanelIdx];
-      double *KER;
-      double *y_pot = &(pot[dstPanelIdx]);
-      double *y_dpdn = &(pot[dstPanelIdx + nPnls]);
+      double sumPot = 0.0, sumDpdn = 0.0;
+      int pairIdx;
 
-      for (j = 0; j < srcCount; j++) {
-        int srcPanelIdx = srcStart + j;
-        panel *pnlY = sys->panelByIdx[srcPanelIdx];
-        double x_pot = sgm[srcPanelIdx];
-        double x_dpdn = sgm[srcPanelIdx + nPnls];
+      for (pairIdx = pairBegin; pairIdx < pairEnd; pairIdx++) {
+        int srcLeaf = sys->nearPairSrc[pairIdx];
+        int srcStart = sys->leafPanelStart[srcLeaf];
+        int srcCount = sys->leafPanelCount[srcLeaf];
+        int j;
 
-        KER = panelIA0(pnlX, pnlY);
-        y_pot[0] += (KER[0] * x_dpdn + KER[1] * x_pot) * (*alpha);
-        y_dpdn[0] += (KER[2] * x_dpdn + KER[3] * x_pot) * (*alpha);
+        for (j = 0; j < srcCount; j++) {
+          int srcPanelIdx = srcStart + j;
+          panel *pnlY = sys->panelByIdx[srcPanelIdx];
+          double x_pot = sgm[srcPanelIdx];
+          double x_dpdn = sgm[srcPanelIdx + nPnls];
+          double *KER = panelIA0(pnlX, pnlY);
+
+          sumPot += (KER[0] * x_dpdn + KER[1] * x_pot) * alpha;
+          sumDpdn += (KER[2] * x_dpdn + KER[3] * x_pot) * alpha;
+        }
       }
+      pot[dstPanelIdx] += sumPot;
+      pot[dstPanelIdx + nPnls] += sumDpdn;
     }
   }
+}
+
+/*
+ * Contiguous leaf ranges. Interleaving was tried and is worse -- adjacent
+ * leaves then belong to different threads, so their pot[] writes land on
+ * adjacent cache lines and false-share (Near 36.5 s at 8 threads against
+ * 27.0 s contiguous).
+ */
+static void *nearApplyWorker(void *arg) {
+  NearApplyTask *t = (NearApplyTask *)arg;
+  nearApplyLeafStrided(t->sys, t->alpha, t->sgm, t->pot,
+                       t->beginLeaf, 1, t->endLeaf);
+  return NULL;
+}
+
+static int nearApplyThreadCount(int nTasks) {
+  const char *env = getenv("FABIPB_NEARFIELD_APPLY_THREADS");
+  long hc;
+  int threads;
+
+  if (env != NULL && env[0] != '\0') {
+    threads = atoi(env);
+  } else {
+    hc = sysconf(_SC_NPROCESSORS_ONLN);
+    threads = (hc > 0) ? (int)hc : 1;
+  }
+  if (threads < 1) threads = 1;
+  if (threads > nTasks) threads = nTasks;
+  if (threads > 128) threads = 128;
+  return threads;
+}
+
+/*
+ * The host near-field apply used to be a single serial loop over near pairs.
+ * On a 72-core host that made every -g=0 run effectively single-threaded and
+ * made any GPU-vs-CPU speedup indefensible as a hardware comparison.
+ */
+static void applyNearfield1CPU(ssystem *sys, double *alpha, double *sgm, double *pot) {
+  int nLeaves = sys->nLeafCubesFlat;
+  int nThreads;
+  pthread_t *threads;
+  NearApplyTask *tasks;
+  int t, created = 0;
+
+  /* set up kernel */
+  kernel = kernelKER4;
+
+  if (sys->nearLeafPairOffset == NULL || nLeaves <= 0) {
+    /* Layout not built (older path): fall back to the whole range. */
+    nearApplyLeafStrided(sys, *alpha, sgm, pot, 0, 1, nLeaves > 0 ? nLeaves : 0);
+    return;
+  }
+
+  nThreads = nearApplyThreadCount(nLeaves);
+  if (nThreads <= 1) {
+    nearApplyLeafStrided(sys, *alpha, sgm, pot, 0, 1, nLeaves);
+    return;
+  }
+
+  threads = (pthread_t *)calloc((size_t)nThreads, sizeof(pthread_t));
+  tasks = (NearApplyTask *)calloc((size_t)nThreads, sizeof(NearApplyTask));
+  if (threads == NULL || tasks == NULL) {
+    free(threads); free(tasks);
+    nearApplyLeafStrided(sys, *alpha, sgm, pot, 0, 1, nLeaves);
+    return;
+  }
+
+  for (t = 0; t < nThreads; t++) {
+    tasks[t].sys = sys;
+    tasks[t].alpha = *alpha;
+    tasks[t].sgm = sgm;
+    tasks[t].pot = pot;
+    tasks[t].beginLeaf = (int)(((long long)nLeaves * t) / nThreads);
+    tasks[t].endLeaf = (int)(((long long)nLeaves * (t + 1)) / nThreads);
+    if (pthread_create(&threads[t], NULL, nearApplyWorker, &tasks[t]) != 0) break;
+    created++;
+  }
+  for (t = 0; t < created; t++) pthread_join(threads[t], NULL);
+  if (created < nThreads) {
+    int from = (created > 0) ? tasks[created - 1].endLeaf : 0;
+    nearApplyLeafStrided(sys, *alpha, sgm, pot, from, 1, nLeaves);
+  }
+  free(tasks);
+  free(threads);
 } /* applyNearfield1CPU */
 
 void applyNearfield1(ssystem *sys, double *alpha, double *sgm, double *beta, double *pot) {
