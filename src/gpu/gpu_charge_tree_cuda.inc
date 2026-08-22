@@ -616,6 +616,12 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   }
   tBuild1 = wall_seconds_cuda_local();
   if (gCTE.derivOrderMax + 1 >= 16) return 0;   /* fixed pointer arrays */
+  if (!cteStackDepthOk(sys->chgDepth)) {
+    setNearfieldLastError("charge-tree depth %d needs a %d-entry device stack, "
+                          "CTE_MAX_STACK is %d", sys->chgDepth,
+                          7 * sys->chgDepth + 1, CTE_MAX_STACK);
+    return 0;
+  }
 
   /* Two rows per level, each sized for the longest row that level can hold:
    * row(derivMax - p). levOff[derivMax+1] is the per-array total, which also
@@ -924,6 +930,12 @@ int gpuChargeTreeRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
     if (!buildChargeTreeGpu(sys)) { freeChargeTreeGpu(); return 0; }
   }
   if (gCTE.derivOrderMax + 1 >= 16) return 0;
+  if (!cteStackDepthOk(sys->chgDepth)) {
+    setNearfieldLastError("charge-tree depth %d needs a %d-entry device stack, "
+                          "CTE_MAX_STACK is %d", sys->chgDepth,
+                          7 * sys->chgDepth + 1, CTE_MAX_STACK);
+    return 0;
+  }
 
   if (scratchSys != sys) {
     cudaFree(d_scratch); d_scratch = NULL;

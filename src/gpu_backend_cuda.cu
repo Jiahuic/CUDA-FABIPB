@@ -833,7 +833,27 @@ int gpuSetupRHS(ssystem *sys, int qOrder, double fac, double *sgm) {
  * the moment sum and the leaf charge sum across its lanes.
  * =================================================================== */
 
-#define CTE_MAX_STACK 64
+/*
+ * Depth-first stack depth for the charge-tree walk.
+ *
+ * Worst case is 7*chgDepth + 1: the walk pops one node and pushes up to eight,
+ * a net +7, and at most chgDepth expansions happen before the path reaches a
+ * leaf, which does not expand. That is exactly 64 at depth 9 -- the depth ZIKV
+ * sdens=2 and H1N1 sdens=1 both run at -- so the previous value of 64 had zero
+ * margin, and depth 10 (71) overflowed. On overflow the push loop simply
+ * stopped, dropping whole subtrees with no error and returning a plausible but
+ * wrong energy.
+ *
+ * 128 covers depth 18. cteStackDepthOk() refuses the GPU path above that so the
+ * CPU fallback engages instead of truncating; the loop guard remains as a
+ * backstop against the bound above ever being wrong.
+ */
+#define CTE_MAX_STACK 128
+
+/* Largest chgDepth the device stack can hold. */
+static int cteStackDepthOk(int chgDepth) {
+  return (7 * chgDepth + 1) <= CTE_MAX_STACK;
+}
 
 /*
  * Row geometry of the Cartesian derivative tensor, from the nMom table already
