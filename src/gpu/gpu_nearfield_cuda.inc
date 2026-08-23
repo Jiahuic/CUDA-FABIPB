@@ -632,8 +632,17 @@ int buildNearfieldTables(const ssystem *sys) {
 
       workers.reserve((size_t)nThreads);
       for (t = 0; t < nThreads; t++) {
-        int begin = (sys->nNearPairsFlat * t) / nThreads;
-        int end = (sys->nNearPairsFlat * (t + 1)) / nThreads;
+        /*
+         * 64-bit split. nNearPairsFlat * t overflows a signed int once the pair
+         * count passes INT_MAX/nThreads -- 67,108,863 pairs at the 32-thread cap
+         * -- which produced a negative begin/end and an out-of-range read of
+         * nearPairSrc. Only the resident path reaches this loop, so it took a
+         * case that is both large and resident to expose it: 6CO8 sdens=1 at
+         * depth 9 has 92,779,203 pairs and segfaulted here, while the same mesh
+         * at depth 8 streams and never enters this code.
+         */
+        int begin = (int)(((long long)sys->nNearPairsFlat * t) / nThreads);
+        int end = (int)(((long long)sys->nNearPairsFlat * (t + 1)) / nThreads);
         workers.emplace_back([=, &threadCounts, &threadDisjointBuildCounts]() {
           int localPairIdx;
           long long *localCounts = &threadCounts[(size_t)t * 5U];

@@ -486,8 +486,9 @@ int gpuDirectApply(ssystem *sys, double alpha, double beta, const double *sgm, d
 
           workers.reserve((size_t)nThreads);
           for (t = 0; t < nThreads; t++) {
-            int begin = (dstCount * t) / nThreads;
-            int end = (dstCount * (t + 1)) / nThreads;
+            /* 64-bit split; see the note in gpu_nearfield_cuda.inc. */
+            int begin = (int)(((long long)dstCount * t) / nThreads);
+            int end = (int)(((long long)dstCount * (t + 1)) / nThreads);
             workers.emplace_back([=]() {
               int localDst, localS;
               for (localDst = begin; localDst < end; localDst++) {

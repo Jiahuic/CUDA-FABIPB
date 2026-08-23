@@ -210,8 +210,10 @@ int buildDirectTables(const ssystem *sys) {
 
         workers.reserve((size_t)nThreads);
         for (t = 0; t < nThreads; t++) {
-          int begin = (sys->nPnls * t) / nThreads;
-          int end = (sys->nPnls * (t + 1)) / nThreads;
+          /* 64-bit split; see the note in gpu_nearfield_cuda.inc. nPnls reaches
+           * 1.03e8, so the int product overflows above 67M panels. */
+          int begin = (int)(((long long)sys->nPnls * t) / nThreads);
+          int end = (int)(((long long)sys->nPnls * (t + 1)) / nThreads);
           workers.emplace_back([=]() {
             int localI, localJ;
             for (localI = begin; localI < end; localI++) {
