@@ -759,7 +759,7 @@ int gpuL2PApply(ssystem *sys, double alpha, double beta, double *pot) {
   l2pLeafKernel<<<gLeaf.nLeaves, 256>>>(
       sys->nPnls, gLeaf.nMom,
       gLeaf.d_leafPanelStart, gLeaf.d_leafPanelCount, gLeaf.d_leafMatrixOffset,
-      gLeaf.d_l2p0, gLeaf.d_l2p1,
+      gLeaf.d_q2m0, gLeaf.d_q2m1,   /* L2P matrices alias the Q2M ones */
       alpha, beta,
       gLeaf.d_lec1, gLeaf.d_lec2, gLeaf.d_lec3, gLeaf.d_lec4,
       gLeaf.d_pot);

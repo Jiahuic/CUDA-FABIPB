@@ -174,8 +174,8 @@ struct LeafTransformGpuCache {
   int *h_leafMatrixOffset;
   double *h_q2m0;
   double *h_q2m1;
-  double *h_l2p0;
-  double *h_l2p1;
+  /* No l2p arrays: L2P0/L2P1 alias Q2M0/Q2M1 (fmm.c), so the leaf transform
+   * cache stores one copy and l2pLeafKernel is handed the q2m pointers. */
   double *h_sgm;
   double *h_pot;
   double *h_momPot;
@@ -189,8 +189,6 @@ struct LeafTransformGpuCache {
   int *d_leafMatrixOffset;
   double *d_q2m0;
   double *d_q2m1;
-  double *d_l2p0;
-  double *d_l2p1;
   double *d_sgm;
   double *d_pot;
   double *d_momPot;

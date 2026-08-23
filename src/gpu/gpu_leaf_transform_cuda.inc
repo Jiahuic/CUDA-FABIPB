@@ -2,8 +2,6 @@ void freeLeafCache() {
   free(gLeaf.h_leafMatrixOffset);
   free(gLeaf.h_q2m0);
   free(gLeaf.h_q2m1);
-  free(gLeaf.h_l2p0);
-  free(gLeaf.h_l2p1);
   free(gLeaf.h_sgm);
   free(gLeaf.h_pot);
   free(gLeaf.h_momPot);
@@ -15,8 +13,6 @@ void freeLeafCache() {
   gLeaf.h_leafMatrixOffset = NULL;
   gLeaf.h_q2m0 = NULL;
   gLeaf.h_q2m1 = NULL;
-  gLeaf.h_l2p0 = NULL;
-  gLeaf.h_l2p1 = NULL;
   gLeaf.h_sgm = NULL;
   gLeaf.h_pot = NULL;
   gLeaf.h_momPot = NULL;
@@ -31,8 +27,6 @@ void freeLeafCache() {
   cudaFree(gLeaf.d_leafMatrixOffset);
   cudaFree(gLeaf.d_q2m0);
   cudaFree(gLeaf.d_q2m1);
-  cudaFree(gLeaf.d_l2p0);
-  cudaFree(gLeaf.d_l2p1);
   cudaFree(gLeaf.d_sgm);
   cudaFree(gLeaf.d_pot);
   cudaFree(gLeaf.d_momPot);
@@ -46,8 +40,6 @@ void freeLeafCache() {
   gLeaf.d_leafMatrixOffset = NULL;
   gLeaf.d_q2m0 = NULL;
   gLeaf.d_q2m1 = NULL;
-  gLeaf.d_l2p0 = NULL;
-  gLeaf.d_l2p1 = NULL;
   gLeaf.d_sgm = NULL;
   gLeaf.d_pot = NULL;
   gLeaf.d_momPot = NULL;
@@ -72,8 +64,6 @@ int allocateLeafHostArrays(const ssystem *sys, int nMom, long long totalEntries)
   gLeaf.h_leafMatrixOffset = (int *)malloc((nLeaves + 1U) * sizeof(int));
   gLeaf.h_q2m0 = (double *)malloc(total * sizeof(double));
   gLeaf.h_q2m1 = (double *)malloc(total * sizeof(double));
-  gLeaf.h_l2p0 = (double *)malloc(total * sizeof(double));
-  gLeaf.h_l2p1 = (double *)malloc(total * sizeof(double));
   gLeaf.h_sgm = (double *)malloc(vecPanels * sizeof(double));
   gLeaf.h_pot = (double *)malloc(vecPanels * sizeof(double));
   gLeaf.h_momPot = (double *)malloc(cubeMom * sizeof(double));
@@ -84,7 +74,6 @@ int allocateLeafHostArrays(const ssystem *sys, int nMom, long long totalEntries)
   gLeaf.h_lec4 = (double *)malloc(cubeMom * sizeof(double));
 
   return gLeaf.h_leafMatrixOffset && gLeaf.h_q2m0 && gLeaf.h_q2m1 &&
-         gLeaf.h_l2p0 && gLeaf.h_l2p1 &&
          gLeaf.h_sgm && gLeaf.h_pot &&
          gLeaf.h_momPot && gLeaf.h_momDpdn &&
          gLeaf.h_lec1 && gLeaf.h_lec2 && gLeaf.h_lec3 && gLeaf.h_lec4;
@@ -106,10 +95,6 @@ int allocateLeafDeviceArrays(const ssystem *sys, int nMom, long long totalEntrie
   err = cudaMalloc((void **)&gLeaf.d_q2m0, total * sizeof(double));
   if (err != cudaSuccess) return 0;
   err = cudaMalloc((void **)&gLeaf.d_q2m1, total * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gLeaf.d_l2p0, total * sizeof(double));
-  if (err != cudaSuccess) return 0;
-  err = cudaMalloc((void **)&gLeaf.d_l2p1, total * sizeof(double));
   if (err != cudaSuccess) return 0;
   err = cudaMalloc((void **)&gLeaf.d_sgm, vecPanels * sizeof(double));
   if (err != cudaSuccess) return 0;
@@ -156,10 +141,19 @@ int buildLeafTables(const ssystem *sys) {
     int count = sys->leafPanelCount[idx];
     size_t bytes = (size_t)nMom * (size_t)count * sizeof(double);
     int offset = gLeaf.h_leafMatrixOffset[idx];
+    /*
+     * L2P0/L2P1 alias Q2M0/Q2M1 -- fmm.c assigns
+     *   L2P0[idx] = Q2M0[idx] = calcMoments0(sys, order, cb, 0);
+     * so the leaf matrices are the same objects. Uploading them twice doubled
+     * this cache, which is exactly the one auto-disabled above
+     * FABIPB_HUGE_CAPSID_ATOMS to free device memory for near-field streaming.
+     * Assert the aliasing so the optimisation fails loudly if calcMoments0 is
+     * ever changed to produce distinct matrices.
+     */
+    ASSERT(L2P0[idx] == Q2M0[idx]);
+    ASSERT(L2P1[idx] == Q2M1[idx]);
     memcpy(&gLeaf.h_q2m0[offset], Q2M0[idx], bytes);
     memcpy(&gLeaf.h_q2m1[offset], Q2M1[idx], bytes);
-    memcpy(&gLeaf.h_l2p0[offset], L2P0[idx], bytes);
-    memcpy(&gLeaf.h_l2p1[offset], L2P1[idx], bytes);
     gLeaf.h_leafMatrixOffset[idx + 1] = offset + nMom * count;
   }
 
@@ -180,12 +174,6 @@ int buildLeafTables(const ssystem *sys) {
                  (size_t)totalEntries * sizeof(double),
                  cudaMemcpyHostToDevice) != cudaSuccess) return 0;
   if (cudaMemcpy(gLeaf.d_q2m1, gLeaf.h_q2m1,
-                 (size_t)totalEntries * sizeof(double),
-                 cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gLeaf.d_l2p0, gLeaf.h_l2p0,
-                 (size_t)totalEntries * sizeof(double),
-                 cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-  if (cudaMemcpy(gLeaf.d_l2p1, gLeaf.h_l2p1,
                  (size_t)totalEntries * sizeof(double),
                  cudaMemcpyHostToDevice) != cudaSuccess) return 0;
 
