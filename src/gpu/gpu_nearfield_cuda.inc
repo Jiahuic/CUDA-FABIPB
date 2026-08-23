@@ -825,7 +825,7 @@ __global__ void nearfieldApplyKernel(
   double addPot = (k0[tid] * x_dpdn + k1[tid] * x_pot) * alpha;
   double addDpdn = (k2[tid] * x_dpdn + k3[tid] * x_pot) * alpha;
 
-#if __CUDA_ARCH__ >= 600
+#if !defined(FABIPB_FORCE_CAS_ATOMIC) && __CUDA_ARCH__ >= 600
   atomicAdd(&pot[d], addPot);
   atomicAdd(&pot[d + nPnls], addDpdn);
 #else
@@ -955,7 +955,7 @@ __device__ __forceinline__ void nearDisjointQ1Apply(
   }
   kernelKer4Device(r, pnlX->normal, pnlY->normal, out);
   scale = pnlX->area * pnlY->area;
-#if __CUDA_ARCH__ >= 600
+#if !defined(FABIPB_FORCE_CAS_ATOMIC) && __CUDA_ARCH__ >= 600
   atomicAdd(&pot[d], alpha * scale * (out[0] * sgm[s + nPnls] + out[1] * sgm[s]));
   atomicAdd(&pot[d + nPnls], alpha * scale * (out[2] * sgm[s + nPnls] + out[3] * sgm[s]));
 #else
