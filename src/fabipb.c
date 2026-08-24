@@ -235,8 +235,10 @@ static int isHighContrastDielectric(void) {
   return epsilon1 > 0.0 && epsilon1 <= 2.0 && ratio >= 40.0;
 }
 
+#define HUGE_CAPSID_SEP_RATIO 1.2
+
 static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
-                                    int precondExplicit) {
+                                    int precondExplicit, int sepExplicit) {
   unsigned long long threshold = getHugeCapsidAtomThreshold();
   int hugeCapsid = (unsigned long long)sys->nChar > threshold;
   int highContrast = isHighContrastDielectric();
@@ -249,6 +251,22 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
     } else {
       sys->gpuQ2MMode = 1;
     }
+  }
+
+  /*
+   * Separation ratio. Larger values accept cube pairs as well separated higher
+   * in the tree, so both the near field and M2L shrink; the cost is a longer
+   * multipole reach and therefore more truncation error. Measured on H1N1
+   * sdens=0.5 (24.7M panels), sweeping S with everything else fixed: the matvec
+   * falls from 18.5 s to 11.2 s per call between 0.8 and 1.2 while the
+   * iteration count stays at 12 throughout, and the energy moves by 0.055%
+   * against S=0.6 -- an order of magnitude below the discretization error at
+   * this density. Raised for huge capsids only; the same sweep on a 420k-panel
+   * protein put 0.8 much further from its fine-mesh reference, so this is not a
+   * safe global default.
+   */
+  if (!sepExplicit && hugeCapsid) {
+    sys->maxSepRatio = HUGE_CAPSID_SEP_RATIO;
   }
 
   if (!precondExplicit) {
@@ -277,6 +295,12 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
                          : "auto: default diagonal preconditioner";
       printf("Resolved preconditioner mode=%d (%s; eps2/eps1=%g)\n",
              sys->precondCacheMode, precondReason, epsilon2 / epsilon1);
+    }
+    {
+      const char *sepReason = sepExplicit ? "explicit -S"
+          : hugeCapsid ? "auto: huge capsid, wider separation ratio"
+                       : "auto: default";
+      printf("Resolved separation ratio=%g (%s)\n", sys->maxSepRatio, sepReason);
     }
   }
 }
@@ -1045,6 +1069,7 @@ int main(int nargs, char *argv[]){
   int meshOnlyMode = 0;
   int q2mExplicit = 0;
   int precondExplicit = 0;
+  int sepExplicit = 0;
   const char *meshControlName = NULL;
   const char *backendParamName = NULL;
 
@@ -1095,7 +1120,7 @@ int main(int nargs, char *argv[]){
 
     /* order/orderMom accept negatives: they select adaptive-order policies
      * (see scripts/run_fmm_param_matrix.sh, e.g. "-p=-6 -pm=-1"). */
-    if      ((v = optValue(arg, "S"))    != NULL) sys->maxSepRatio        = optDouble(arg, v, 1e-12, 10.0);
+    if      ((v = optValue(arg, "S"))    != NULL) { sys->maxSepRatio      = optDouble(arg, v, 1e-12, 10.0); sepExplicit = 1; }
     else if ((v = optValue(arg, "o"))    != NULL) tolpar                  = optDouble(arg, v, 1e-300, 1.0);
     else if ((v = optValue(arg, "a"))    != NULL) arnoldiSz               = optInt(arg, v, 1, 100000);
     else if ((v = optValue(arg, "i"))    != NULL) numItr                  = optInt(arg, v, 1, 1000000);
@@ -1251,7 +1276,7 @@ int main(int nargs, char *argv[]){
     printf("Mesh-only mode: stopping after mesh generation.\n");
     return 0;
   }
-  resolveAutoSolverPolicy(sys, q2mExplicit, precondExplicit);
+  resolveAutoSolverPolicy(sys, q2mExplicit, precondExplicit, sepExplicit);
   reportDirectRhsLimit(nPnls, sys->nChar, sys->gpuMode);
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
