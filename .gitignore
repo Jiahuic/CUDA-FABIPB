@@ -36,3 +36,4 @@ bimpb_cuda/
 .codex
 .omx/
 .fabipb_nanoshaper_*/
+__pycache__/
