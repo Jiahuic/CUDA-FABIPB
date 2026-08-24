@@ -15,6 +15,9 @@ bin="$root/build/fabipb"
 runner="$root/scripts/run_6co8_fabipb_fast.sh"
 mkdir -p "$bench"
 
+# shellcheck source=scripts/lib_idle.sh
+source "$root/scripts/lib_idle.sh"
+
 log()  { printf '\n=== [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 # Provenance for one output directory.
@@ -23,10 +26,13 @@ provenance() {
   git -C "$root" rev-parse HEAD           > "$d/git_commit.txt" 2>&1
   git -C "$root" status --short --branch  > "$d/git_status.txt" 2>&1
   cat /proc/loadavg                       > "$d/loadavg_before.txt"
-  [[ "${CONTENDED:-0}" == "1" ]] && echo "host was contended; times not usable for timing tables" > "$d/CONTENDED.txt"
+  [[ "${IDLE_CONTENDED:-0}" == "1" ]] && \
+    echo "host was contended at launch; times not usable for timing tables" > "$d/CONTENDED.txt"
   env | grep '^FABIPB_' | sort            > "$d/env_fabipb.txt" 2>/dev/null || true
   nvidia-smi --query-gpu=clocks.sm,temperature.gpu,memory.used \
              --format=csv                 > "$d/gpu_before.txt" 2>&1
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+             --format=csv                 > "$d/gpu_procs_before.txt" 2>&1
 }
 finish() {
   local d="$1"
@@ -34,19 +40,32 @@ finish() {
   nvidia-smi --query-gpu=clocks.sm,temperature.gpu --format=csv > "$d/gpu_after.txt" 2>&1
 }
 
+# Run one command with the machine to ourselves, sampling contention throughout.
+# $1=outdir  $2...=the command.  Sets RUN_RC.
+guarded_run() {
+  local d="$1"; shift
+  local runpid
+  "$@" &
+  runpid=$!
+  idle_watch_start "$d" "$runpid"
+  wait "$runpid"; RUN_RC=$?
+  idle_watch_stop "$d"
+}
+
 # Direct-binary step (no runner): $1=outdir name, rest=fabipb args
 direct() {
   local name="$1"; shift
   local d="$bench/$name"
   if [[ -e "$d/fmm.log" ]]; then log "SKIP $name (exists)"; return 0; fi
+  require_idle "$name" || { log "SKIPPED $name (machine busy)"; return 0; }
   provenance "$d"
   log "RUN  $name"
-  ( cd "$root" && FABIPB_REUSE_MESH=1 /usr/bin/time -v "$bin" "$@" ) \
-      >"$d/fmm.log" 2>"$d/time_v.txt"
-  local rc=$?
+  guarded_run "$d" env -C "$root" FABIPB_REUSE_MESH=1 \
+      /usr/bin/time -v -o "$d/time_v.txt" "$bin" "$@" >"$d/fmm.log" 2>&1
   finish "$d"
   printf '%s\n' "$*" > "$d/command.txt"
-  log "DONE $name rc=$rc  $(grep -oE 'ttl time: [0-9.]+' "$d/fmm.log" | tail -1)"
+  log "DONE $name rc=$RUN_RC  $(grep -oE 'ttl time: [0-9.]+' "$d/fmm.log" | tail -1)$(
+      [[ -e "$d/CONTENDED.txt" ]] && echo '  [CONTENDED]')"
   return 0
 }
 
@@ -56,49 +75,23 @@ runner_step() {
   local pqr="${!#}"; set -- "${@:1:$(($#-1))}"
   local d="$bench/$name"
   if [[ -e "$d/fmm.log" ]]; then log "SKIP $name (exists)"; return 0; fi
+  require_idle "$name" || { log "SKIPPED $name (machine busy)"; return 0; }
   provenance "$d"
   log "RUN  $name  ($*)"
-  ( cd "$root" && env "$@" OUT_DIR="$d" ALLOW_EXISTING_OUT_DIR=1 \
-      /usr/bin/time -v "$runner" "$pqr" ) >"$d/driver.log" 2>"$d/time_v.txt"
-  local rc=$?
+  guarded_run "$d" env -C "$root" "$@" OUT_DIR="$d" ALLOW_EXISTING_OUT_DIR=1 \
+      /usr/bin/time -v -o "$d/time_v.txt" "$runner" "$pqr" >"$d/driver.log" 2>&1
   finish "$d"
-  log "DONE $name rc=$rc  $(grep -oE 'ttl time: [0-9.]+' "$d/fmm.log" 2>/dev/null | tail -1)"
+  log "DONE $name rc=$RUN_RC  $(grep -oE 'ttl time: [0-9.]+' "$d/fmm.log" 2>/dev/null | tail -1)$(
+      [[ -e "$d/CONTENDED.txt" ]] && echo '  [CONTENDED]')"
   return 0
 }
 
 
-# ---- wait for an idle host before any timing run ---------------------------
-# Timing runs on a loaded machine are not measurements (results_plan.md 0).
-# Poll the 15-minute load average until it stays below the threshold for a
-# sustained window, or give up after max_wait and report rather than run.
-wait_for_idle() {
-  local thresh="${IDLE_LOAD_THRESHOLD:-20}"
-  local need="${IDLE_SUSTAIN_MIN:-5}"      # consecutive minutes below thresh
-  local max_wait="${IDLE_MAX_WAIT_MIN:-420}"
-  local ok=0 waited=0 l15
-
-  log "waiting for idle host: 15-min load < $thresh for ${need} min (max ${max_wait} min)"
-  while (( waited < max_wait )); do
-    l15=$(awk '{print $3}' /proc/loadavg)
-    if awk -v a="$l15" -v b="$thresh" 'BEGIN{exit !(a<b)}'; then
-      ok=$((ok+1))
-    else
-      ok=0
-    fi
-    if (( ok >= need )); then
-      log "host idle (load15=$l15) after ${waited} min -- starting"
-      return 0
-    fi
-    sleep 60; waited=$((waited+1))
-    (( waited % 15 == 0 )) && log "still waiting: load15=$l15 (${waited}/${max_wait} min)"
-  done
-  # Do not throw the night away: run anyway, but mark every result contended
-  # so the timing tables can exclude them. Iterations/residuals/energies stay
-  # valid regardless of load; only the times are suspect.
-  log "GAVE UP waiting after ${max_wait} min (load15=$l15). Running ANYWAY, marked contended."
-  CONTENDED=1
-  return 0
-}
+# The idle gate now lives in scripts/lib_idle.sh and runs before EVERY step
+# rather than once per batch: a six-hour queue that checks the machine only at
+# hour zero is not protected at hour five.  It also gates on the GPU, not just
+# loadavg -- free VRAM decides the resident/streaming regime, so a foreign
+# process changes which code path runs, not merely how fast it runs.
 
 Q="-eps1=4 -eps2=80 -P=3 -q=1 -a=30 -i=100 -o=1e-4"
 M7="$root/test_proteins/7A6A_charmm_protein_compact"
@@ -197,7 +190,17 @@ if [[ ${#steps[@]} -eq 0 ]]; then
   steps=(C2b C5a B2 C1 C5b C3 A2 A3)
 fi
 log "sequential run: ${steps[*]}   commit $(git -C "$root" rev-parse --short HEAD)"
-CONTENDED=0
-if [[ "${SKIP_IDLE_WAIT:-0}" != "1" ]]; then wait_for_idle; fi
+log "idle gate: load<${IDLE_LOAD_THRESHOLD} foreign-cores<=${IDLE_FOREIGN_CORES} GPU<${IDLE_GPU_MEM_MIB}MiB, \
+${IDLE_SUSTAIN_MIN}min sustained, checked before every step"
 for s in "${steps[@]}"; do "step_$s"; done
 log "all steps finished"
+
+# Summarise which results are usable for timing, so a night's queue does not
+# have to be audited by hand.
+log "contention summary:"
+for d in "$bench"/*/; do
+  [[ -e "$d/contention_max.txt" ]] || continue
+  printf '    %-40s %s %s\n' "$(basename "$d")" \
+    "$([[ -e "$d/CONTENDED.txt" ]] && echo 'DIRTY ' || echo 'clean ')" \
+    "$(cat "$d/contention_max.txt")"
+done

@@ -6,9 +6,13 @@ drivers write (git_commit.txt, loadavg_before/after.txt, time_v.txt), and emits
 the four tables results_plan.md section 9 specifies. Directories carrying
 NOT_A_BENCHMARK.txt are skipped.
 
-Timing rule: a run is only eligible for the timing tables if its 15-minute load
-average stayed below the core count. Converged results (iterations, residual,
-energy) are reported regardless, because they are unaffected by host load.
+Timing rule: a run is eligible for the timing tables only if scripts/lib_idle.sh
+sampled no contention -- foreign CPU cores and foreign GPU memory -- for its
+whole duration. Runs predating the sampler fall back to the launch-time load
+snapshot and are labelled timing_basis=launch-snapshot-only, which is weaker
+evidence: it cannot speak for what the machine did after the run started.
+Converged results (iterations, residual, energy) are reported regardless,
+because they are unaffected by host load.
 """
 import csv, os, re, glob, statistics, subprocess, sys
 
@@ -84,10 +88,34 @@ def scan(d):
     tv = read(os.path.join(d, "time_v.txt"))
     peak = grab(tv, r"Maximum resident set size \(kbytes\):\s*(\d+)", int)
     r["peak_rss_gb"] = round(peak / 1048576.0, 2) if peak else ""
-    try:
-        r["timing_usable"] = "yes" if float(r["loadavg15_before"]) < NCORES else "no"
-    except (TypeError, ValueError):
+
+    # Contention sampled across the whole run (scripts/lib_idle.sh). The launch
+    # snapshot alone cannot clear a six-hour run -- it says nothing about hour
+    # five -- so prefer the sampled verdict whenever it exists.
+    cm = read(os.path.join(d, "contention_max.txt"))
+    r["max_foreign_cores"] = grab(cm, r"max_foreign_cores=([0-9.]+)")
+    r["max_foreign_gpu_mib"] = grab(cm, r"max_foreign_gpu_mib=(\d+)")
+    nsamp = grab(cm, r"samples=(\d+)", int)
+    dirty = grab(cm, r"dirty_samples=(\d+)", int)
+    if cm and nsamp == 0:
+        # Sampler ran but caught nothing (run shorter than the interval): no
+        # evidence either way, which must not be recorded as a clean result.
         r["timing_usable"] = "unknown"
+        r["timing_basis"] = "no-samples"
+    elif cm and dirty is not None:
+        r["timing_usable"] = "yes" if dirty == 0 else "no"
+        r["timing_basis"] = "sampled"
+    elif os.path.isfile(os.path.join(d, "CONTENDED.txt")):
+        r["timing_usable"] = "no"
+        r["timing_basis"] = "flagged"
+    else:
+        # Legacy runs predating the sampler: fall back to the launch snapshot,
+        # and label it so the weaker evidence is visible in the table.
+        try:
+            r["timing_usable"] = "yes" if float(r["loadavg15_before"]) < NCORES else "no"
+        except (TypeError, ValueError):
+            r["timing_usable"] = "unknown"
+        r["timing_basis"] = "launch-snapshot-only"
     return r
 
 
@@ -135,7 +163,8 @@ def main():
     write_csv("final_benchmark.csv", final, [
         "case", "commit", "panels", "iterations", "residual", "energy_kcal_mol",
         "repeat_n", "time_median_s", "time_min_s", "time_max_s", "time_spread_pct",
-        "peak_rss_gb", "loadavg15_before", "timing_usable", "fallback", "run"])
+        "peak_rss_gb", "loadavg15_before", "max_foreign_cores", "timing_usable",
+        "timing_basis", "fallback", "run"])
 
     write_csv("stage_breakdown.csv", final, [
         "case", "loadPanel_s", "gkInit_s", "setupFMM_s", "setupPC_s",
@@ -149,7 +178,8 @@ def main():
     write_csv("all_runs.csv", rows, [
         "run", "commit", "panels", "depth", "iterations", "residual",
         "energy_kcal_mol", "total_s", "near_regime", "m2l_regime",
-        "loadavg15_before", "timing_usable", "peak_rss_gb", "fallback"])
+        "loadavg15_before", "max_foreign_cores", "max_foreign_gpu_mib",
+        "timing_usable", "timing_basis", "peak_rss_gb", "fallback"])
 
 
 if __name__ == "__main__":

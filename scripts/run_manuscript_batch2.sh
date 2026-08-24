@@ -12,6 +12,9 @@ ZIKV="$root/test_proteins/ZIKV_6CO8_zenodo.pqr"
 H1N1="$root/test_proteins/H1N1_atoms.pqr"
 mkdir -p "$bench"
 
+# shellcheck source=scripts/lib_idle.sh
+source "$root/scripts/lib_idle.sh"
+
 log() { printf '\n=== [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 provenance() {
@@ -19,6 +22,20 @@ provenance() {
   git -C "$root" rev-parse HEAD > "$d/git_commit.txt" 2>&1
   cat /proc/loadavg > "$d/loadavg_before.txt"
   env | grep '^FABIPB_' | sort > "$d/env_fabipb.txt" 2>/dev/null || true
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+             --format=csv > "$d/gpu_procs_before.txt" 2>&1
+  [[ "${IDLE_CONTENDED:-0}" == "1" ]] && \
+    echo "host was contended at launch; times not usable" > "$d/CONTENDED.txt"
+}
+
+guarded_run() {
+  local d="$1"; shift
+  local runpid
+  "$@" &
+  runpid=$!
+  idle_watch_start "$d" "$runpid"
+  wait "$runpid"; RUN_RC=$?
+  idle_watch_stop "$d"
 }
 
 runner_step() {
@@ -26,11 +43,13 @@ runner_step() {
   local pqr="${!#}"; set -- "${@:1:$(($#-1))}"
   local d="$bench/$name"
   [[ -e "$d/fmm.log" ]] && { log "SKIP $name"; return 0; }
+  require_idle "$name" || { log "SKIPPED $name (machine busy)"; return 0; }
   provenance "$d"; log "RUN  $name ($*)"
-  ( cd "$root" && env "$@" OUT_DIR="$d" ALLOW_EXISTING_OUT_DIR=1 \
-      /usr/bin/time -v "$runner" "$pqr" ) >"$d/driver.log" 2>"$d/time_v.txt"
+  guarded_run "$d" env -C "$root" "$@" OUT_DIR="$d" ALLOW_EXISTING_OUT_DIR=1 \
+      /usr/bin/time -v -o "$d/time_v.txt" "$runner" "$pqr" >"$d/driver.log" 2>&1
   cat /proc/loadavg > "$d/loadavg_after.txt"
-  log "DONE $name  $(grep -oE 'ttl time: [0-9.]+' "$d/fmm.log" 2>/dev/null | tail -1)"
+  log "DONE $name rc=$RUN_RC  $(grep -oE 'ttl time: [0-9.]+' "$d/fmm.log" 2>/dev/null | tail -1)$(
+      [[ -e "$d/CONTENDED.txt" ]] && echo '  [CONTENDED]')"
 }
 
 # ---- T6: does the depth-5 work-assignment win hold on another geometry? ----
@@ -39,6 +58,8 @@ step_T6() {
   local tag="$2"
   local d="$bench/t6_workassign_$tag"
   [[ -e "$d/sweep.txt" ]] && { log "SKIP T6 $tag"; return 0; }
+  # Reports per-call kernel time, so it is as timing-sensitive as any run.
+  require_idle "T6 $tag" || { log "SKIPPED T6 $tag (machine busy)"; return 0; }
   provenance "$d"; log "RUN  T6 work-assignment sweep on $tag"
   : > "$d/sweep.txt"
   for t in 4 5 6 7; do
