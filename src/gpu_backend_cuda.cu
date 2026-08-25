@@ -143,6 +143,14 @@ __global__ void nearfieldDisjointQ1BuildKernel(
     double *k2,
     double *k3);
 
+__global__ void nearfieldSpecialScatterKernel(
+    long long nSpecial,
+    const NearSpecialCoeff *special,
+    double *k0,
+    double *k1,
+    double *k2,
+    double *k3);
+
 __global__ void nearfieldDisjointQ1ApplyKernel(
     int nPnls,
     long long nInteractions,

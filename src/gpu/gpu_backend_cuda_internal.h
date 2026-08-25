@@ -40,6 +40,18 @@ extern "C" double **L2P1;
 extern "C" double **tLegA;
 extern "C" double **wLegA;
 
+/* One host-computed near-field coefficient with the interaction it belongs to.
+ * Kept as a single record rather than five parallel arrays: appending to five
+ * vectors from every build thread put ~160 write streams in flight and cost
+ * more than the PCIe transfer the compaction saves. */
+typedef struct {
+  long long idx;
+  double k0;
+  double k1;
+  double k2;
+  double k3;
+} NearSpecialCoeff;
+
 struct NearPanelGeom {
   double vtx[3][3];
   double a0[3];
@@ -98,6 +110,15 @@ struct NearfieldGpuCache {
   int h_k1Pinned;
   int h_k2Pinned;
   int h_k3Pinned;
+  /* Sparse coefficient upload for the resident build (see T5 in
+   * gpu_nearfield_cuda.inc). When the on-device disjoint builder is enabled it
+   * writes every disjoint interaction itself, so only the geometrically
+   * special pairs -- around 5% of interactions -- have to cross PCIe. These
+   * hold that compacted set: an interaction index plus its four coefficients. */
+  int sparseCoeffUpload;
+  long long nSpecialCoeff;
+  NearSpecialCoeff *d_special;
+
   int specialCacheEnabled;
   int specialCacheValid;
   long long specialCacheChunks;

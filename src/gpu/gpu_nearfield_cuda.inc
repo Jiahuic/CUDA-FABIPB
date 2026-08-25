@@ -32,6 +32,19 @@ static void freeNearfieldStagingHost(void *p, int *pinned) {
   *pinned = 0;
 }
 
+/*
+ * Whether the resident build sends only the special coefficients (T5).
+ *
+ * Must be the single source of truth: the host coefficient arrays are not
+ * allocated when this is on, so a disagreement between the allocation site and
+ * the build loop would dereference NULL. FABIPB_NEARFIELD_DENSE_COEFF=1 forces
+ * the old dense upload so both paths can be A/B'd from one binary.
+ */
+static int nearfieldSparseCoeffEnabled(const ssystem *sys) {
+  return gpuNearfieldDisjointBuildEnabled(sys) &&
+         !envFlagEnabled("FABIPB_NEARFIELD_DENSE_COEFF");
+}
+
 static void freeNearfieldSpecialCache(void) {
   delete gNear.specialOffset;
   delete gNear.cacheSrc;
@@ -117,6 +130,7 @@ void freeNearfieldCache() {
   gNear.h_k2 = NULL;
   gNear.h_k3 = NULL;
 
+  cudaFree(gNear.d_special);
   cudaFree(gNear.d_panels);
   cudaFree(gNear.d_src);
   cudaFree(gNear.d_dst);
@@ -132,6 +146,8 @@ void freeNearfieldCache() {
   cudaFree(gNear.d_sgm);
   cudaFree(gNear.d_pot);
   freeNearfieldStreamPairTable();
+  gNear.d_special = NULL;
+  gNear.nSpecialCoeff = 0;
   gNear.d_panels = NULL;
   gNear.d_src = NULL;
   gNear.d_dst = NULL;
@@ -204,6 +220,16 @@ int allocateHostArrays(long long n) {
     setNearfieldLastError("host calloc h_leafPairOffset failed for %.3f GiB",
                           bytesToGiB(((size_t)gNear.sys->nLeafCubesFlat + 1U) * sizeof(int)));
     return 0;
+  }
+  /* With the device disjoint builder on, the dense host coefficient arrays are
+   * never written or uploaded (T5): only the compacted special list crosses
+   * PCIe. Skipping them saves ~32 bytes per interaction of host memory --
+   * 3.3 GB on 7A6A at depth 6. */
+  if (nearfieldSparseCoeffEnabled(gNear.sys)) {
+    gNear.h_k0 = gNear.h_k1 = gNear.h_k2 = gNear.h_k3 = NULL;
+    return (gNear.h_panels && gNear.h_src && gNear.h_dst && gNear.h_pairSrcCount &&
+            gNear.h_pairInteractionOffset && gNear.h_leafPanelStart &&
+            gNear.h_leafPanelCount && gNear.h_leafPairOffset) ? 1 : 0;
   }
   gNear.h_k0 = (double *)malloc(ni * sizeof(double));
   if (!gNear.h_k0) {
@@ -493,6 +519,11 @@ int buildNearfieldTables(const ssystem *sys) {
   double t0, t1;
   int collectCaseCounts = (sys->benchmarkMode > 0);
   int useGpuDisjointBuild = gpuNearfieldDisjointBuildEnabled(sys);
+  /* With the device builder on, only the geometrically special pairs need to
+   * cross PCIe; the dense k arrays would be ~95% zeros that the builder
+   * immediately overwrites. Collect those few entries instead. */
+  int sparseCoeff = nearfieldSparseCoeffEnabled(sys);
+  std::vector<NearSpecialCoeff> serialSpecial;
 
   setNearfieldLastError("not attempted");
   for (pairIdx = 0; pairIdx < sys->nNearPairsFlat; pairIdx++) {
@@ -609,17 +640,21 @@ int buildNearfieldTables(const ssystem *sys) {
             gNear.h_dst[idx] = dstPanelIdx;
             gNear.h_src[idx] = srcPanelIdx;
             if (useGpuDisjointBuild && nVtx == 0) {
+              /* The device builder owns this one; nothing to store or send. */
               disjointBuildCount++;
-              gNear.h_k0[idx] = 0.0;
-              gNear.h_k1[idx] = 0.0;
-              gNear.h_k2[idx] = 0.0;
-              gNear.h_k3[idx] = 0.0;
             } else {
               double *KER = panelIA0(pnlX, pnlY);
-              gNear.h_k0[idx] = KER[0];
-              gNear.h_k1[idx] = KER[1];
-              gNear.h_k2[idx] = KER[2];
-              gNear.h_k3[idx] = KER[3];
+              if (sparseCoeff) {
+                NearSpecialCoeff rec;
+                rec.idx = idx; rec.k0 = KER[0]; rec.k1 = KER[1];
+                rec.k2 = KER[2]; rec.k3 = KER[3];
+                serialSpecial.push_back(rec);
+              } else {
+                gNear.h_k0[idx] = KER[0];
+                gNear.h_k1[idx] = KER[1];
+                gNear.h_k2[idx] = KER[2];
+                gNear.h_k3[idx] = KER[3];
+              }
             }
           }
         }
@@ -628,6 +663,10 @@ int buildNearfieldTables(const ssystem *sys) {
       std::vector<std::thread> workers;
       std::vector<long long> threadCounts((size_t)nThreads * 5U, 0);
       std::vector<long long> threadDisjointBuildCounts((size_t)nThreads, 0);
+      /* Per-thread special lists, concatenated after the join. Collecting into
+       * shared storage would need a lock on the hot path; the lists are small
+       * (~5% of interactions) so the copy is cheap. */
+      std::vector<std::vector<NearSpecialCoeff> > threadSpecial((size_t)nThreads);
       int t;
 
       workers.reserve((size_t)nThreads);
@@ -643,10 +682,27 @@ int buildNearfieldTables(const ssystem *sys) {
          */
         int begin = (int)(((long long)sys->nNearPairsFlat * t) / nThreads);
         int end = (int)(((long long)sys->nNearPairsFlat * (t + 1)) / nThreads);
-        workers.emplace_back([=, &threadCounts, &threadDisjointBuildCounts]() {
+        workers.emplace_back([=, &threadCounts, &threadDisjointBuildCounts,
+                              &threadSpecial]() {
           int localPairIdx;
           long long *localCounts = &threadCounts[(size_t)t * 5U];
           long long localDisjointBuildCount = 0;
+          std::vector<NearSpecialCoeff> &tSpecial = threadSpecial[(size_t)t];
+          /* Reserve up front. Growing these by push_back reallocation costs
+           * more than the PCIe transfer it saves -- measured at +0.31 s on
+           * 7A6A depth 6, which exactly cancelled the 0.33 s upload win.
+           * Specials are the pairs sharing a vertex, an edge, or the panel
+           * itself: a few percent of interactions, but the fraction climbs as
+           * leaves get smaller, so reserve generously and shrink later. */
+          if (sparseCoeff && begin < end) {
+            long long spanBegin = gNear.h_pairInteractionOffset[begin];
+            long long spanEnd = (end < sys->nNearPairsFlat)
+                                ? gNear.h_pairInteractionOffset[end]
+                                : totalInteractions;
+            long long guess = (spanEnd - spanBegin) / 8;
+            if (guess < 1024) guess = 1024;
+            tSpecial.reserve((size_t)guess);
+          }
           for (localPairIdx = begin; localPairIdx < end; localPairIdx++) {
             int srcLeaf = sys->nearPairSrc[localPairIdx];
             int dstLeaf = sys->nearPairDst[localPairIdx];
@@ -683,16 +739,19 @@ int buildNearfieldTables(const ssystem *sys) {
                 gNear.h_src[idx] = srcPanelIdx;
                 if (useGpuDisjointBuild && nVtx == 0) {
                   localDisjointBuildCount++;
-                  gNear.h_k0[idx] = 0.0;
-                  gNear.h_k1[idx] = 0.0;
-                  gNear.h_k2[idx] = 0.0;
-                  gNear.h_k3[idx] = 0.0;
                 } else {
                   double *KER = panelIA0(pnlX, pnlY);
-                  gNear.h_k0[idx] = KER[0];
-                  gNear.h_k1[idx] = KER[1];
-                  gNear.h_k2[idx] = KER[2];
-                  gNear.h_k3[idx] = KER[3];
+                  if (sparseCoeff) {
+                    NearSpecialCoeff rec;
+                    rec.idx = idx; rec.k0 = KER[0]; rec.k1 = KER[1];
+                    rec.k2 = KER[2]; rec.k3 = KER[3];
+                    tSpecial.push_back(rec);
+                  } else {
+                    gNear.h_k0[idx] = KER[0];
+                    gNear.h_k1[idx] = KER[1];
+                    gNear.h_k2[idx] = KER[2];
+                    gNear.h_k3[idx] = KER[3];
+                  }
                 }
               }
             }
@@ -702,7 +761,23 @@ int buildNearfieldTables(const ssystem *sys) {
       }
       for (t = 0; t < nThreads; t++) {
         workers[(size_t)t].join();
+      }
+      if (sparseCoeff) {
+        /* Size the merged list once. Letting insert() grow it geometrically
+         * across 32 appends re-copies hundreds of MB inside the timed build. */
+        size_t totalSpecial = 0;
+        for (t = 0; t < nThreads; t++) {
+          totalSpecial += threadSpecial[(size_t)t].size();
+        }
+        serialSpecial.reserve(totalSpecial);
+      }
+      for (t = 0; t < nThreads; t++) {
         disjointBuildCount += threadDisjointBuildCounts[(size_t)t];
+        if (sparseCoeff) {
+          serialSpecial.insert(serialSpecial.end(),
+              threadSpecial[(size_t)t].begin(), threadSpecial[(size_t)t].end());
+          std::vector<NearSpecialCoeff>().swap(threadSpecial[(size_t)t]);
+        }
         if (collectCaseCounts) {
           long long *localCounts = &threadCounts[(size_t)t * 5U];
           gNear.caseDisjointCount += localCounts[0];
@@ -748,18 +823,54 @@ int buildNearfieldTables(const ssystem *sys) {
   if (!cudaMemcpyNearfield(gNear.d_leafPairOffset, gNear.h_leafPairOffset,
                            ((size_t)sys->nLeafCubesFlat + 1U) * sizeof(int),
                            cudaMemcpyHostToDevice, "h_leafPairOffset -> d_leafPairOffset")) return 0;
-  if (!cudaMemcpyNearfield(gNear.d_k0, gNear.h_k0,
-                           (size_t)totalInteractions * sizeof(double),
-                           cudaMemcpyHostToDevice, "h_k0 -> d_k0")) return 0;
-  if (!cudaMemcpyNearfield(gNear.d_k1, gNear.h_k1,
-                           (size_t)totalInteractions * sizeof(double),
-                           cudaMemcpyHostToDevice, "h_k1 -> d_k1")) return 0;
-  if (!cudaMemcpyNearfield(gNear.d_k2, gNear.h_k2,
-                           (size_t)totalInteractions * sizeof(double),
-                           cudaMemcpyHostToDevice, "h_k2 -> d_k2")) return 0;
-  if (!cudaMemcpyNearfield(gNear.d_k3, gNear.h_k3,
-                           (size_t)totalInteractions * sizeof(double),
-                           cudaMemcpyHostToDevice, "h_k3 -> d_k3")) return 0;
+  if (sparseCoeff) {
+    /* Zero the cache first. Between them the device builder and the scatter
+     * below cover every interaction, but the two classifications are made
+     * independently, so an interaction that neither claims would otherwise
+     * read uninitialised device memory. The dense upload this replaces
+     * supplied those zeros implicitly; a memset costs milliseconds against
+     * the hundreds this saves on PCIe. */
+    size_t coeffBytes = (size_t)totalInteractions * sizeof(double);
+    cudaError_t merr;
+    long long nSpecial = (long long)serialSpecial.size();
+
+    if ((merr = cudaMemset(gNear.d_k0, 0, coeffBytes)) != cudaSuccess ||
+        (merr = cudaMemset(gNear.d_k1, 0, coeffBytes)) != cudaSuccess ||
+        (merr = cudaMemset(gNear.d_k2, 0, coeffBytes)) != cudaSuccess ||
+        (merr = cudaMemset(gNear.d_k3, 0, coeffBytes)) != cudaSuccess) {
+      setNearfieldLastError("cudaMemset of the resident coefficient cache failed: %s",
+                            cudaGetErrorString(merr));
+      return 0;
+    }
+    gNear.nSpecialCoeff = nSpecial;
+    if (nSpecial > 0) {
+      size_t recBytes = (size_t)nSpecial * sizeof(NearSpecialCoeff);
+      if (!cudaMallocNearfield((void **)&gNear.d_special, recBytes, "d_special")) return 0;
+      if (!cudaMemcpyNearfield(gNear.d_special, &serialSpecial[0], recBytes,
+                               cudaMemcpyHostToDevice, "special coeffs")) return 0;
+    }
+    if (sys->benchmarkMode > 0) {
+      printf("GPU nearfield sparse coeff upload: special=%lld of %lld interactions "
+             "(%.2f%%), sent %.3f GiB instead of %.3f GiB\n",
+             nSpecial, (long long)totalInteractions,
+             totalInteractions > 0 ? 100.0 * (double)nSpecial / (double)totalInteractions : 0.0,
+             bytesToGiB((size_t)nSpecial * sizeof(NearSpecialCoeff)),
+             bytesToGiB((size_t)totalInteractions * 4U * sizeof(double)));
+    }
+  } else {
+    if (!cudaMemcpyNearfield(gNear.d_k0, gNear.h_k0,
+                             (size_t)totalInteractions * sizeof(double),
+                             cudaMemcpyHostToDevice, "h_k0 -> d_k0")) return 0;
+    if (!cudaMemcpyNearfield(gNear.d_k1, gNear.h_k1,
+                             (size_t)totalInteractions * sizeof(double),
+                             cudaMemcpyHostToDevice, "h_k1 -> d_k1")) return 0;
+    if (!cudaMemcpyNearfield(gNear.d_k2, gNear.h_k2,
+                             (size_t)totalInteractions * sizeof(double),
+                             cudaMemcpyHostToDevice, "h_k2 -> d_k2")) return 0;
+    if (!cudaMemcpyNearfield(gNear.d_k3, gNear.h_k3,
+                             (size_t)totalInteractions * sizeof(double),
+                             cudaMemcpyHostToDevice, "h_k3 -> d_k3")) return 0;
+  }
   t1 = wall_seconds_cuda_local();
   fmmNearGpuUploadTime += (t1 - t0);
 
@@ -793,6 +904,25 @@ int buildNearfieldTables(const ssystem *sys) {
       setNearfieldLastError("nearfield disjoint build kernel failed: %s",
                             cudaGetErrorString(err));
       return 0;
+    }
+    /* Host-computed special coefficients go in last, so that where the two
+     * classifications disagree the exact host value is what survives. */
+    if (sparseCoeff && gNear.nSpecialCoeff > 0) {
+      int scatterGrid = (int)((gNear.nSpecialCoeff + blockSize - 1) / blockSize);
+      nearfieldSpecialScatterKernel<<<scatterGrid, blockSize>>>(
+          gNear.nSpecialCoeff, gNear.d_special,
+          gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3);
+      err = cudaGetLastError();
+      if (err == cudaSuccess) err = cudaDeviceSynchronize();
+      if (err != cudaSuccess) {
+        setNearfieldLastError("nearfield special scatter kernel failed: %s",
+                              cudaGetErrorString(err));
+        return 0;
+      }
+      /* The compacted arrays are consumed; the resident cache now holds
+       * everything the apply kernels read. */
+      cudaFree(gNear.d_special);
+      gNear.d_special = NULL;
     }
     t1 = wall_seconds_cuda_local();
     fmmNearGpuCoeffTime += (t1 - t0);
@@ -855,6 +985,35 @@ __global__ void nearfieldApplyKernel(
   } while (assumed2 != old2);
 #endif
 }
+/*
+ * Scatter the geometrically special coefficients into the resident cache.
+ *
+ * Pairs the on-device disjoint builder does not own -- shared vertex, shared
+ * edge, or self -- still need panelIA0 on the host. There are few of them
+ * (~5% of interactions on 7A6A), so rather than send a dense array that is
+ * 95% zeros across PCIe, the host sends only those entries with their
+ * interaction index and this writes them into place.
+ *
+ * Must run AFTER nearfieldDisjointQ1BuildKernel. The two classifications are
+ * made independently -- the host uses nrCommonVtx on the mesh, the device uses
+ * nearDisjointCase on the uploaded geometry -- and running the host values
+ * last means that where they disagree the exact host coefficient wins.
+ */
+__global__ void nearfieldSpecialScatterKernel(
+    long long nSpecial,
+    const NearSpecialCoeff *special,
+    double *k0, double *k1, double *k2, double *k3) {
+  long long tid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (tid >= nSpecial) {
+    return;
+  }
+  NearSpecialCoeff c = special[tid];
+  k0[c.idx] = c.k0;
+  k1[c.idx] = c.k1;
+  k2[c.idx] = c.k2;
+  k3[c.idx] = c.k3;
+}
+
 __device__ int samePoint3(const double a[3], const double b[3]) {
   return (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]);
 }
