@@ -45,6 +45,47 @@ static int nearfieldSparseCoeffEnabled(const ssystem *sys) {
          !envFlagEnabled("FABIPB_NEARFIELD_DENSE_COEFF");
 }
 
+/*
+ * Sources a destination panel must accumulate before a warp is worth giving it.
+ *
+ * The warp kernel divides a destination's source list over 32 lanes and pays a
+ * ten-step shuffle reduction for it, so it needs enough passes to amortise that
+ * cost. Measured on two surfaces, near-field kernel time per matvec, resident
+ * regime (Section "Restoring the parallelism without giving up ownership"):
+ *
+ *   src/dst   7A6A                      1a63
+ *   ~1030     warp 3.69x over atomics   warp 2.80x
+ *   ~245      warp 1.63x                warp 1.20x
+ *   ~65       atomics 2.24x over warp   atomics 2.15x
+ *   ~27       atomics 4.91x             atomics 3.27x
+ *
+ * The crossover therefore lies between 68 and 234 on both geometries; 128 is
+ * four passes per lane and sits in the middle of that bracket. The thread-per-
+ * destination kernel is never the best of the three on either surface, so the
+ * automatic choice is between the atomic and warp forms only; -G still selects
+ * any of them explicitly, which is how the paper's tables are reproduced.
+ */
+#define NEAR_WARP_SRC_PER_DST 128
+
+static int resolveNearfieldMode(const ssystem *sys, long long totalInteractions) {
+  long long srcPerDst;
+
+  if (sys->gpuNearfieldMode >= 0) {
+    return sys->gpuNearfieldMode;   /* explicit -G wins */
+  }
+  if (sys->nPnls <= 0) {
+    return 0;
+  }
+  srcPerDst = totalInteractions / (long long)sys->nPnls;
+  if (sys->benchmarkMode > 0) {
+    printf("GPU nearfield auto mode: src/dst=%lld threshold=%d -> %s\n",
+           srcPerDst, NEAR_WARP_SRC_PER_DST,
+           (srcPerDst >= NEAR_WARP_SRC_PER_DST) ? "2 (warp per destination)"
+                                                : "0 (interaction + atomics)");
+  }
+  return (srcPerDst >= NEAR_WARP_SRC_PER_DST) ? 2 : 0;
+}
+
 static void freeNearfieldSpecialCache(void) {
   delete gNear.specialOffset;
   delete gNear.cacheSrc;
@@ -563,7 +604,7 @@ int buildNearfieldTables(const ssystem *sys) {
            sys->gpuNearfieldMode);
   }
   gNear.sys = sys;
-  gNear.nearfieldMode = sys->gpuNearfieldMode;
+  gNear.nearfieldMode = resolveNearfieldMode(sys, totalInteractions);
   gNear.streaming = 0;
   gNear.caseDisjointCount = 0;
   gNear.caseOneCommonCount = 0;

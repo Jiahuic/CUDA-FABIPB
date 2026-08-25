@@ -368,17 +368,19 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
   fmmNearGpuH2DTime += (t1 - t0);
 
   blockSize = 256;
-  if (sys->benchmarkMode > 0 && printedMode != sys->gpuNearfieldMode) {
-    const char *modeName = (sys->gpuNearfieldMode == 0) ? "interaction" :
-                           (sys->gpuNearfieldMode == 2) ? "destination-leaf warp" :
-                                                          "destination-leaf";
-    printf("GPU nearfield apply mode=%d (%s)\n", sys->gpuNearfieldMode, modeName);
-    printedMode = sys->gpuNearfieldMode;
+  /* Resolved at cache-build time by resolveNearfieldMode: sys->gpuNearfieldMode
+   * may be -1 for auto, so the apply path must read the resolved value. */
+  if (sys->benchmarkMode > 0 && printedMode != gNear.nearfieldMode) {
+    const char *modeName = (gNear.nearfieldMode == 0) ? "interaction" :
+                           (gNear.nearfieldMode == 2) ? "destination-leaf warp" :
+                                                        "destination-leaf";
+    printf("GPU nearfield apply mode=%d (%s)\n", gNear.nearfieldMode, modeName);
+    printedMode = gNear.nearfieldMode;
   }
   t0 = wall_seconds_cuda_local();
   if (gNear.streaming) {
     if (!applyNearfieldStreaming(sys, alpha)) return 0;
-  } else if (sys->gpuNearfieldMode == 2) {
+  } else if (gNear.nearfieldMode == 2) {
     /* Warp per destination panel. blockSize is a multiple of 32, so every warp
      * is whole and the kernel's full-mask shuffles are well defined. */
     gridSize = sys->nLeafCubesFlat;
@@ -388,7 +390,7 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
         gNear.d_pairSrcCount, gNear.d_pairInteractionOffset,
         gNear.d_src, gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
         alpha, gNear.d_sgm, gNear.d_pot);
-  } else if (sys->gpuNearfieldMode == 1) {
+  } else if (gNear.nearfieldMode == 1) {
     gridSize = sys->nLeafCubesFlat;
     nearfieldLeafApplyKernel<<<gridSize, blockSize>>>(
         gNear.nPnls,
