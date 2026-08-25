@@ -1,7 +1,29 @@
 build/
 build-*/
+# results/ is ignored wholesale -- results/paper/benchmarks alone is ~55 GB of
+# meshes and run logs. The paper sources and the small CSV/log files the paper
+# actually cites are re-included below. Re-inclusion has to walk down one
+# directory at a time: git cannot un-ignore a file whose parent is excluded.
 results/*
 !results/README.md
+!results/paper/
+results/paper/*
+!results/paper/README.md
+!results/paper/manuscript_notes/
+!results/paper/tables/
+!results/paper/figures/
+!results/paper/raw_logs/
+
+# LaTeX build products. Rebuilt by `make` in fmm-pb; the checked-in copy would
+# only ever be stale. (*.log and *.out are already caught by the global rules.)
+results/paper/manuscript_notes/**/*.aux
+results/paper/manuscript_notes/**/*.bbl
+results/paper/manuscript_notes/**/*.blg
+results/paper/manuscript_notes/**/*.fdb_latexmk
+results/paper/manuscript_notes/**/*.fls
+results/paper/manuscript_notes/**/*.pdf
+results/paper/manuscript_notes/**/*.synctex.gz
+results/paper/manuscript_notes/**/*.toc
 TABI-PB/
 nanoshaper/
 nanoshaper-master/
@@ -37,3 +59,8 @@ bimpb_cuda/
 .omx/
 .fabipb_nanoshaper_*/
 __pycache__/
+
+# Must come last: gitignore takes the LAST matching pattern, and the bare
+# `Makefile` rule above (aimed at CMake's generated makefile in the source
+# tree) would otherwise swallow the manuscript's hand-written one.
+!results/paper/manuscript_notes/fmm-pb/Makefile
