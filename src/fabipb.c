@@ -605,7 +605,8 @@ static void print_usage(const char *prog) {
   printf("  -r=0|1|2  FMM, direct GPU, or direct CPU matvec (default: 0)\n");
   printf("  -Q=0|1    CPU dgemv loop or GPU Q2M path (default: auto)\n");
   printf("            auto disables Q2M/L2P on huge capsids to preserve nearfield GPU memory\n");
-  printf("  -G=0|1    interaction or destination-leaf GPU nearfield (default: 1)\n");
+  printf("  -G=0|1|2  GPU nearfield work assignment: interaction+atomics,\n"
+         "            thread-per-destination, or warp-per-destination (default: 1)\n");
   printf("  -P=-1|0|1|2|3  disabled, original, cached-block, cached-LU, or diagonal/Jacobi preconditioner (default: auto)\n");
   printf("                 3 is faster than 2 in most measured cases and is required at capsid\n");
   printf("                 scale, where 2 costs far more preconditioner-solve time and can stall;\n");
@@ -1153,7 +1154,7 @@ int main(int nargs, char *argv[]){
       sys->gpuQ2MMode = optInt(arg, v, 0, 1);
       q2mExplicit = 1;
     }
-    else if ((v = optValue(arg, "G"))    != NULL) sys->gpuNearfieldMode   = optInt(arg, v, 0, 1);
+    else if ((v = optValue(arg, "G"))    != NULL) sys->gpuNearfieldMode   = optInt(arg, v, 0, 2);
     else if ((v = optValue(arg, "P"))    != NULL) {
       sys->precondCacheMode = optInt(arg, v, -1, 3);
       precondExplicit = 1;
@@ -1249,7 +1250,8 @@ int main(int nargs, char *argv[]){
       printf("GPU Q2M mode=%s (1=GPU, 0=CPU dgemv loop)\n",
              autoOrExplicitLabel(q2mExplicit, sys->gpuQ2MMode,
                                  q2mBuf, sizeof(q2mBuf)));
-      printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf)\n", sys->gpuNearfieldMode);
+      printf("GPU nearfield mode=%d (0=interaction, 1=destination-leaf, 2=destination-leaf warp)\n",
+             sys->gpuNearfieldMode);
     }
     printf("Preconditioner mode=%s (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n",
            autoOrExplicitLabel(precondExplicit, sys->precondCacheMode,

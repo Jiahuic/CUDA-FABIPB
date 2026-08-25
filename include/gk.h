@@ -85,7 +85,8 @@ struct ssystem {
   int debugComparePrecond;  /* 0=off, >0 compare original/cached PtVfmm once */
   int matvecMode;           /* 0=FMM, 1=direct GPU baseline */
   int gpuQ2MMode;           /* 1=GPU Q2M, 0=CPU dgemv loop; default resolved after loadPanel */
-  int gpuNearfieldMode;     /* 0=interaction kernel, 1=destination-leaf grouped */
+  int gpuNearfieldMode;     /* 0=interaction+atomics, 1=thread-per-destination,
+                              2=warp-per-destination (see gpu_nearfield_cuda.inc) */
   /*
    * 0=original, 1=cached local blocks, 2=cached LU, 3=diagonal/Jacobi.
    *

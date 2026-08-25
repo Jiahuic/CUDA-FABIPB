@@ -361,14 +361,25 @@ int gpuNearfieldApply(ssystem *sys, double alpha, const double *sgm, double *pot
 
   blockSize = 256;
   if (sys->benchmarkMode > 0 && printedMode != sys->gpuNearfieldMode) {
-    printf("GPU nearfield apply mode=%d (%s)\n",
-           sys->gpuNearfieldMode,
-           (sys->gpuNearfieldMode == 0) ? "interaction" : "destination-leaf");
+    const char *modeName = (sys->gpuNearfieldMode == 0) ? "interaction" :
+                           (sys->gpuNearfieldMode == 2) ? "destination-leaf warp" :
+                                                          "destination-leaf";
+    printf("GPU nearfield apply mode=%d (%s)\n", sys->gpuNearfieldMode, modeName);
     printedMode = sys->gpuNearfieldMode;
   }
   t0 = wall_seconds_cuda_local();
   if (gNear.streaming) {
     if (!applyNearfieldStreaming(sys, alpha)) return 0;
+  } else if (sys->gpuNearfieldMode == 2) {
+    /* Warp per destination panel. blockSize is a multiple of 32, so every warp
+     * is whole and the kernel's full-mask shuffles are well defined. */
+    gridSize = sys->nLeafCubesFlat;
+    nearfieldLeafWarpApplyKernel<<<gridSize, blockSize>>>(
+        gNear.nPnls,
+        gNear.d_leafPanelStart, gNear.d_leafPanelCount, gNear.d_leafPairOffset,
+        gNear.d_pairSrcCount, gNear.d_pairInteractionOffset,
+        gNear.d_src, gNear.d_k0, gNear.d_k1, gNear.d_k2, gNear.d_k3,
+        alpha, gNear.d_sgm, gNear.d_pot);
   } else if (sys->gpuNearfieldMode == 1) {
     gridSize = sys->nLeafCubesFlat;
     nearfieldLeafApplyKernel<<<gridSize, blockSize>>>(

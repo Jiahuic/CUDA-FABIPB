@@ -1106,6 +1106,84 @@ __global__ void nearfieldLeafApplyKernel(
     pot[d + nPnls] += sumDpdn;
   }
 }
+
+/*
+ * Warp-per-destination-panel variant of nearfieldLeafApplyKernel.
+ *
+ * The thread-per-destination kernel above trades parallelism for ownership:
+ * one thread walks every near pair of its leaf and every source panel within
+ * it, so at 7A6A depth 8 a single thread executes ~297 interactions in
+ * sequence while the machine sits underused. Measurements showed this is what
+ * costs destination indexing its advantage, not the block size -- sweeping
+ * blockDim from 32 to 256 moved the time by under 1%.
+ *
+ * Here each destination panel gets a warp and the source loop is split across
+ * its 32 lanes, followed by a shuffle reduction. That restores exposed
+ * parallelism while keeping what destination ownership is for: no atomics, and
+ * a fixed-shape reduction tree, so the result is bit-reproducible run to run,
+ * which the interaction-indexed kernel's atomicAdd cannot promise.
+ *
+ * All lanes of a warp share warpId, so they enter and leave the outer loop
+ * together and the full-mask shuffles are safe. Each destination panel is
+ * owned by exactly one warp, so the final accumulation needs no atomic.
+ */
+__global__ void nearfieldLeafWarpApplyKernel(
+    int nPnls,
+    const int *leafPanelStart,
+    const int *leafPanelCount,
+    const int *leafPairOffset,
+    const int *pairSrcCount,
+    const long long *pairInteractionOffset,
+    const int *src,
+    const double *k0,
+    const double *k1,
+    const double *k2,
+    const double *k3,
+    double alpha,
+    const double *sgm,
+    double *pot) {
+  int leaf = blockIdx.x;
+  int lane = (int)(threadIdx.x & 31u);
+  int warpId = (int)(threadIdx.x >> 5);
+  int warpsPerBlock = (int)(blockDim.x >> 5);
+  int dstStart = leafPanelStart[leaf];
+  int dstCount = leafPanelCount[leaf];
+  int pairBegin = leafPairOffset[leaf];
+  int pairEnd = leafPairOffset[leaf + 1];
+  int localDst;
+
+  for (localDst = warpId; localDst < dstCount; localDst += warpsPerBlock) {
+    int d = dstStart + localDst;
+    double sumPot = 0.0;
+    double sumDpdn = 0.0;
+    int pairIdx, off;
+
+    for (pairIdx = pairBegin; pairIdx < pairEnd; pairIdx++) {
+      int srcCount = pairSrcCount[pairIdx];
+      long long base = pairInteractionOffset[pairIdx] + (long long)localDst * (long long)srcCount;
+      int j;
+
+      for (j = lane; j < srcCount; j += 32) {
+        long long idx = base + (long long)j;
+        int s = src[idx];
+        double x_pot = sgm[s];
+        double x_dpdn = sgm[s + nPnls];
+        sumPot += (k0[idx] * x_dpdn + k1[idx] * x_pot) * alpha;
+        sumDpdn += (k2[idx] * x_dpdn + k3[idx] * x_pot) * alpha;
+      }
+    }
+
+    for (off = 16; off > 0; off >>= 1) {
+      sumPot += __shfl_down_sync(0xffffffffu, sumPot, off);
+      sumDpdn += __shfl_down_sync(0xffffffffu, sumDpdn, off);
+    }
+    if (lane == 0) {
+      pot[d] += sumPot;
+      pot[d + nPnls] += sumDpdn;
+    }
+  }
+}
+
 int applyNearfieldStreamingChunk(const ssystem *sys, long long count, double alpha,
                                  long long chunkIdx, long long *specialTotal) {
   const int blockSize = 256;
