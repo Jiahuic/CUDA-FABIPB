@@ -27,6 +27,8 @@ else
   fmm_gpu_reason="auto: binary selects GPU when CUDA is available"
 fi
 fmm_qorder="${FMM_QORDER:-1}"
+fmm_sep_ratio_override="${FMM_SEP_RATIO:-auto}"
+fmm_nearfield_mode_override="${FMM_NEARFIELD_MODE:-${FMM_G:-auto}}"
 restart="${GMRES_RESTART:-30}"
 max_iter="${GMRES_MAX_ITER:-100}"
 tolerance="${GMRES_TOLERANCE:-1e-4}"
@@ -178,6 +180,16 @@ if [[ "$fmm_q2m_override" != "auto" ]]; then
 fi
 if [[ "$fmm_preconditioner_override" != "auto" ]]; then
   fabipb_cmd+=(-P="$fmm_preconditioner_override")
+fi
+# Separation ratio and near-field work assignment both default to "auto" in the
+# solver. Without these the runner silently drops any override the caller sets,
+# which is how an A/B against the automatic policy can end up comparing a
+# configuration against itself.
+if [[ "$fmm_sep_ratio_override" != "auto" ]]; then
+  fabipb_cmd+=(-S="$fmm_sep_ratio_override")
+fi
+if [[ "$fmm_nearfield_mode_override" != "auto" ]]; then
+  fabipb_cmd+=(-G="$fmm_nearfield_mode_override")
 fi
 fabipb_cmd+=(./input)
 if [[ -n "$fabipb_timeout" ]]; then
