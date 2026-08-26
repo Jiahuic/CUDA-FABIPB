@@ -26,6 +26,7 @@
 #define DEFAULT_MAX_DIRECT_RHS_PAIRS 5000000000ULL
 #define DEFAULT_MAX_GPU_DIRECT_RHS_PAIRS 200000000000ULL
 #define DEFAULT_HUGE_CAPSID_ATOMS 5000000ULL
+#define DEFAULT_HUGE_CAPSID_PANELS 5000000ULL
 
 #if defined(__GNUC__) || defined(__clang__)
 #define FABIPB_THREAD_LOCAL __thread
@@ -243,10 +244,35 @@ static int isHighContrastDielectric(void) {
 #define HUGE_CAPSID_TREE_THETA 0.8
 #define HUGE_CAPSID_TREE_ORDER 3
 
+/*
+ * Capsid-scale detection.
+ *
+ * Originally keyed on atom count alone. That misses hollow capsids, which are
+ * exactly the target: Zika 6CO8 carries 1.58M atoms -- below a 5M atom
+ * threshold -- while meshing to between 10.2M and 65.3M panels. The atom count
+ * measures how much matter there is; what licenses the loose settings is a
+ * coarse mesh over a thin shell, which shows up in the panel count.
+ *
+ * Either trigger therefore suffices. This remains a heuristic: the quantity
+ * that actually matters is the mesh discretization error, which is not known a
+ * priori, and a finely resolved globular protein could in principle reach the
+ * panel threshold without the accompanying error budget. The thresholds are
+ * overridable, and any explicit setting wins.
+ */
+static int isCapsidScale(const ssystem *sys, int nPnls) {
+  unsigned long long atomThreshold = getHugeCapsidAtomThreshold();
+  unsigned long long panelThreshold =
+      parseUnsignedLongLongEnv("FABIPB_HUGE_CAPSID_PANELS",
+                               DEFAULT_HUGE_CAPSID_PANELS);
+  return (unsigned long long)sys->nChar > atomThreshold ||
+         (nPnls > 0 && (unsigned long long)nPnls > panelThreshold);
+}
+
 static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
-                                    int precondExplicit, int sepExplicit) {
+                                    int precondExplicit, int sepExplicit,
+                                    int nPnls) {
   unsigned long long threshold = getHugeCapsidAtomThreshold();
-  int hugeCapsid = (unsigned long long)sys->nChar > threshold;
+  int hugeCapsid = isCapsidScale(sys, nPnls);
   int highContrast = isHighContrastDielectric();
 
   if (!q2mExplicit) {
@@ -311,6 +337,8 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
       printf("Resolved charge-tree theta=%g order=%d (huge capsid; %llu atoms > %llu)\n",
              HUGE_CAPSID_TREE_THETA, HUGE_CAPSID_TREE_ORDER,
              (unsigned long long)sys->nChar, threshold);
+      printf("  (capsid-scale trigger: %d panels, %llu atoms)\n",
+             nPnls, (unsigned long long)sys->nChar);
     }
   }
 
@@ -1338,7 +1366,7 @@ int main(int nargs, char *argv[]){
     printf("Mesh-only mode: stopping after mesh generation.\n");
     return 0;
   }
-  resolveAutoSolverPolicy(sys, q2mExplicit, precondExplicit, sepExplicit);
+  resolveAutoSolverPolicy(sys, q2mExplicit, precondExplicit, sepExplicit, nPnls);
   reportDirectRhsLimit(nPnls, sys->nChar, sys->gpuMode);
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;

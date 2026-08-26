@@ -98,6 +98,15 @@ M7="$root/test_proteins/7A6A_charmm_protein_compact"
 ZIKV="$root/test_proteins/ZIKV_6CO8_zenodo.pqr"
 H1N1="$root/test_proteins/H1N1_atoms.pqr"
 
+# The mesh-convergence series and the cross-solver comparisons resolve
+# differences between densities that are smaller than the charge-tree error, so
+# they must NOT inherit the capsid-scale tree policy (theta=0.8, order 3) that
+# the solver now applies automatically above ~5e6 panels. Pinning them here
+# rather than relying on the policy means regenerating the series cannot
+# silently degrade the extrapolated limit E*.
+CONVERGENCE_TREE="FABIPB_RHS_TREE_THETA=0.3 FABIPB_ENERGY_TREE_THETA=0.3 FABIPB_CHARGE_TREE_ORDER=7"
+
+
 # ---- C2: near-field work assignment, resident regime (fast) ----------------
 step_C2() {
   direct c2_workassign_dstleaf_7a6a -B=1 -g=1 -G=1 -m=2 -R=1.0 -t=6 $Q "$M7"
@@ -137,7 +146,7 @@ step_C5b() {
 
 # ---- C3: third ZIKV density for extrapolation ------------------------------
 step_C3() {
-  runner_step zikv_6co8_sdens15 SDENS=1.5 "$ZIKV"
+  runner_step zikv_6co8_sdens15 $CONVERGENCE_TREE SDENS=1.5 "$ZIKV"
 }
 
 
@@ -170,7 +179,7 @@ step_C2b() {
 step_A2() {
   local i
   for i in 1 2 3; do
-    runner_step "zikv_6co8_sdens1_rep$i" SDENS=1 "$ZIKV"
+    runner_step "zikv_6co8_sdens1_rep$i" $CONVERGENCE_TREE SDENS=1 "$ZIKV"
   done
   for i in 1 2 3; do
     runner_step "h1n1_sdens05_rep_$i" SDENS=0.5 "$H1N1"

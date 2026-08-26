@@ -10,6 +10,15 @@ bin="$root/build/fabipb"
 runner="$root/scripts/run_6co8_fabipb_fast.sh"
 ZIKV="$root/test_proteins/ZIKV_6CO8_zenodo.pqr"
 H1N1="$root/test_proteins/H1N1_atoms.pqr"
+
+# The mesh-convergence series and the cross-solver comparisons resolve
+# differences between densities that are smaller than the charge-tree error, so
+# they must NOT inherit the capsid-scale tree policy (theta=0.8, order 3) that
+# the solver now applies automatically above ~5e6 panels. Pinning them here
+# rather than relying on the policy means regenerating the series cannot
+# silently degrade the extrapolated limit E*.
+CONVERGENCE_TREE="FABIPB_RHS_TREE_THETA=0.3 FABIPB_ENERGY_TREE_THETA=0.3 FABIPB_CHARGE_TREE_ORDER=7"
+
 mkdir -p "$bench"
 
 # shellcheck source=scripts/lib_idle.sh
@@ -81,7 +90,7 @@ step_T6() {
 step_T2() {
   runner_step h1n1_sdens05_depth9  SDENS=0.5 FMM_DEPTH=9  "$H1N1"
   runner_step h1n1_sdens05_depth10 SDENS=0.5 FMM_DEPTH=10 "$H1N1"
-  runner_step zikv_6co8_sdens1_depth9 SDENS=1 FMM_DEPTH=9 "$ZIKV"
+  runner_step zikv_6co8_sdens1_depth9 $CONVERGENCE_TREE SDENS=1 FMM_DEPTH=9 "$ZIKV"
 }
 
 # ---- T4 test: halved leaf cache, can GPU Q2M/L2P stay on at capsid scale? --
@@ -91,7 +100,7 @@ step_T4test() {
 
 # ---- T7: clean sdens=2 for the convergence series --------------------------
 step_T7() {
-  runner_step zikv_6co8_sdens2 SDENS=2 FMM_DEPTH=9 "$ZIKV"
+  runner_step zikv_6co8_sdens2 $CONVERGENCE_TREE SDENS=2 FMM_DEPTH=9 "$ZIKV"
 }
 
 # ---- T3: serial CPU reference (longest; last) ------------------------------
