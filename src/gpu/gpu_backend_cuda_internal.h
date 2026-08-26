@@ -33,6 +33,7 @@ extern "C" double **dGk;
 extern "C" int *sgn3;
 extern "C" double kappa;
 extern "C" double epsilon;
+extern "C" double epsilon1;
 extern "C" double **Q2M0;
 extern "C" double **Q2M1;
 extern "C" double **L2P0;

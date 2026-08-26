@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <errno.h>
 #include "gkGlobal.h"
 #include "gk.h"
 
@@ -30,8 +31,92 @@ extern double *fcnBuf1, *fcnBuf2, *fcnBuf3, *convVecR;
 cube *goDown(double *refPt, cube *cb);
 void setupConVect(int order, double *trns, double *convVec);
 
+/*
+ * Taylor order for the charge-tree clusters used by setupRHS and the post-solve
+ * energy.
+ *
+ * FABIPB_CHARGE_TREE_ORDER=<n> overrides the default set below. It exists so
+ * the charge-tree order can be varied without touching -pm, which would change
+ * the matvec accuracy at the same time and confound the comparison. Still
+ * capped by sys->maxOrder, since the moment tables are only allocated that far.
+ */
+int chargeTreeOrderOverride(void) {
+  static int initialized = 0;
+  static int override = 0;    /* 0 = follow the FMM order */
+
+  if (!initialized) {
+    const char *env = getenv("FABIPB_CHARGE_TREE_ORDER");
+    initialized = 1;
+    if (env != NULL) {
+      char *endptr = NULL;
+      long value;
+
+      errno = 0;
+      value = strtol(env, &endptr, 10);
+      if (errno == 0 && endptr != env && *endptr == '\0' &&
+          value >= 1 && value <= 32) {
+        override = (int)value;
+      } else {
+        fprintf(stderr,
+                "Warning: ignoring invalid FABIPB_CHARGE_TREE_ORDER='%s'\n", env);
+      }
+    }
+  }
+  return override;
+}
+
+/*
+ * Default Taylor order for charge-tree clusters: a flat 3.
+ *
+ * This used to follow the FMM's per-level ordMom, giving p=4 at the fine levels
+ * and rising to p=7 near the root. That adaptivity is a good trade on a CPU,
+ * where each cluster pays for its own order, but it works against the GPU
+ * kernels: the per-thread derivative scratch slab is sized by derivMax, the
+ * *maximum* order over all levels, so a handful of near-root clusters at p=7
+ * imposed a 660-double slab on every thread. A flat lower order shrinks the
+ * slab for everyone.
+ *
+ * Measured on H1N1 sdens=0.5 at theta=0.8, whole-solve time and energy drift
+ * against theta=0.2/adaptive (results/paper/benchmarks/t19,t20):
+ *
+ *   p        total     rhs+energy   share of run   drift
+ *   1        290.5 s      17.6 s        6.1%       1.031%
+ *   3        303.9 s      29.2 s        9.6%       0.191%
+ *   5        339.7 s      66.2 s       19.5%       0.052%
+ *   adaptive 374.0 s     103.3 s       27.6%       0.076%
+ *
+ * p=3 is the floor of the useful range. Below it the walk is bound by traversal
+ * and direct evaluation rather than by coefficient count, so p=1 buys only 4.4%
+ * more time for 5.4x the error. Above it the extra accuracy is invisible next
+ * to the mesh discretization error, which exceeds 10% at these densities.
+ *
+ * As with the acceptance ratio, mesh-convergence series and cross-solver
+ * comparisons need more than this -- they resolve differences smaller than the
+ * tree error. Set FABIPB_CHARGE_TREE_ORDER=7 (or higher) alongside a tighter
+ * FABIPB_*_TREE_THETA for those.
+ */
+/* Policy default, set by resolveAutoSolverPolicy(); 0 means "follow the FMM's
+ * per-level order", which is the conservative choice for small problems. An
+ * explicit FABIPB_CHARGE_TREE_ORDER always wins over this. */
+static int gChargeTreeOrderPolicy = 0;
+
+void setChargeTreeOrderPolicy(int order) {
+  if (order >= 1 && order <= 32) {
+    gChargeTreeOrderPolicy = order;
+  }
+}
+
 int rhsChargeExpansionOrder(ssystem *sys, int level) {
-  int order = MAX(sys->ordMom[level], 4);
+  int override = chargeTreeOrderOverride();
+  int order;
+
+  if (override > 0) {
+    order = override;                       /* explicit env wins */
+  } else if (gChargeTreeOrderPolicy > 0) {
+    order = gChargeTreeOrderPolicy;         /* size-gated policy, flat */
+  } else {
+    order = MAX(sys->ordMom[level], 4);     /* conservative: follow the FMM */
+  }
   return MIN(order, sys->maxOrder);
 }
 

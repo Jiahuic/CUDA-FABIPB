@@ -365,7 +365,7 @@ __global__ void chargeTreeEnergyKernel(
     const int *nMomT,
     const int *panelOrigIdx, const double *sgm,
     double *scratch, long long stride,
-    double *partial) {
+    double *partial, int screenedOnly) {
   const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   const long long nThreadsTotal = (long long)gridDim.x * blockDim.x;
   /* Base of each level's two-row window; slot m&1 holds row m. */
@@ -512,8 +512,13 @@ __global__ void chargeTreeEnergyKernel(
                 dnGk = nrm[0] * *CTE_AK(0, n + 1, lA)
                      + nrm[1] * *CTE_AK(0, n + 1, lB)
                      + nrm[2] * *CTE_AK(0, n + 1, lC);
-                y0 += sgn3d[i] * mom[i] * (*CTE_A0(0, n, l) - *CTE_AK(0, n, l));
-                y1 += sgn3d[i] * mom[i] * (eps * dnGk - dnG0);
+                if (screenedOnly) {
+                  y0 += -sgn3d[i] * mom[i] * *CTE_AK(0, n, l);
+                  y1 += sgn3d[i] * mom[i] * eps * dnGk;
+                } else {
+                  y0 += sgn3d[i] * mom[i] * (*CTE_A0(0, n, l) - *CTE_AK(0, n, l));
+                  y1 += sgn3d[i] * mom[i] * (eps * dnGk - dnG0);
+                }
               }
             }
           }
@@ -540,8 +545,13 @@ __global__ void chargeTreeEnergyKernel(
           ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
           dG0dn = -ip * G0 / r2;
           dGkdn = coef * dG0dn;
-          y0 += chr[j] * (G0 - Gk);
-          y1 += chr[j] * (eps * dGkdn - dG0dn);
+          if (screenedOnly) {
+            y0 += -chr[j] * Gk;
+            y1 += chr[j] * eps * dGkdn;
+          } else {
+            y0 += chr[j] * (G0 - Gk);
+            y1 += chr[j] * (eps * dGkdn - dG0dn);
+          }
         }
         continue;
       }
@@ -579,8 +589,10 @@ __global__ void chargeTreeEnergyKernel(
 }
 
 extern "C" double energyTreeTheta(void);
+extern "C" double rhsTreeTheta(void);
 
-int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
+static int gpuPanelChargeTreeEnergyMode(ssystem *sys, const double *sgm,
+                                        double *pot, int screenedOnly) {
   int blockSize = 128, gridSize;
   long long stride, slabDoubles;
   size_t scratchBytes;
@@ -681,7 +693,7 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   tKernel0 = wall_seconds_cuda_local();
   chargeTreeEnergyKernel<<<gridSize, blockSize, (size_t)blockSize * sizeof(double)>>>(
       gCTE.nPanels, gCTE.derivOrderMax, gCTE.idxDim, sys->chgDepth, sys->height,
-      energyTreeTheta(), kappa, epsilon, fourPiI,
+      screenedOnly ? rhsTreeTheta() : energyTreeTheta(), kappa, epsilon, fourPiI,
       gCTE.d_panels,
       gCTE.d_nodeCtr, gCTE.d_nodeRad, gCTE.d_nodeLevel,
       gCTE.d_nodeKidStart, gCTE.d_nodeKidCount,
@@ -692,7 +704,7 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
       gCTE.d_idx3, gCTE.d_sgn3, d_levOff, gCTE.d_nMom,
       gCTE.d_panelIdx, d_sgm,
       d_scratch, stride,
-      d_partial);
+      d_partial, screenedOnly);
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     setNearfieldLastError("charge-tree energy launch failed: %s", cudaGetErrorString(err));
@@ -717,14 +729,25 @@ int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
   tReduce1 = wall_seconds_cuda_local();
   *pot = total;
   if (sys->benchmarkMode > 0) {
-    printf("GPU charge-tree energy: threads=%lld grid=%d scratch=%.3f GiB slab=%lld doubles\n",
-           stride, gridSize, bytesToGiB(scratchBytes), slabDoubles);
-    printf("GPU charge-tree energy breakdown (s): build=%.6f scratch=%.6f sgm_h2d=%.6f kernel=%.6f partial_d2h=%.6f reduce=%.6f rebuilt=%d\n",
+    printf("GPU charge-tree %senergy: threads=%lld grid=%d scratch=%.3f GiB slab=%lld doubles theta=%g\n",
+           screenedOnly ? "screened-only " : "", stride, gridSize,
+           bytesToGiB(scratchBytes), slabDoubles,
+           screenedOnly ? rhsTreeTheta() : energyTreeTheta());
+    printf("GPU charge-tree %senergy breakdown (s): build=%.6f scratch=%.6f sgm_h2d=%.6f kernel=%.6f partial_d2h=%.6f reduce=%.6f rebuilt=%d\n",
+           screenedOnly ? "screened-only " : "",
            tBuild1 - tBuild0, tScratch1 - tScratch0, tUpload1 - tUpload0,
            tKernel1 - tKernel0, tCopy1 - tCopy0, tReduce1 - tReduce0,
            rebuiltTree);
   }
   return 1;
+}
+
+int gpuPanelChargeTreeEnergy(ssystem *sys, const double *sgm, double *pot) {
+  return gpuPanelChargeTreeEnergyMode(sys, sgm, pot, 0);
+}
+
+int gpuPanelChargeTreeScreenedEnergy(ssystem *sys, const double *sgm, double *pot) {
+  return gpuPanelChargeTreeEnergyMode(sys, sgm, pot, 1);
 }
 
 

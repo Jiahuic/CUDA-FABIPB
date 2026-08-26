@@ -5,6 +5,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include "gkGlobal.h"
 #include "gk.h"
 #include "gpu_backend.h"
@@ -24,6 +25,7 @@ extern double **dG0;     /* workspace for setupDerivs */
 extern double **dGk;     /* workspace for setupDerivs */
 extern double kappa;
 extern double epsilon;
+extern double epsilon1;
 extern void (*kernel)();
 extern void (*kernelD)(double r, int p, double *G0, double *Gk);
 extern double **Q2M0, **Q2M1;   /* moments */
@@ -33,9 +35,28 @@ extern int ***idx3;
 extern double fourPiI;
 extern double **tLegA, **wLegA;
 
+static double treecodeWallSeconds(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
+}
+
+/* Policy default, set by resolveAutoSolverPolicy(); an explicit environment
+ * variable always wins over it. See setChargeTreeThetaPolicy(). */
+static double gRhsThetaPolicy = 0.3;
+static double gEnergyThetaPolicy = 0.3;
+
+void setChargeTreeThetaPolicy(double theta) {
+  if (theta > 0.0 && theta <= 10.0) {
+    gRhsThetaPolicy = theta;
+    gEnergyThetaPolicy = theta;
+  }
+}
+
 double rhsTreeTheta(void) {
   static int initialized = 0;
-  static double theta = 0.3;
+  static int fromEnv = 0;
+  static double theta = 0.0;
 
   if (!initialized) {
     const char *env = getenv("FABIPB_RHS_TREE_THETA");
@@ -49,29 +70,51 @@ double rhsTreeTheta(void) {
       if (errno == 0 && endptr != env && *endptr == '\0' &&
           value > 0.0 && value <= 1.0) {
         theta = value;
+        fromEnv = 1;
       } else {
         fprintf(stderr,
-                "Warning: ignoring invalid FABIPB_RHS_TREE_THETA='%s'; using 0.3\n",
-                env);
+                "Warning: ignoring invalid FABIPB_RHS_TREE_THETA='%s'\n", env);
       }
     }
   }
-  return theta;
+  return fromEnv ? theta : gRhsThetaPolicy;
 }
 
 /*
- * Acceptance ratio for the post-solve panel-charge energy treecode.
+ * Acceptance ratio for the charge-tree walks: the right-hand side and the
+ * post-solve energy. Separate from rhsTreeTheta() so the two can be tuned
+ * independently, though both now default to the same value.
  *
- * This is deliberately separate from rhsTreeTheta() so accuracy/runtime can be
- * tuned independently. For the virus-scale production runs we use 0.3 by
- * default: it keeps the post-solve energy evaluator from dominating runtime,
- * while the observed H1N1/ZIKV energy drift remains within the accepted
- * capsid-scale tolerance. Set FABIPB_ENERGY_TREE_THETA=0.2 for the stricter
- * historical setting.
+ * Default 0.8, raised from 0.3. The criterion is the discretization error of
+ * the mesh being run, not an absolute tolerance: tightening the tree below the
+ * mesh error buys nothing measurable and costs a large fraction of runtime,
+ * because these two stages are ~2/3 of a capsid solve.
+ *
+ * Measured on H1N1 sdens=0.5 (results/paper/benchmarks/t19_tree_theta_order),
+ * energies against theta=0.2 at adaptive order:
+ *
+ *   theta   total     rhs+energy   energy drift
+ *   0.2     1331.3 s    1057.6 s     reference
+ *   0.3      786.8 s     504.6 s     0.0001%
+ *   0.5      471.8 s     199.9 s     0.0002%
+ *   0.8      374.0 s     103.3 s     0.0758%
+ *
+ * against a mesh discretization error above 10% at that density (ZIKV 6CO8
+ * gives 10.06% at sdens=1 versus its own four-point extrapolated limit, and
+ * sdens=0.5 is coarser still). So 0.8 sits two orders of magnitude inside the
+ * error that actually governs the answer, for a 2.1x whole-solve speedup.
+ *
+ * TWO CASES STILL NEED A TIGHTER SETTING, because they resolve differences
+ * smaller than the tree error and would be corrupted by it:
+ *   - the mesh convergence / Richardson extrapolation series, which compares
+ *     densities whose energies differ by a few percent;
+ *   - cross-solver comparisons against collocation or TABI-PB references.
+ * Set FABIPB_RHS_TREE_THETA / FABIPB_ENERGY_TREE_THETA=0.3 (or 0.2) for those.
  */
 double energyTreeTheta(void) {
   static int initialized = 0;
-  static double theta = 0.3;
+  static int fromEnv = 0;
+  static double theta = 0.0;
 
   if (!initialized) {
     const char *env = getenv("FABIPB_ENERGY_TREE_THETA");
@@ -85,14 +128,14 @@ double energyTreeTheta(void) {
       if (errno == 0 && endptr != env && *endptr == '\0' &&
           value > 0.0 && value <= 1.0) {
         theta = value;
+        fromEnv = 1;
       } else {
         fprintf(stderr,
-                "Warning: ignoring invalid FABIPB_ENERGY_TREE_THETA='%s'; using 0.3\n",
-                env);
+                "Warning: ignoring invalid FABIPB_ENERGY_TREE_THETA='%s'\n", env);
       }
     }
   }
-  return theta;
+  return fromEnv ? theta : gEnergyThetaPolicy;
 }
 
 void initRhsTreeWorkspace(ssystem *sys, RhsTreeWorkspace *ws) {
@@ -632,6 +675,119 @@ static void panelEnergyTree(ssystem *sys, int qOrder, panel *pnlX,
   out[1] *= 2.0 * pnlX->area;
 }
 
+static void chgClusterScreenedEval(ssystem *sys, cube *chgCb, panel *pnlX,
+                                   RhsTreeWorkspace *ws, double *y) {
+  int order = rhsChargeExpansionOrder(sys, chgCb->level);
+  int nMom = sys->nMom[order];
+  double *mom = chgCb->mom_chr;
+  double *nrm = pnlX->normal;
+  double *dgk = ws->dgk[0];
+  double y0 = 0.0, y1 = 0.0;
+  int i, i1, i2, i3, n;
+
+  ASSERT(chgCb->level >= 0 && chgCb->level <= sys->chgDepth);
+  ASSERT(order >= 0 && order <= sys->maxOrder);
+  ASSERT(nMom > 0 && nMom < 1000000);
+  ASSERT(mom != NULL);
+
+  for (i = n = 0; n <= order; n++) {
+    for (i1 = 0; i1 <= n; i1++) {
+      for (i2 = 0; i2 <= n - i1; i2++, i++) {
+        double dnGk;
+        i3 = n - i1 - i2;
+        y0 += sgn3[i] * mom[i] * dgk[i];
+        dnGk = nrm[0] * dgk[idx3[i1 + 1][i2][i3]]
+             + nrm[1] * dgk[idx3[i1][i2 + 1][i3]]
+             + nrm[2] * dgk[idx3[i1][i2][i3 + 1]];
+        y1 += sgn3[i] * mom[i] * epsilon * dnGk;
+      }
+    }
+  }
+  y[0] = y0;
+  y[1] = y1;
+}
+
+static void screenedTreeWalk(ssystem *sys, cube *chgCb, double *quadPt,
+                             panel *pnlX, RhsTreeWorkspace *ws, double *y) {
+  double theta = rhsTreeTheta();
+  double dist, r[3], yFar[2];
+  int k, i;
+
+  for (k = 0; k < 3; k++) {
+    r[k] = quadPt[k] - chgCb->x[k];
+  }
+  dist = sqrt(SQR(r[0]) + SQR(r[1]) + SQR(r[2]));
+
+  if (chgCb->eRad < theta * dist && chgCb->level >= sys->height) {
+    setupDerivsWorkspace(sys, ws, rhsChargeExpansionOrder(sys, chgCb->level) + 1, r);
+    chgClusterScreenedEval(sys, chgCb, pnlX, ws, yFar);
+    y[0] += yFar[0];
+    y[1] += yFar[1];
+    return;
+  }
+
+  if (chgCb->level == sys->chgDepth) {
+    double *nrm = pnlX->normal;
+    for (i = 0; i < chgCb->nChgs; i++) {
+      int j = chgCb->chgIdx[i];
+      double x[3], r2, rnorm, G0, Gk, coef, ip, dG0dn, dGkdn;
+      for (k = 0; k < 3; k++) {
+        x[k] = quadPt[k] - sys->pos[3 * j + k];
+      }
+      r2 = SQR(x[0]) + SQR(x[1]) + SQR(x[2]);
+      rnorm = sqrt(r2);
+      G0 = fourPiI / rnorm;
+      Gk = exp(-kappa * rnorm) * G0;
+      coef = (kappa * rnorm + 1.0) * exp(-kappa * rnorm);
+      ip = nrm[0] * x[0] + nrm[1] * x[1] + nrm[2] * x[2];
+      dG0dn = -ip * G0 / r2;
+      dGkdn = coef * dG0dn;
+      y[0] += sys->chr[j] * Gk;
+      y[1] += sys->chr[j] * epsilon * dGkdn;
+    }
+    return;
+  }
+
+  for (i = 0; i < chgCb->nKids; i++) {
+    screenedTreeWalk(sys, chgCb->kids[i], quadPt, pnlX, ws, y);
+  }
+}
+
+static void panelScreenedTree(ssystem *sys, int qOrder, panel *pnlX,
+                              cube *chgRoot, RhsTreeWorkspace *ws,
+                              double out[2]) {
+  int ix, jx, k;
+  double r0[3], r[3], *ax2, *ax0;
+  double *tLeg, *wLeg;
+  double y[2];
+
+  tLeg = tLegA[qOrder];
+  wLeg = wLegA[qOrder];
+  ax2 = pnlX->a[2];
+  ax0 = pnlX->a[0];
+
+  for (k = 0; k < 3; k++) {
+    r0[k] = pnlX->vtx[0][k];
+  }
+
+  out[0] = 0.0;
+  out[1] = 0.0;
+  for (ix = 0; ix < qOrder; ix++) {
+    for (jx = 0; jx < qOrder; jx++) {
+      for (k = 0; k < 3; k++) {
+        r[k] = r0[k] + tLeg[ix] * (ax2[k] + tLeg[jx] * ax0[k]);
+      }
+      y[0] = 0.0;
+      y[1] = 0.0;
+      screenedTreeWalk(sys, chgRoot, r, pnlX, ws, y);
+      out[0] += y[0] * tLeg[ix] * wLeg[ix] * wLeg[jx];
+      out[1] += y[1] * tLeg[ix] * wLeg[ix] * wLeg[jx];
+    }
+  }
+  out[0] *= 2.0 * pnlX->area;
+  out[1] *= 2.0 * pnlX->area;
+}
+
 typedef struct {
   ssystem *sys;
   panel **panels;
@@ -640,6 +796,16 @@ typedef struct {
   int end;
   double sum;
 } PanelEnergyTask;
+
+typedef struct {
+  ssystem *sys;
+  panel **panels;
+  const double *rhs;
+  const double *sgm;
+  int begin;
+  int end;
+  double sum;
+} RhsReuseEnergyTask;
 
 static int energyThreadCount(int nTasks) {
   const char *env = getenv("FABIPB_ENERGY_THREADS");
@@ -697,6 +863,44 @@ static void *panelEnergyWorker(void *arg) {
              intgr[1] * task->sgm[pnl->idx];
   }
   freeRhsTreeWorkspace(&ws);
+  task->sum = local;
+  return NULL;
+}
+
+static void *rhsReuseEnergyWorker(void *arg) {
+  RhsReuseEnergyTask *task = (RhsReuseEnergyTask *)arg;
+  ssystem *sys = task->sys;
+  RhsTreeWorkspace ws;
+  double local = 0.0;
+  double screened[2];
+  int i;
+
+  initRhsTreeWorkspace(sys, &ws);
+  for (i = task->begin; i < task->end; i++) {
+    panel *pnl = task->panels[i];
+    int idx = pnl->idx;
+
+    panelScreenedTree(sys, sys->maxQuadOrder, pnl, sys->chgCubeList[0],
+                      &ws, screened);
+    local += -screened[0] * task->sgm[idx + sys->nPnls] +
+              screened[1] * task->sgm[idx];
+  }
+  freeRhsTreeWorkspace(&ws);
+  task->sum = local;
+  return NULL;
+}
+
+static void *rhsReuseCoulombDotWorker(void *arg) {
+  RhsReuseEnergyTask *task = (RhsReuseEnergyTask *)arg;
+  ssystem *sys = task->sys;
+  double local = 0.0;
+  int i;
+
+  for (i = task->begin; i < task->end; i++) {
+    local += epsilon1 *
+        (task->rhs[i] * task->sgm[i + sys->nPnls] -
+         task->rhs[i + sys->nPnls] * task->sgm[i]);
+  }
   task->sum = local;
   return NULL;
 }
@@ -784,6 +988,153 @@ void applyPanelChargeTreeEnergy( ssystem *sys, double *sgm, double *pot ) {
 
   for (t = 0; t < created; t++) {
     *pot += tasks[t].sum;
+  }
+
+  free(threads);
+  free(tasks);
+  if (ownPanels) {
+    free(panels);
+  }
+}
+
+void applyRhsReusePanelChargeTreeEnergy( ssystem *sys, const double *rhs,
+                                         double *sgm, double *pot ) {
+  int ownPanels = 0;
+  int nThreads, t, created = 0, failed = 0;
+  panel **panels;
+  RhsReuseEnergyTask *tasks;
+  pthread_t *threads;
+  double t0 = 0.0, t1 = 0.0, dotTime = 0.0, screenedTime = 0.0;
+  double coulombDot = 0.0, screenedTree = 0.0;
+
+  ASSERT(sys->chgCubeList != NULL && sys->chgCubeList[0] != NULL);
+  ASSERT(rhs != NULL);
+
+  *pot = 0.0;
+  if (sys->nPnls <= 0) {
+    return;
+  }
+
+  if (sys->gpuMode > 0 && gpuRhsReusePanelChargeTreeEnergy(sys, rhs, sgm, pot)) {
+    return;
+  }
+
+  panels = panelEnergyArray(sys, &ownPanels);
+  nThreads = energyThreadCount(sys->nPnls);
+  if (sys->benchmarkMode > 0) {
+    printf("rhs-reuse energy evaluator: threads=%d panels=%d theta=%g\n",
+           nThreads, sys->nPnls, rhsTreeTheta());
+    if (sys->gpuMode > 0) {
+      printf("GPU rhs-reuse energy unavailable: %s; using CPU screened-tree fallback.\n",
+             gpuNearfieldLastError());
+    }
+  }
+
+  CALLOC(tasks, nThreads, RhsReuseEnergyTask);
+  CALLOC(threads, nThreads, pthread_t);
+
+  t0 = treecodeWallSeconds();
+  if (sys->gpuMode > 0 && gpuRhsReuseCoulombDot(sys, rhs, sgm, &coulombDot)) {
+    created = 0;
+  } else {
+    if (sys->gpuMode > 0 && sys->benchmarkMode > 0) {
+      printf("GPU rhs-reuse Coulomb dot unavailable: %s; using CPU dot.\n",
+             gpuNearfieldLastError());
+    }
+    for (t = 0; t < nThreads; t++) {
+      int begin = (int)(((long long)sys->nPnls * t) / nThreads);
+      int end = (int)(((long long)sys->nPnls * (t + 1)) / nThreads);
+      tasks[t].sys = sys;
+      tasks[t].panels = NULL;
+      tasks[t].rhs = rhs;
+      tasks[t].sgm = sgm;
+      tasks[t].begin = begin;
+      tasks[t].end = end;
+      tasks[t].sum = 0.0;
+    }
+
+    if (nThreads == 1) {
+      rhsReuseCoulombDotWorker(&tasks[0]);
+      created = 1;
+    } else {
+      for (t = 0; t < nThreads; t++) {
+        if (pthread_create(&threads[t], NULL, rhsReuseCoulombDotWorker, &tasks[t]) != 0) {
+          failed = 1;
+          break;
+        }
+        created++;
+      }
+      for (t = 0; t < created; t++) {
+        pthread_join(threads[t], NULL);
+      }
+      if (failed) {
+        fprintf(stderr,
+                "Warning: pthread_create failed for rhs-reuse Coulomb dot; recomputing serially\n");
+        tasks[0].begin = 0;
+        tasks[0].end = sys->nPnls;
+        tasks[0].sum = 0.0;
+        rhsReuseCoulombDotWorker(&tasks[0]);
+        created = 1;
+      }
+    }
+
+    for (t = 0; t < created; t++) {
+      coulombDot += tasks[t].sum;
+    }
+  }
+  t1 = treecodeWallSeconds();
+  dotTime = t1 - t0;
+
+  created = 0;
+  failed = 0;
+  t0 = treecodeWallSeconds();
+  for (t = 0; t < nThreads; t++) {
+    int begin = (int)(((long long)sys->nPnls * t) / nThreads);
+    int end = (int)(((long long)sys->nPnls * (t + 1)) / nThreads);
+    tasks[t].sys = sys;
+    tasks[t].panels = panels;
+    tasks[t].rhs = rhs;
+    tasks[t].sgm = sgm;
+    tasks[t].begin = begin;
+    tasks[t].end = end;
+    tasks[t].sum = 0.0;
+  }
+
+  if (nThreads == 1) {
+    rhsReuseEnergyWorker(&tasks[0]);
+    created = 1;
+  } else {
+    for (t = 0; t < nThreads; t++) {
+      if (pthread_create(&threads[t], NULL, rhsReuseEnergyWorker, &tasks[t]) != 0) {
+        failed = 1;
+        break;
+      }
+      created++;
+    }
+    for (t = 0; t < created; t++) {
+      pthread_join(threads[t], NULL);
+    }
+    if (failed) {
+      fprintf(stderr,
+              "Warning: pthread_create failed for rhs-reuse screened tree; recomputing serially\n");
+      tasks[0].begin = 0;
+      tasks[0].end = sys->nPnls;
+      tasks[0].sum = 0.0;
+      rhsReuseEnergyWorker(&tasks[0]);
+      created = 1;
+    }
+  }
+
+  for (t = 0; t < created; t++) {
+    screenedTree += tasks[t].sum;
+  }
+  t1 = treecodeWallSeconds();
+  screenedTime = t1 - t0;
+  *pot = coulombDot + screenedTree;
+
+  if (sys->benchmarkMode > 0) {
+    printf("rhs-reuse energy breakdown: coulomb-dot=%.17g screened-tree=%.17g total=%.17g dot-time=%.6f screened-time=%.6f\n",
+           coulombDot, screenedTree, *pot, dotTime, screenedTime);
   }
 
   free(threads);

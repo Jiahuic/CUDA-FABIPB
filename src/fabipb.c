@@ -69,6 +69,8 @@ void kernelKER4(double *x, double *y);
 void buildChargeTree(ssystem *sys);
 void computeChgMoments(ssystem *sys);
 double rhsTreeTheta(void);
+void setChargeTreeThetaPolicy(double theta);
+void setChargeTreeOrderPolicy(int order);
 extern double **tLegA, **wLegA;
 extern FABIPB_THREAD_LOCAL double *nrmX, *nrmY;
 extern int maxQuadOrder;
@@ -82,6 +84,8 @@ int PtVmain(double *pot, double *sgm);
 
 void applyTreecode( ssystem *sys, double *sgm, double *pot );
 void applyPanelChargeTreeEnergy( ssystem *sys, double *sgm, double *pot );
+void applyRhsReusePanelChargeTreeEnergy( ssystem *sys, const double *rhs,
+                                         double *sgm, double *pot );
 
 /*
  * Pin the *external* math-library thread counts to 1.
@@ -236,6 +240,8 @@ static int isHighContrastDielectric(void) {
 }
 
 #define HUGE_CAPSID_SEP_RATIO 1.2
+#define HUGE_CAPSID_TREE_THETA 0.8
+#define HUGE_CAPSID_TREE_ORDER 3
 
 static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
                                     int precondExplicit, int sepExplicit) {
@@ -267,6 +273,45 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
    */
   if (!sepExplicit && hugeCapsid) {
     sys->maxSepRatio = HUGE_CAPSID_SEP_RATIO;
+  }
+
+  /*
+   * Charge-tree acceptance ratio and Taylor order, used by the right-hand side
+   * and the post-solve energy. Raised only for huge capsids, for the same reason
+   * as the separation ratio above: a loose setting is safe when the mesh
+   * discretization error is large and the panels lie in a thin shell, and unsafe
+   * otherwise.
+   *
+   * H1N1 sdens=0.5, whole-solve time and energy drift against theta=0.2 at the
+   * FMM's adaptive order (results/paper/benchmarks/t19, t20):
+   *
+   *   theta / order   total     rhs+energy   drift
+   *   0.3 / adaptive  786.8 s     504.6 s    0.0001%   (previous behaviour)
+   *   0.8 / 3         303.9 s      29.2 s    0.191%    (this policy)
+   *
+   * 0.191% sits against a discretization error above 10% at that density, while
+   * the two charge-tree stages fall from 64% of the run to under 10% -- a 2.6x
+   * whole-solve speedup for an accuracy cost the mesh already dwarfs.
+   *
+   * These are NOT safe globally. The same settings move small globular proteins
+   * at fine resolution by 1.7% (1cbn) and 7.9% (1a63): those meshes fill their
+   * cubes instead of occupying a thin shell, so the bounding-sphere slack that
+   * makes a loose ratio work on a capsid is absent, and their discretization
+   * error is small enough that the tree error is no longer hidden beneath it.
+   *
+   * Mesh-convergence series and cross-solver comparisons need the conservative
+   * setting even on a capsid, since they resolve differences smaller than the
+   * tree error. Set FABIPB_RHS_TREE_THETA, FABIPB_ENERGY_TREE_THETA and
+   * FABIPB_CHARGE_TREE_ORDER explicitly for those; the environment always wins.
+   */
+  if (hugeCapsid) {
+    setChargeTreeThetaPolicy(HUGE_CAPSID_TREE_THETA);
+    setChargeTreeOrderPolicy(HUGE_CAPSID_TREE_ORDER);
+    if (sys->benchmarkMode > 0) {
+      printf("Resolved charge-tree theta=%g order=%d (huge capsid; %llu atoms > %llu)\n",
+             HUGE_CAPSID_TREE_THETA, HUGE_CAPSID_TREE_ORDER,
+             (unsigned long long)sys->nChar, threshold);
+    }
   }
 
   if (!precondExplicit) {
@@ -632,12 +677,16 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_MAX_GPU_DIRECT_RHS_PAIRS=<n>  cap GPU direct setupRHS work\n");
   printf("  FABIPB_ALLOW_LARGE_DIRECT_RHS=1  bypass the active direct setupRHS cap\n");
   printf("  FABIPB_FORCE_TREE_RHS=1   force the tree-accelerated setupRHS path\n");
-  printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio (default 0.3)\n");
+  printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio\n"
+         "            (default 0.3; 0.8 automatically for huge capsids)\n");
   printf("  FABIPB_RHS_THREADS=<n> setupRHS tree worker threads (default: online CPUs, max 128)\n");
   printf("Post-solve energy evaluation:\n");
-  printf("  FABIPB_ENERGY_MODE=charge-tree|panel-tree|compare  energy evaluator (default: panel-tree)\n");
-  printf("                            panel-tree is threaded and more accurate; compare runs both and reports the diff\n");
-  printf("  FABIPB_ENERGY_TREE_THETA=<x> panel-tree acceptance ratio (default 0.3; independent of the RHS ratio)\n");
+  printf("  FABIPB_ENERGY_MODE=rhs-reuse|charge-tree|panel-tree|compare|compare-rhs  energy evaluator (default: panel-tree)\n");
+  printf("                            rhs-reuse keeps setupRHS Coulomb terms and computes only screened correction\n");
+  printf("  FABIPB_ENERGY_TREE_THETA=<x> panel-tree acceptance ratio\n"
+         "            (default 0.3; 0.8 automatically for huge capsids)\n");
+  printf("  FABIPB_CHARGE_TREE_ORDER=<n> charge-tree Taylor order\n"
+         "            (default: follow the FMM order; 3 automatically for huge capsids)\n");
   printf("  FABIPB_ENERGY_THREADS=<n> panel-tree worker threads (default: online CPUs, max 128)\n");
   printf("Diagnostics (optional; disabled unless explicitly enabled):\n");
   printf("  FABIPB_RHS_SUMMARY_PATH=<path> write raw and TABI-style RHS summary CSV\n");
@@ -690,14 +739,21 @@ static const char *energyMode(void) {
     return "panel-tree";
   }
   if (strcmp(env, "charge-tree") == 0 ||
+      strcmp(env, "rhs-reuse") == 0 ||
       strcmp(env, "panel-tree") == 0 ||
-      strcmp(env, "compare") == 0) {
+      strcmp(env, "compare") == 0 ||
+      strcmp(env, "compare-rhs") == 0) {
     return env;
   }
   fprintf(stderr,
           "Warning: ignoring invalid FABIPB_ENERGY_MODE='%s'; using panel-tree\n",
           env);
   return "panel-tree";
+}
+
+static int energyModeNeedsRhsCopy(const char *mode) {
+  return (strcmp(mode, "rhs-reuse") == 0 ||
+          strcmp(mode, "compare-rhs") == 0);
 }
 
 static void writeSolutionIfRequested(ssystem *sys, double *sgm) {
@@ -1061,7 +1117,7 @@ int main(int nargs, char *argv[]){
   int numItr=100, arnoldiSz=30, ldw, ldh;
   panel *inputLst;
   double tolpar=1.0e-4, para=332.0716;
-  double *sgm, *pot, *GMRES_work, *GMRES_h, ptl;
+  double *sgm, *pot, *GMRES_work, *GMRES_h, *rhsEnergy, ptl;
   static int info;
   double meshResolution = 1.0;
   double meshOverrideValue = 0.0;
@@ -1078,9 +1134,11 @@ int main(int nargs, char *argv[]){
   double start_t, end_t;
   double stage_t0, loadPanel_t, gkInit_t, setupFMM_t_local;
   double setupPC_t, setupRHS_t, gmres_t, treecode_t;
+  const char *postEnergyMode;
 
   ensure_startup_thread_env(nargs, argv);
   CALLOC(sys, 1, ssystem);
+  postEnergyMode = energyMode();
   set_benchmark_thread_defaults();
   sys->height = 2;
   sys->maxSepRatio = 0.8;
@@ -1258,7 +1316,7 @@ int main(int nargs, char *argv[]){
     printf("Preconditioner mode=%s (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n",
            autoOrExplicitLabel(precondExplicit, sys->precondCacheMode,
                                precondBuf, sizeof(precondBuf)));
-    printf("Energy mode=%s (charge-tree, panel-tree, compare)\n", energyMode());
+    printf("Energy mode=%s (rhs-reuse, charge-tree, panel-tree, compare, compare-rhs)\n", energyMode());
     if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
       printf("Debug compare flags: apply=%d precond=%d\n",
              sys->debugCompareApply, sys->debugComparePrecond);
@@ -1291,6 +1349,7 @@ int main(int nargs, char *argv[]){
 
   CALLOC(sgm, 2*nPnls, double);
   CALLOC(pot, 2*nPnls, double);
+  rhsEnergy = NULL;
 
   stage_t0 = wall_seconds();
   setupFMM(sys);
@@ -1320,6 +1379,19 @@ int main(int nargs, char *argv[]){
   stage_t0 = wall_seconds();
   setupRHS(sys, sgm);
   setupRHS_t = wall_seconds() - stage_t0;
+  if (energyModeNeedsRhsCopy(postEnergyMode)) {
+    size_t rhsCount = (size_t)2 * (size_t)nPnls;
+    size_t ri;
+    CALLOC(rhsEnergy, rhsCount, double);
+    for (ri = 0; ri < rhsCount; ri++) {
+      rhsEnergy[ri] = sgm[ri];
+    }
+    if (sys->benchmarkMode > 0) {
+      printf("Preserved setupRHS vector for rhs-reuse energy: %.3f GiB\n",
+             (double)(rhsCount * sizeof(double)) /
+                 (1024.0 * 1024.0 * 1024.0));
+    }
+  }
   if (sys->gpuMode > 0) {
     /*
      * setupRHS may leave the charge-tree GPU cache resident. Virus-scale
@@ -1382,12 +1454,15 @@ int main(int nargs, char *argv[]){
     printf("ttl time: %f, gmres-its=%d\n", end_t, numItr);
     printf("solvation energy: skipped\n");
   } else {
-    const char *postEnergyMode = energyMode();
     int treecodeTimeSet = 0;
     stage_t0 = wall_seconds();
     if (strcmp(postEnergyMode, "panel-tree") == 0) {
       ensureChargeTreeBuilt(sys);
       applyPanelChargeTreeEnergy(sys, sgm, &ptl);
+    } else if (strcmp(postEnergyMode, "rhs-reuse") == 0) {
+      ASSERT(rhsEnergy != NULL);
+      ensureChargeTreeBuilt(sys);
+      applyRhsReusePanelChargeTreeEnergy(sys, rhsEnergy, sgm, &ptl);
     } else if (strcmp(postEnergyMode, "compare") == 0) {
       double chargeTreeRaw, panelTreeRaw;
       double chargeTreeTime, panelTreeTime;
@@ -1409,6 +1484,28 @@ int main(int nargs, char *argv[]){
                  ? fabs(chargeTreeRaw - panelTreeRaw) / fabs(chargeTreeRaw)
                  : fabs(chargeTreeRaw - panelTreeRaw),
              chargeTreeTime, panelTreeTime);
+    } else if (strcmp(postEnergyMode, "compare-rhs") == 0) {
+      double rhsReuseRaw, panelTreeRaw;
+      double rhsReuseTime, panelTreeTime;
+
+      ASSERT(rhsEnergy != NULL);
+      ensureChargeTreeBuilt(sys);
+      applyRhsReusePanelChargeTreeEnergy(sys, rhsEnergy, sgm, &rhsReuseRaw);
+      rhsReuseTime = wall_seconds() - stage_t0;
+
+      stage_t0 = wall_seconds();
+      applyPanelChargeTreeEnergy(sys, sgm, &panelTreeRaw);
+      panelTreeTime = wall_seconds() - stage_t0;
+
+      ptl = rhsReuseRaw;
+      treecode_t = rhsReuseTime + panelTreeTime;
+      treecodeTimeSet = 1;
+      printf("Energy compare-rhs: rhs-reuse raw=%.17g panel-tree raw=%.17g abs-diff=%.17g rel-diff=%.17g rhs-reuse-time=%.6f panel-tree-time=%.6f\n",
+             rhsReuseRaw, panelTreeRaw, fabs(rhsReuseRaw - panelTreeRaw),
+             (fabs(panelTreeRaw) > 0.0)
+                 ? fabs(rhsReuseRaw - panelTreeRaw) / fabs(panelTreeRaw)
+                 : fabs(rhsReuseRaw - panelTreeRaw),
+             rhsReuseTime, panelTreeTime);
     } else {
       applyTreecode( sys, sgm, &ptl );
     }

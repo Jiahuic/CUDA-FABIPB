@@ -25,6 +25,10 @@ int gpuSetupRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
  * to fall back to the threaded CPU evaluator.
  */
 int gpuPanelChargeTreeEnergy(struct ssystem *sys, const double *sgm, double *pot);
+int gpuRhsReuseCoulombDot(struct ssystem *sys, const double *rhs,
+                          const double *sgm, double *dot);
+int gpuRhsReusePanelChargeTreeEnergy(struct ssystem *sys, const double *rhs,
+                                     const double *sgm, double *pot);
 /* setupRHS via the same charge-tree walk on the device. 0 => use the CPU path. */
 int gpuChargeTreeRHS(struct ssystem *sys, int qOrder, double fac, double *sgm);
 /*

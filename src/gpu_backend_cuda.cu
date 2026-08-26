@@ -888,3 +888,4 @@ static int cteStackDepthOk(int chgDepth) {
 #define CTE_WARP 32
 
 #include "gpu/gpu_charge_tree_cuda.inc"
+#include "gpu/gpu_rhs_reuse_cuda.inc"
