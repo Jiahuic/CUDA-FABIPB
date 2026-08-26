@@ -70,6 +70,8 @@ void kernelKER4(double *x, double *y);
 void buildChargeTree(ssystem *sys);
 void computeChgMoments(ssystem *sys);
 double rhsTreeTheta(void);
+double energyTreeTheta(void);
+int rhsChargeExpansionOrderReport(void);
 void setChargeTreeThetaPolicy(double theta);
 void setChargeTreeOrderPolicy(int order);
 extern double **tLegA, **wLegA;
@@ -334,10 +336,13 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
     setChargeTreeThetaPolicy(HUGE_CAPSID_TREE_THETA);
     setChargeTreeOrderPolicy(HUGE_CAPSID_TREE_ORDER);
     if (sys->benchmarkMode > 0) {
-      printf("Resolved charge-tree theta=%g order=%d (huge capsid; %llu atoms > %llu)\n",
-             HUGE_CAPSID_TREE_THETA, HUGE_CAPSID_TREE_ORDER,
-             (unsigned long long)sys->nChar, threshold);
-      printf("  (capsid-scale trigger: %d panels, %llu atoms)\n",
+      /* Report what the solver will actually use, not what the policy asked
+       * for: an explicit environment variable overrides the policy, and a log
+       * line that says otherwise is worse than no log line. */
+      printf("Resolved charge-tree theta=%g/%g order=%d (capsid-scale policy "
+             "requested %g/%d; %d panels, %llu atoms)\n",
+             rhsTreeTheta(), energyTreeTheta(), rhsChargeExpansionOrderReport(),
+             (double)HUGE_CAPSID_TREE_THETA, HUGE_CAPSID_TREE_ORDER,
              nPnls, (unsigned long long)sys->nChar);
     }
   }

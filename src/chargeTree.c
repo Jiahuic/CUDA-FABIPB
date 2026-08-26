@@ -106,6 +106,14 @@ void setChargeTreeOrderPolicy(int order) {
   }
 }
 
+/* The order that will actually be used, for logging: env override if set,
+ * otherwise the size-gated policy, otherwise 0 meaning "follow the FMM". */
+int rhsChargeExpansionOrderReport(void) {
+  int override = chargeTreeOrderOverride();
+  if (override > 0) return override;
+  return gChargeTreeOrderPolicy;   /* 0 = adaptive, follows the FMM order */
+}
+
 int rhsChargeExpansionOrder(ssystem *sys, int level) {
   int override = chargeTreeOrderOverride();
   int order;
