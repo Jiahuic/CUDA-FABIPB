@@ -1,66 +1,18 @@
 build/
 build-*/
-# results/ is ignored wholesale -- results/paper/benchmarks alone is ~55 GB of
-# meshes and run logs. The paper sources and the small CSV/log files the paper
-# actually cites are re-included below. Re-inclusion has to walk down one
-# directory at a time: git cannot un-ignore a file whose parent is excluded.
-results/*
-!results/README.md
-!results/paper/
-results/paper/*
-!results/paper/README.md
-!results/paper/manuscript_notes/
-!results/paper/tables/
-!results/paper/figures/
-!results/paper/raw_logs/
+# results/ holds benchmark output and derived data only -- currently ~106 GB of
+# meshes and run logs. None of it is tracked, and it was purged from history.
+# The manuscript sources live in paper/ at the top level instead, so that
+# ignoring results/ does not cost the paper its version history.
+results/
 
-# LaTeX build products. Rebuilt by `make` in fmm-pb; the checked-in copy would
-# only ever be stale. (*.log and *.out are already caught by the global rules.)
-results/paper/manuscript_notes/**/*.aux
-results/paper/manuscript_notes/**/*.bbl
-results/paper/manuscript_notes/**/*.blg
-results/paper/manuscript_notes/**/*.fdb_latexmk
-results/paper/manuscript_notes/**/*.fls
-results/paper/manuscript_notes/**/*.pdf
-results/paper/manuscript_notes/**/*.synctex.gz
-results/paper/manuscript_notes/**/*.toc
-TABI-PB/
-nanoshaper/
-nanoshaper-master/
-/nanoshaper-master
-resume.md
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-CTestTestfile.cmake
-Makefile
-coulomb
-*.o
-*.out
-*.log
-.DS_Store
-msms.output
-triangles.txt
-msms.*
-test_proteins/*.xyzr
-test_proteins/*.vert
-test_proteins/*.face
-test_proteins/H1N1.pqr
-test_proteins/H1N1_atoms.pqr
-test_proteins/ZIKV_6CO8_zenodo.pqr
-test_proteins/*.pdb
-test_proteins/*_charmm.pqr
-test_proteins/*_charmm_protein_compact.pqr
-test_proteins/TABI.pqr
-TABI-PB/examples/pqr.zip
-TABI-PB/examples/zenodo_4568768/
-bimpb_cuda/
-.codex
-.omx/
-.fabipb_nanoshaper_*/
-__pycache__/
-
-# Must come last: gitignore takes the LAST matching pattern, and the bare
-# `Makefile` rule above (aimed at CMake's generated makefile in the source
-# tree) would otherwise swallow the manuscript's hand-written one.
-!results/paper/manuscript_notes/fmm-pb/Makefile
+# LaTeX build products. Rebuilt by `make` in paper/fmm-pb; a checked-in copy
+# would only ever be stale. (*.log and *.out are already caught globally.)
+paper/**/*.aux
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.fdb_latexmk
+paper/**/*.fls
+paper/**/*.pdf
+paper/**/*.synctex.gz
+paper/**/*.toc
