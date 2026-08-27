@@ -274,7 +274,26 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
                                     int precondExplicit, int sepExplicit,
                                     int nPnls) {
   unsigned long long threshold = getHugeCapsidAtomThreshold();
-  int hugeCapsid = isCapsidScale(sys, nPnls);
+  /*
+   * Two triggers, deliberately different in scope.
+   *
+   * hugeCapsid (atom count) is what the separation-ratio, Q2M and
+   * preconditioner policies were measured against -- all on H1N1. It must not
+   * be widened casually: eta=1.2 was validated on a system that converges in 12
+   * iterations, and applying it to ZIKV 6CO8 sdens=1, which needs 87 and sits
+   * much closer to the preconditioner's limit, pushed the solve past the
+   * iteration cap entirely (info=1 at 100 iterations, residual 2.5e-4 against a
+   * 1e-4 tolerance, GMRES 323 s -> 7388 s). Conditioning, not accuracy, is what
+   * fails, and it fails on a case the sweep never covered.
+   *
+   * capsidScale (atoms OR panels) is used only for the charge-tree Taylor
+   * order, which is an accuracy knob and cannot affect conditioning: it changes
+   * the right-hand side and the post-solve energy, not the operator GMRES
+   * iterates on. Hollow capsids have few atoms and enormous meshes, so the
+   * panel count is what identifies them.
+   */
+  int hugeCapsid = (unsigned long long)sys->nChar > threshold;
+  int capsidScale = isCapsidScale(sys, nPnls);
   int highContrast = isHighContrastDielectric();
 
   if (!q2mExplicit) {
@@ -332,8 +351,7 @@ static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
    * tree error. Set FABIPB_RHS_TREE_THETA, FABIPB_ENERGY_TREE_THETA and
    * FABIPB_CHARGE_TREE_ORDER explicitly for those; the environment always wins.
    */
-  if (hugeCapsid) {
-    setChargeTreeThetaPolicy(HUGE_CAPSID_TREE_THETA);
+  if (capsidScale) {
     setChargeTreeOrderPolicy(HUGE_CAPSID_TREE_ORDER);
     if (sys->benchmarkMode > 0) {
       /* Report what the solver will actually use, not what the policy asked
@@ -710,14 +728,14 @@ static void print_usage(const char *prog) {
   printf("  FABIPB_MAX_GPU_DIRECT_RHS_PAIRS=<n>  cap GPU direct setupRHS work\n");
   printf("  FABIPB_ALLOW_LARGE_DIRECT_RHS=1  bypass the active direct setupRHS cap\n");
   printf("  FABIPB_FORCE_TREE_RHS=1   force the tree-accelerated setupRHS path\n");
-  printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio\n"
-         "            (default 0.3; 0.8 automatically for huge capsids)\n");
+  printf("  FABIPB_RHS_TREE_THETA=<x> charge-tree acceptance ratio (default 0.8;\n"
+         "            use 0.3 for mesh-convergence or cross-solver studies)\n");
   printf("  FABIPB_RHS_THREADS=<n> setupRHS tree worker threads (default: online CPUs, max 128)\n");
   printf("Post-solve energy evaluation:\n");
   printf("  FABIPB_ENERGY_MODE=rhs-reuse|charge-tree|panel-tree|compare|compare-rhs  energy evaluator (default: panel-tree)\n");
   printf("                            rhs-reuse keeps setupRHS Coulomb terms and computes only screened correction\n");
-  printf("  FABIPB_ENERGY_TREE_THETA=<x> panel-tree acceptance ratio\n"
-         "            (default 0.3; 0.8 automatically for huge capsids)\n");
+  printf("  FABIPB_ENERGY_TREE_THETA=<x> panel-tree acceptance ratio (default 0.8;\n"
+         "            independent of the RHS ratio)\n");
   printf("  FABIPB_CHARGE_TREE_ORDER=<n> charge-tree Taylor order\n"
          "            (default: follow the FMM order; 3 automatically for huge capsids)\n");
   printf("  FABIPB_ENERGY_THREADS=<n> panel-tree worker threads (default: online CPUs, max 128)\n");

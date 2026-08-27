@@ -41,10 +41,29 @@ static double treecodeWallSeconds(void) {
   return (double)tv.tv_sec + 1.0e-6 * (double)tv.tv_usec;
 }
 
-/* Policy default, set by resolveAutoSolverPolicy(); an explicit environment
- * variable always wins over it. See setChargeTreeThetaPolicy(). */
-static double gRhsThetaPolicy = 0.3;
-static double gEnergyThetaPolicy = 0.3;
+/*
+ * Charge-tree acceptance ratio, for the right-hand side and the post-solve
+ * energy. 0.8 everywhere, raised from 0.3.
+ *
+ * The criterion is the discretization error of the mesh being solved, not an
+ * absolute tolerance: tightening the tree below the mesh error buys nothing
+ * measurable and costs a large fraction of runtime, since these two stages were
+ * ~2/3 of a capsid solve. Measured on H1N1 sdens=0.5, whole-solve time against
+ * theta=0.2 at adaptive order: 0.3 -> 786.8 s, 0.8 -> 374.0 s, for an energy
+ * drift of 0.076% against a mesh error above 10% at that density.
+ *
+ * Unlike the Taylor order, which stays size-gated because a flat order 3 moves
+ * small globular proteins by several percent, the acceptance ratio alone is
+ * mild away from capsid scale: on a 420k-panel protein theta=0.8 at the default
+ * order sits 0.088% from its fine reference.
+ *
+ * resolveAutoSolverPolicy() may still set this explicitly; an environment
+ * variable always wins over both. Mesh-convergence series and cross-solver
+ * comparisons need 0.3 or tighter, because they resolve differences smaller
+ * than the tree error -- the drivers pin those via CONVERGENCE_TREE.
+ */
+static double gRhsThetaPolicy = 0.8;
+static double gEnergyThetaPolicy = 0.8;
 
 void setChargeTreeThetaPolicy(double theta) {
   if (theta > 0.0 && theta <= 10.0) {
