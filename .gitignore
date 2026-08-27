@@ -1,18 +1,8 @@
 build/
 build-*/
-# results/ holds benchmark output and derived data only -- currently ~106 GB of
-# meshes and run logs. None of it is tracked, and it was purged from history.
-# The manuscript sources live in paper/ at the top level instead, so that
-# ignoring results/ does not cost the paper its version history.
+# The manuscript is deliberately NOT version-controlled: it must not be
+# published with the code. Both locations are ignored and both were purged from
+# git history. The files stay on disk; back them up out of band.
+paper/
 results/
 
-# LaTeX build products. Rebuilt by `make` in paper/fmm-pb; a checked-in copy
-# would only ever be stale. (*.log and *.out are already caught globally.)
-paper/**/*.aux
-paper/**/*.bbl
-paper/**/*.blg
-paper/**/*.fdb_latexmk
-paper/**/*.fls
-paper/**/*.pdf
-paper/**/*.synctex.gz
-paper/**/*.toc
