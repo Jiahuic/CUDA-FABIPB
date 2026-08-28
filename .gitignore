@@ -6,3 +6,7 @@ build-*/
 paper/
 results/
 
+# Local research/planning notes are kept out of the publication repository.
+PLANS.md
+docs/*_plan.md
+docs/archive/

@@ -8,7 +8,7 @@ FABIPB is a Galerkin boundary-integral Poisson-Boltzmann solver with FMM acceler
 - `include/`: shared headers
 - `scripts/`: build, smoke-test, and benchmark helpers
 - `test_proteins/`: small sample inputs and local benchmark inputs
-- `docs/`: design notes and dependency details
+- `docs/`: maintained dependency and GPU backend notes
 - `results/`: generated output, ignored by git
 
 ## Dependencies
@@ -51,7 +51,10 @@ brew install cmake
 Apple Accelerate can provide BLAS/LAPACK on macOS. Homebrew OpenBLAS is also
 supported, but use one BLAS consistently when comparing timings.
 
-See `docs/dependencies.md` for platform-specific notes.
+See:
+
+- `docs/dependencies.md` for platform-specific build notes.
+- `docs/gpu_backend_explained.md` for the CUDA backend architecture.
 
 ## Build
 

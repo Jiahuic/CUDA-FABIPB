@@ -341,7 +341,7 @@ __device__ void cteSetupDerivsStrided(int order, const double *x,
  * because the kernel is footprint-bound: holding threads, arithmetic and
  * coalescing fixed and varying only the footprint gave 248.6 MiB -> 37.17 s
  * against 2.8 MiB -> 14.92 s on 7A6A, so roughly 2.5x is the ceiling for this
- * footprint reduction (see docs/6co8_gpu_fabipb_milestone.md).
+ * footprint reduction.
  *
  * Row m lives in slot m&1, so writing row iRow reuses the slot holding row
  * iRow-2, which is dead by then. Levels are visited with p ascending, and level
