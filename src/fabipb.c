@@ -20,13 +20,9 @@
 #include "fabipb_system.h"
 #include "gk.h"
 #include "gmres.h"
+#include "fabipb_options.h"
 #include "direct_backend.h"
 #include "gpu_backend.h"
-
-#define DEFAULT_MAX_DIRECT_RHS_PAIRS 5000000000ULL
-#define DEFAULT_MAX_GPU_DIRECT_RHS_PAIRS 200000000000ULL
-#define DEFAULT_HUGE_CAPSID_ATOMS 5000000ULL
-#define DEFAULT_HUGE_CAPSID_PANELS 5000000ULL
 
 #if defined(__GNUC__) || defined(__clang__)
 #define FABIPB_THREAD_LOCAL __thread
@@ -89,364 +85,6 @@ void applyTreecode( ssystem *sys, double *sgm, double *pot );
 void applyPanelChargeTreeEnergy( ssystem *sys, double *sgm, double *pot );
 void applyRhsReusePanelChargeTreeEnergy( ssystem *sys, const double *rhs,
                                          double *sgm, double *pot );
-
-/*
- * Pin the *external* math-library thread counts to 1.
- *
- * These control BLAS/LAPACK/OpenMP internal parallelism, where the reduction
- * order is not fixed, so leaving them free makes results vary run to run.
- * Pinning them keeps a run reproducible.
- *
- * FABIPB's own worker-thread counts are deliberately NOT in this list. They
- * partition their loops into disjoint output slots, so the result is identical
- * at any thread count (verified: the nearfield build gives the same energy to
- * every printed digit at 1, 4, 16 and 32 threads). Pinning them here cost real
- * time for no reproducibility benefit -- the nearfield host build alone ran
- * 9.52 s single-threaded versus 2.73 s at 32 threads on a 420k-panel mesh, and
- * the production runner never overrode it. Benchmark runs still get a fully
- * pinned environment from scripts/with_benchmark_env.sh, which sets each of
- * them explicitly.
- */
-static void set_benchmark_thread_defaults(void) {
-  const char *vars[] = {
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS"
-  };
-  size_t i;
-
-  for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
-    if (getenv(vars[i]) == NULL) {
-      setenv(vars[i], "1", 0);
-    }
-  }
-}
-
-static int missing_external_thread_env(void) {
-  const char *vars[] = {
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS"
-  };
-  size_t i;
-
-  for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
-    if (getenv(vars[i]) == NULL) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static unsigned long long parseUnsignedLongLongEnv(const char *name,
-                                                   unsigned long long defaultValue) {
-  const char *env = getenv(name);
-  char *endptr = NULL;
-  unsigned long long value;
-
-  if (env == NULL || env[0] == '\0') {
-    return defaultValue;
-  }
-
-  errno = 0;
-  value = strtoull(env, &endptr, 10);
-  if (errno != 0 || endptr == env || *endptr != '\0') {
-    fprintf(stderr, "Warning: ignoring invalid %s='%s'\n", name, env);
-    return defaultValue;
-  }
-
-  return value;
-}
-
-static unsigned long long getMaxDirectRhsPairs(void) {
-  return parseUnsignedLongLongEnv("FABIPB_MAX_DIRECT_RHS_PAIRS",
-                                  DEFAULT_MAX_DIRECT_RHS_PAIRS);
-}
-
-static unsigned long long getMaxGpuDirectRhsPairs(void) {
-  return parseUnsignedLongLongEnv("FABIPB_MAX_GPU_DIRECT_RHS_PAIRS",
-                                  DEFAULT_MAX_GPU_DIRECT_RHS_PAIRS);
-}
-
-static int allowLargeDirectRhs(void) {
-  const char *env = getenv("FABIPB_ALLOW_LARGE_DIRECT_RHS");
-  return env != NULL && strcmp(env, "1") == 0;
-}
-
-static int forceTreeRhs(void) {
-  const char *env = getenv("FABIPB_FORCE_TREE_RHS");
-  return env != NULL && strcmp(env, "1") == 0;
-}
-
-static unsigned long long countDirectRhsPairs(int nPnls, int nChar) {
-  return (unsigned long long)nPnls * (unsigned long long)nChar;
-}
-
-static int canUseGpuDirectRhs(int gpuMode) {
-  return gpuMode > 0 && gpuBackendAvailable();
-}
-
-static unsigned long long getActiveDirectRhsPairLimit(int gpuMode) {
-  return canUseGpuDirectRhs(gpuMode) ? getMaxGpuDirectRhsPairs()
-                                     : getMaxDirectRhsPairs();
-}
-
-/*
- * Decides whether setupRHS should use the tree-accelerated charge-to-panel
- * path instead of the direct panel-charge double loop. FABIPB_FORCE_TREE_RHS
- * forces the tree path regardless of size (used to validate the tree path
- * against the direct path on small meshes). FABIPB_ALLOW_LARGE_DIRECT_RHS
- * preserves its original meaning: force the direct path even above the active
- * pair limit, for an intentional long benchmark. GPU runs use a separate,
- * larger cap because the CUDA direct RHS is practical for medium-large cases
- * where the CPU direct loop is not.
- */
-static int shouldUseTreeRhs(int nPnls, int nChar, int gpuMode) {
-  unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
-  unsigned long long maxDirectRhsPairs = getActiveDirectRhsPairLimit(gpuMode);
-
-  if (forceTreeRhs()) {
-    return 1;
-  }
-  return rhsPairs > maxDirectRhsPairs && !allowLargeDirectRhs();
-}
-
-static void reportDirectRhsLimit(int nPnls, int nChar, int gpuMode) {
-  unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
-  unsigned long long maxDirectRhsPairs = getActiveDirectRhsPairLimit(gpuMode);
-
-  if (rhsPairs > maxDirectRhsPairs && !allowLargeDirectRhs() && !forceTreeRhs()) {
-    printf("setupRHS: %llu panel-charge interactions (panels=%d charges=%d) exceeds "
-           "FABIPB_MAX_DIRECT_RHS_PAIRS=%llu; using tree-accelerated RHS.\n",
-           rhsPairs, nPnls, nChar, maxDirectRhsPairs);
-  }
-}
-
-static unsigned long long getHugeCapsidAtomThreshold(void) {
-  const char *env = getenv("FABIPB_HUGE_CAPSID_ATOMS");
-
-  if (env != NULL && env[0] != '\0') {
-    return parseUnsignedLongLongEnv("FABIPB_HUGE_CAPSID_ATOMS",
-                                    DEFAULT_HUGE_CAPSID_ATOMS);
-  }
-  return parseUnsignedLongLongEnv("FABIPB_Q2M_HUGE_CAPSID_ATOMS",
-                                  DEFAULT_HUGE_CAPSID_ATOMS);
-}
-
-static int isHighContrastDielectric(void) {
-  double ratio = epsilon2 / epsilon1;
-  return epsilon1 > 0.0 && epsilon1 <= 2.0 && ratio >= 40.0;
-}
-
-#define HUGE_CAPSID_SEP_RATIO 1.2
-#define HUGE_CAPSID_TREE_THETA 0.8
-#define HUGE_CAPSID_TREE_ORDER 3
-
-/*
- * Capsid-scale detection.
- *
- * Originally keyed on atom count alone. That misses hollow capsids, which are
- * exactly the target: Zika 6CO8 carries 1.58M atoms -- below a 5M atom
- * threshold -- while meshing to between 10.2M and 65.3M panels. The atom count
- * measures how much matter there is; what licenses the loose settings is a
- * coarse mesh over a thin shell, which shows up in the panel count.
- *
- * Either trigger therefore suffices. This remains a heuristic: the quantity
- * that actually matters is the mesh discretization error, which is not known a
- * priori, and a finely resolved globular protein could in principle reach the
- * panel threshold without the accompanying error budget. The thresholds are
- * overridable, and any explicit setting wins.
- */
-static int isCapsidScale(const ssystem *sys, int nPnls) {
-  unsigned long long atomThreshold = getHugeCapsidAtomThreshold();
-  unsigned long long panelThreshold =
-      parseUnsignedLongLongEnv("FABIPB_HUGE_CAPSID_PANELS",
-                               DEFAULT_HUGE_CAPSID_PANELS);
-  return (unsigned long long)sys->nChar > atomThreshold ||
-         (nPnls > 0 && (unsigned long long)nPnls > panelThreshold);
-}
-
-static void resolveAutoSolverPolicy(ssystem *sys, int q2mExplicit,
-                                    int precondExplicit, int sepExplicit,
-                                    int nPnls) {
-  unsigned long long threshold = getHugeCapsidAtomThreshold();
-  /*
-   * Two triggers, deliberately different in scope.
-   *
-   * hugeCapsid (atom count) is what the separation-ratio, Q2M and
-   * preconditioner policies were measured against -- all on H1N1. It must not
-   * be widened casually: eta=1.2 was validated on a system that converges in 12
-   * iterations, and applying it to ZIKV 6CO8 sdens=1, which needs 87 and sits
-   * much closer to the preconditioner's limit, pushed the solve past the
-   * iteration cap entirely (info=1 at 100 iterations, residual 2.5e-4 against a
-   * 1e-4 tolerance, GMRES 323 s -> 7388 s). Conditioning, not accuracy, is what
-   * fails, and it fails on a case the sweep never covered.
-   *
-   * capsidScale (atoms OR panels) is used only for the charge-tree Taylor
-   * order, which is an accuracy knob and cannot affect conditioning: it changes
-   * the right-hand side and the post-solve energy, not the operator GMRES
-   * iterates on. Hollow capsids have few atoms and enormous meshes, so the
-   * panel count is what identifies them.
-   */
-  int hugeCapsid = (unsigned long long)sys->nChar > threshold;
-  int capsidScale = isCapsidScale(sys, nPnls);
-  int highContrast = isHighContrastDielectric();
-
-  if (!q2mExplicit) {
-    if (sys->gpuMode <= 0) {
-      sys->gpuQ2MMode = 0;
-    } else if (hugeCapsid) {
-      sys->gpuQ2MMode = 0;
-    } else {
-      sys->gpuQ2MMode = 1;
-    }
-  }
-
-  /*
-   * Separation ratio. Larger values accept cube pairs as well separated higher
-   * in the tree, so both the near field and M2L shrink; the cost is a longer
-   * multipole reach and therefore more truncation error. Measured on H1N1
-   * sdens=0.5 (24.7M panels), sweeping S with everything else fixed: the matvec
-   * falls from 18.5 s to 11.2 s per call between 0.8 and 1.2 while the
-   * iteration count stays at 12 throughout, and the energy moves by 0.055%
-   * against S=0.6 -- an order of magnitude below the discretization error at
-   * this density. Raised for huge capsids only; the same sweep on a 420k-panel
-   * protein put 0.8 much further from its fine-mesh reference, so this is not a
-   * safe global default.
-   */
-  if (!sepExplicit && hugeCapsid) {
-    sys->maxSepRatio = HUGE_CAPSID_SEP_RATIO;
-  }
-
-  /*
-   * Charge-tree acceptance ratio and Taylor order, used by the right-hand side
-   * and the post-solve energy. Raised only for huge capsids, for the same reason
-   * as the separation ratio above: a loose setting is safe when the mesh
-   * discretization error is large and the panels lie in a thin shell, and unsafe
-   * otherwise.
-   *
-   * H1N1 sdens=0.5, whole-solve time and energy drift against theta=0.2 at the
-   * FMM's adaptive order (results/paper/benchmarks/t19, t20):
-   *
-   *   theta / order   total     rhs+energy   drift
-   *   0.3 / adaptive  786.8 s     504.6 s    0.0001%   (previous behaviour)
-   *   0.8 / 3         303.9 s      29.2 s    0.191%    (this policy)
-   *
-   * 0.191% sits against a discretization error above 10% at that density, while
-   * the two charge-tree stages fall from 64% of the run to under 10% -- a 2.6x
-   * whole-solve speedup for an accuracy cost the mesh already dwarfs.
-   *
-   * These are NOT safe globally. The same settings move small globular proteins
-   * at fine resolution by 1.7% (1cbn) and 7.9% (1a63): those meshes fill their
-   * cubes instead of occupying a thin shell, so the bounding-sphere slack that
-   * makes a loose ratio work on a capsid is absent, and their discretization
-   * error is small enough that the tree error is no longer hidden beneath it.
-   *
-   * Mesh-convergence series and cross-solver comparisons need the conservative
-   * setting even on a capsid, since they resolve differences smaller than the
-   * tree error. Set FABIPB_RHS_TREE_THETA, FABIPB_ENERGY_TREE_THETA and
-   * FABIPB_CHARGE_TREE_ORDER explicitly for those; the environment always wins.
-   */
-  if (capsidScale) {
-    setChargeTreeOrderPolicy(HUGE_CAPSID_TREE_ORDER);
-    if (sys->benchmarkMode > 0) {
-      /* Report what the solver will actually use, not what the policy asked
-       * for: an explicit environment variable overrides the policy, and a log
-       * line that says otherwise is worse than no log line. */
-      printf("Resolved charge-tree theta=%g/%g order=%d (capsid-scale policy "
-             "requested %g/%d; %d panels, %llu atoms)\n",
-             rhsTreeTheta(), energyTreeTheta(), rhsChargeExpansionOrderReport(),
-             (double)HUGE_CAPSID_TREE_THETA, HUGE_CAPSID_TREE_ORDER,
-             nPnls, (unsigned long long)sys->nChar);
-    }
-  }
-
-  if (!precondExplicit) {
-    if (hugeCapsid) {
-      sys->precondCacheMode = 3;
-    } else if (highContrast) {
-      sys->precondCacheMode = 2;
-    } else {
-      sys->precondCacheMode = 3;
-    }
-  }
-
-  if (sys->benchmarkMode > 0) {
-    if (sys->matvecMode == 0) {
-      const char *q2mReason = q2mExplicit ? "explicit -Q"
-          : (sys->gpuMode <= 0) ? "auto: GPU disabled"
-          : hugeCapsid ? "auto: huge capsid, preserve GPU memory for nearfield"
-                       : "auto: small/medium case, use GPU Q2M/L2P";
-      printf("Resolved GPU Q2M mode=%d (%s; huge-capsid-threshold=%llu atoms, charges=%d)\n",
-             sys->gpuQ2MMode, q2mReason, threshold, sys->nChar);
-    }
-    {
-      const char *precondReason = precondExplicit ? "explicit -P"
-          : hugeCapsid ? "auto: huge capsid, use diagonal preconditioner"
-          : highContrast ? "auto: high dielectric contrast, use cached block-LU"
-                         : "auto: default diagonal preconditioner";
-      printf("Resolved preconditioner mode=%d (%s; eps2/eps1=%g)\n",
-             sys->precondCacheMode, precondReason, epsilon2 / epsilon1);
-    }
-    {
-      const char *sepReason = sepExplicit ? "explicit -S"
-          : hugeCapsid ? "auto: huge capsid, wider separation ratio"
-                       : "auto: default";
-      printf("Resolved separation ratio=%g (%s)\n", sys->maxSepRatio, sepReason);
-    }
-  }
-}
-
-static const char *autoOrExplicitLabel(int explicitFlag, int value,
-                                       char *buf, size_t bufSize) {
-  if (explicitFlag) {
-    snprintf(buf, bufSize, "%d", value);
-  } else {
-    snprintf(buf, bufSize, "auto");
-  }
-  return buf;
-}
-
-/*
- * Only the external math libraries are listed here. They read their thread
- * count once at library init, which can happen before main(), so setting the
- * variable has to be followed by a re-exec to take effect. FABIPB's own worker
- * counts are read lazily through getenv() at each use, need no re-exec, and are
- * left unpinned -- see set_benchmark_thread_defaults() for why.
- */
-static void ensure_startup_thread_env(int nargs, char *argv[]) {
-  const char *vars[] = {
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS"
-  };
-  int needsExec = 0;
-  size_t i;
-
-  for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
-    if (getenv(vars[i]) == NULL) {
-      setenv(vars[i], "1", 0);
-      needsExec = 1;
-    }
-  }
-
-  if (!needsExec || getenv("FABIPB_THREAD_ENV_REEXEC") != NULL) {
-    return;
-  }
-
-  setenv("FABIPB_THREAD_ENV_REEXEC", "1", 1);
-  execvp(argv[0], argv);
-  fprintf(stderr,
-          "Warning: failed to restart fabipb with pinned thread env (%s). "
-          "Continuing in-process; benchmark reproducibility may be affected.\n",
-          strerror(errno));
-}
 
 static void buildPanelIndexDirect(ssystem *sys) {
   int idx = 0;
@@ -847,7 +485,7 @@ typedef struct {
 
 static unsigned long long rhsSampleStride(void) {
   unsigned long long stride =
-      parseUnsignedLongLongEnv("FABIPB_RHS_SAMPLE_STRIDE", 1000ULL);
+      fabipb_parse_unsigned_long_long_env("FABIPB_RHS_SAMPLE_STRIDE", 1000ULL);
   return (stride > 0ULL) ? stride : 1000ULL;
 }
 
@@ -1106,9 +744,10 @@ static void setupRHSTree(ssystem *sys, int qOrder, double fac, double *sgm) {
 void setupRHS(ssystem *sys, double *sgm) {
   int i, j;
   int nPnls = sys->nPnls, nChar = sys->nChar, qOrder=sys->maxQuadOrder;
-  unsigned long long rhsPairs = countDirectRhsPairs(nPnls, nChar);
-  unsigned long long maxDirectRhsPairs = getActiveDirectRhsPairLimit(sys->gpuMode);
-  int useTree = shouldUseTreeRhs(nPnls, nChar, sys->gpuMode);
+  unsigned long long rhsPairs = fabipb_count_direct_rhs_pairs(nPnls, nChar);
+  unsigned long long maxDirectRhsPairs =
+      fabipb_get_active_direct_rhs_pair_limit(sys->gpuMode);
+  int useTree = fabipb_should_use_tree_rhs(nPnls, nChar, sys->gpuMode);
   double *intgr, fac;
   panel *pnl;
   static int warnedGpuRHS = 0;
@@ -1138,7 +777,8 @@ void setupRHS(ssystem *sys, double *sgm) {
     printf("GPU RHS path unavailable; using CPU setupRHS.\n");
     warnedGpuRHS = 1;
   }
-  if (rhsPairs > getMaxDirectRhsPairs() && !allowLargeDirectRhs()) {
+  if (rhsPairs > fabipb_get_max_direct_rhs_pairs() &&
+      !fabipb_allow_large_direct_rhs()) {
     printf("GPU RHS path unavailable above CPU direct cap; using tree-accelerated RHS.\n");
     setupRHSTree(sys, qOrder, fac, sgm);
     writeRhsSummaryIfRequested(sys, sgm);
@@ -1187,10 +827,10 @@ int main(int nargs, char *argv[]){
   double setupPC_t, setupRHS_t, gmres_t, treecode_t;
   const char *postEnergyMode;
 
-  ensure_startup_thread_env(nargs, argv);
+  fabipb_ensure_startup_thread_env(nargs, argv);
   CALLOC(sys, 1, ssystem);
   postEnergyMode = energyMode();
-  set_benchmark_thread_defaults();
+  fabipb_set_benchmark_thread_defaults();
   sys->height = 2;
   sys->maxSepRatio = 0.8;
   sys->maxQuadOrder = 1;
@@ -1335,7 +975,7 @@ int main(int nargs, char *argv[]){
   if (sys->benchmarkMode > 0) {
     char q2mBuf[16];
     char precondBuf[16];
-    if (missing_external_thread_env()) {
+    if (fabipb_missing_external_thread_env()) {
       fprintf(stderr,
               "Warning: BLAS/OpenMP thread env vars were not exported before startup. "
               "For reproducible benchmarking, prefer scripts/with_benchmark_env.sh because "
@@ -1358,15 +998,15 @@ int main(int nargs, char *argv[]){
            sys->matvecMode);
     if (sys->matvecMode == 0) {
       printf("GPU Q2M mode=%s (1=GPU, 0=CPU dgemv loop)\n",
-             autoOrExplicitLabel(q2mExplicit, sys->gpuQ2MMode,
-                                 q2mBuf, sizeof(q2mBuf)));
+             fabipb_auto_or_explicit_label(q2mExplicit, sys->gpuQ2MMode,
+                                           q2mBuf, sizeof(q2mBuf)));
       printf("GPU nearfield mode=%s (0=interaction, 1=destination-leaf, 2=destination-leaf warp)\n",
              sys->gpuNearfieldMode < 0 ? "auto" : (sys->gpuNearfieldMode == 0 ? "0" :
              (sys->gpuNearfieldMode == 1 ? "1" : "2")));
     }
     printf("Preconditioner mode=%s (-1=disabled, 0=original, 1=cached-blocks, 2=cached-LU, 3=diagonal)\n",
-           autoOrExplicitLabel(precondExplicit, sys->precondCacheMode,
-                               precondBuf, sizeof(precondBuf)));
+           fabipb_auto_or_explicit_label(precondExplicit, sys->precondCacheMode,
+                                         precondBuf, sizeof(precondBuf)));
     printf("Energy mode=%s (rhs-reuse, charge-tree, panel-tree, compare, compare-rhs)\n", energyMode());
     if (sys->debugCompareApply > 0 || sys->debugComparePrecond > 0) {
       printf("Debug compare flags: apply=%d precond=%d\n",
@@ -1389,8 +1029,9 @@ int main(int nargs, char *argv[]){
     printf("Mesh-only mode: stopping after mesh generation.\n");
     return 0;
   }
-  resolveAutoSolverPolicy(sys, q2mExplicit, precondExplicit, sepExplicit, nPnls);
-  reportDirectRhsLimit(nPnls, sys->nChar, sys->gpuMode);
+  fabipb_resolve_auto_solver_policy(sys, q2mExplicit, precondExplicit,
+                                    sepExplicit, nPnls);
+  fabipb_report_direct_rhs_limit(nPnls, sys->nChar, sys->gpuMode);
   loadPanel_t = wall_seconds() - stage_t0;
   sys->pnlOLst = inputLst;
 

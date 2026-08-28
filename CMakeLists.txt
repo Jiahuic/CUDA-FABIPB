@@ -23,6 +23,7 @@ option(FMM_PB_ALLOW_UNSTABLE_OPENBLAS_0320
 
 set(FMM_PB_SOURCES
   src/fabipb.c
+  src/fabipb_options.c
   src/gkSetup.c
   src/input.c
   src/gkGlobal.c

@@ -11,24 +11,27 @@ The GMRES implementation is now native C and still uses BLAS/LAPACK for the unde
 
 ## macOS
 
-If the default Accelerate-backed BLAS/LAPACK setup works, a plain build is usually enough:
+Install command-line tools and CMake:
 
 ```sh
-make
+xcode-select --install
+brew install cmake
 ```
 
-If you prefer Homebrew OpenBLAS/LAPACK, install packages first and then override build variables as needed:
+For the default Accelerate-backed BLAS/LAPACK setup, configure a CPU-only build:
+
+```sh
+cmake -S . -B build -DFMM_PB_ENABLE_CUDA=OFF -DFMM_PB_BLA_VENDOR=Apple
+cmake --build build -j
+```
+
+If you prefer Homebrew OpenBLAS/LAPACK, install packages first and ask CMake to
+prefer OpenBLAS:
 
 ```sh
 brew install openblas lapack
-make BLAS_LIBS=-lopenblas LAPACK_LIBS=-llapack
-```
-
-For apples-to-apples benchmarking against Linux, prefer OpenBLAS and run:
-
-```sh
-brew install openblas
-./scripts/run_apples_to_apples.sh test_proteins/1a7m
+cmake -S . -B build-openblas -DFMM_PB_ENABLE_CUDA=OFF -DFMM_PB_BLA_VENDOR=OpenBLAS
+cmake --build build-openblas -j
 ```
 
 ## Debian/Ubuntu
@@ -42,7 +45,7 @@ Configure and build with:
 
 ```sh
 cmake -S . -B build
-cmake --build build
+cmake --build build -j
 ```
 
 If CMake stops because it detected OpenBLAS `0.3.20`, install or build a newer
@@ -79,7 +82,7 @@ Configure and build with:
 
 ```sh
 cmake -S . -B build
-cmake --build build
+cmake --build build -j
 ```
 
 ## Verifying linkage
@@ -93,7 +96,7 @@ cmake -S . -B build
 Then build:
 
 ```sh
-cmake --build build
+cmake --build build -j
 ```
 
 ## Cross-machine timing checklist (Linux vs macOS)

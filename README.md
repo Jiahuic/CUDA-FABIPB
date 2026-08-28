@@ -13,23 +13,49 @@ FABIPB is a Galerkin boundary-integral Poisson-Boltzmann solver with FMM acceler
 
 ## Dependencies
 
-Required:
+Required to build the solver:
 
-- CMake
-- C compiler
+- CMake 3.16 or newer
+- C99 compiler (`gcc`, `clang`, or Apple Clang)
 - BLAS
 - LAPACK
+- POSIX threads
 
-Optional:
+Optional runtime/build features:
 
-- CUDA toolkit and NVIDIA GPU
-- NanoShaper for PQR-to-surface runs
+- CUDA toolkit and NVIDIA GPU for the GPU backend
+- NanoShaper for PQR-to-surface meshing
+- Python 3 for helper scripts that generate benchmark tables or notes
+
+Debian/Ubuntu packages:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential cmake libopenblas-dev liblapack-dev
+```
+
+CUDA builds also need an NVIDIA driver and CUDA toolkit with `nvcc` available:
+
+```sh
+nvcc --version
+nvidia-smi
+```
+
+macOS CPU-only packages:
+
+```sh
+xcode-select --install
+brew install cmake
+```
+
+Apple Accelerate can provide BLAS/LAPACK on macOS. Homebrew OpenBLAS is also
+supported, but use one BLAS consistently when comparing timings.
 
 See `docs/dependencies.md` for platform-specific notes.
 
 ## Build
 
-Default build, using CUDA automatically when CMake finds a CUDA toolkit:
+Default build. CMake uses CUDA automatically when a CUDA toolkit is available:
 
 ```sh
 cmake -S . -B build
@@ -48,6 +74,12 @@ On macOS without an NVIDIA GPU, use the CPU-only mode. If using Apple Accelerate
 ```sh
 cmake -S . -B build -DFMM_PB_ENABLE_CUDA=OFF -DFMM_PB_BLA_VENDOR=Apple
 cmake --build build -j
+```
+
+Check the binary:
+
+```sh
+./build/fabipb -h
 ```
 
 ## macOS Smoke Test
@@ -81,6 +113,11 @@ Show options:
 ```
 
 ## Capsid Benchmarks
+
+The benchmark runner sets the solver's production defaults automatically:
+GPU selection, Q2M policy, preconditioner policy, right-hand-side tree policy,
+energy mode, and thread counts. For normal runs, set only `SDENS`, `OUT_DIR`,
+and the input file.
 
 ZIKV/6CO8:
 
